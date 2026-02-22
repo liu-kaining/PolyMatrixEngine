@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.db.session import init_db, get_db
 from app.core.redis import redis_client
 from app.market_data.gateway import md_gateway
+from app.market_data.user_stream import user_stream
 from app.market_data.gamma_client import gamma_client
 from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
@@ -34,9 +35,11 @@ async def lifespan(app: FastAPI):
     
     # 3. Background Services
     task_md = asyncio.create_task(md_gateway.connect())
+    task_user = asyncio.create_task(user_stream.connect())
     task_watchdog = asyncio.create_task(watchdog.run())
     
     background_tasks.add(task_md)
+    background_tasks.add(task_user)
     background_tasks.add(task_watchdog)
     
     yield
@@ -90,6 +93,9 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
     
     # Subscribe to WS with token IDs (asset_ids)
     await md_gateway.subscribe([market.yes_token_id, market.no_token_id])
+    
+    # Subscribe to private User Stream (uses condition_id)
+    await user_stream.subscribe(condition_id)
     
     # Start Quoting Engine Daemon for both YES and NO tokens
     task_quoting_yes = asyncio.create_task(start_quoting_engine(condition_id, market.yes_token_id))

@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     # App
     PROJECT_NAME: str = "PolyMatrix Engine"
     DEBUG: bool = False
+    LIVE_TRADING_ENABLED: bool = False  # Set to True to allow actual real money order placements
     
     # Polymarket API
     PM_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

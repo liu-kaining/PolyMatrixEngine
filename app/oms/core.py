@@ -61,10 +61,26 @@ class OrderManagementSystem:
         funder = settings.FUNDER_ADDRESS
         
         self.client = None
+        # LIVE_TRADING_ENABLED checks if we want to actually push to the Polymarket network
+        self.live_trading_enabled = settings.LIVE_TRADING_ENABLED
+        
         if key and funder:
             try:
-                self.client = ClobClient(host, key=key, chain_id=chain_id, funder=funder)
-                logger.info("ClobClient initialized.")
+                # 2 is typically the signature_type for POLY_PROXY / POLYMORPHIC (proxy wallets)
+                # Ensure the funder address is correct.
+                self.client = ClobClient(
+                    host, 
+                    key=key, 
+                    chain_id=chain_id, 
+                    signature_type=2, # POLY_PROXY signature type for gasless transactions
+                    funder=funder
+                )
+                
+                # Derive or set API creds (standard for proxy wallets in py-clob-client)
+                creds = self.client.create_or_derive_api_creds()
+                self.client.set_api_creds(creds)
+                
+                logger.info(f"ClobClient initialized. Live Trading Enabled: {self.live_trading_enabled}")
             except Exception as e:
                 logger.error(f"Failed to init ClobClient: {e}")
                 
@@ -93,23 +109,17 @@ class OrderManagementSystem:
         api_payload = {}
         final_order_id = order_id
         
-        if not self.client:
-            # Mock execution path
-            logger.info(f"No ClobClient. Simulating execution for local order: {order_id} (PENDING)")
+        # Test Mode (Dry-Run) or missing client
+        if not self.client or not self.live_trading_enabled:
+            logger.info(f"[DRY-RUN] Simulating execution for local order: {order_id} (PENDING)")
+            await asyncio.sleep(0.5) # Simulate network delay non-blockingly
             
-            # Simulate network delay non-blockingly outside DB Session
-            await asyncio.sleep(0.5)
-            
-            import random
-            if random.random() < 0.1:  # 10% chance to fail
-                logger.warning(f"Simulated network/API failure for order {order_id}")
-                api_status = OrderStatus.FAILED
-                api_payload = {"error": "Simulated random API failure"}
-            else:
-                logger.info(f"Simulated success for order {order_id} -> OPEN")
-                api_status = OrderStatus.OPEN
-                api_payload = {"mock_response": "Success"}
+            # Simulated outcome
+            api_status = OrderStatus.OPEN
+            api_payload = {"mock_response": "Success (Dry-Run)"}
+            logger.info(f"[DRY-RUN] Simulated success for order {order_id} -> OPEN")
                 
+        # Real Execution Mode
         else:
             try:
                 async def _place_order():
@@ -118,22 +128,26 @@ class OrderManagementSystem:
                         price=price,
                         size=size,
                         side="BUY" if side == OrderSide.BUY else "SELL",
-                        token_id=token_id, # Must be the accurate Token ID, not Condition ID!
+                        token_id=token_id, # Must be the accurate Token ID
                     )
+                    # We use create_and_post_order for automatic signing and API dispatch
                     return self.client.create_and_post_order(order_args)
                 
+                # Wrapped in circuit breaker to handle rate limits (429) or gateway errors (502)
                 res = await self.circuit_breaker.execute(_place_order)
                 
-                if res and res.get("orderID"):
+                if res and res.get("success") and res.get("orderID"):
                     api_status = OrderStatus.OPEN
                     api_payload = res
                     final_order_id = res["orderID"]
+                    logger.info(f"[LIVE] Order successfully posted to CLOB: {final_order_id}")
                 else:
-                    raise Exception(f"Failed to get orderID from response: {res}")
+                    error_msg = res.get("errorMsg", "Unknown API Error") if res else "No response"
+                    raise Exception(f"Failed to get orderID. Response: {error_msg}")
                     
             except Exception as e:
                 # 4. State Machine: FAILED
-                logger.error(f"Order failed: {e}")
+                logger.error(f"[LIVE] Order failed: {e}")
                 api_status = OrderStatus.FAILED
                 api_payload = {"error": str(e)}
 
@@ -158,34 +172,43 @@ class OrderManagementSystem:
 
     async def cancel_order(self, order_id: str):
         """Cancels an open order."""
-        if not self.client:
-            logger.info(f"No ClobClient. Simulating cancel for {order_id}...")
-            # Simulate network delay non-blockingly
+        # Test Mode (Dry-Run) or missing client
+        if not self.client or not self.live_trading_enabled:
+            logger.info(f"[DRY-RUN] Simulating cancel for {order_id}...")
             await asyncio.sleep(0.3)
             
             async with AsyncSessionLocal() as session:
                 order = await session.get(OrderJournal, order_id)
                 if order:
                     order.status = OrderStatus.CANCELED
-                    logger.info(f"Simulated cancel success for order {order_id} -> CANCELED")
+                    logger.info(f"[DRY-RUN] Simulated cancel success for order {order_id} -> CANCELED")
                     await session.commit()
             return True
             
+        # Real Execution Mode
         try:
             async def _cancel():
+                # Real API cancel call using Polymarket Client
                 return self.client.cancel(order_id)
             
             res = await self.circuit_breaker.execute(_cancel)
             
-            async with AsyncSessionLocal() as session:
-                order = await session.get(OrderJournal, order_id)
-                if order:
-                    order.status = OrderStatus.CANCELED
-                    order.payload = {"cancel_response": res}
-                    await session.commit()
-            return True
+            if res == "Canceled" or (isinstance(res, dict) and res.get("success", False) is True):
+                async with AsyncSessionLocal() as session:
+                    order = await session.get(OrderJournal, order_id)
+                    if order:
+                        order.status = OrderStatus.CANCELED
+                        payload = dict(order.payload) if order.payload else {}
+                        payload["cancel_response"] = res
+                        order.payload = payload
+                        logger.info(f"[LIVE] Order successfully canceled on CLOB: {order_id}")
+                        await session.commit()
+                return True
+            else:
+                raise Exception(f"Cancel failed or unrecognized response format: {res}")
+                
         except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
+            logger.error(f"[LIVE] Failed to cancel order {order_id}: {e}")
             return False
 
 oms = OrderManagementSystem()
