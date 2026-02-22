@@ -150,7 +150,7 @@ class OrderManagementSystem:
                 logger.error(f"[LIVE] Order failed: {e}")
                 api_status = OrderStatus.FAILED
                 api_payload = {"error": str(e)}
-
+                
         # 3. State Machine: OPEN / FAILED (Session 2)
         async with AsyncSessionLocal() as session:
             # Re-fetch the order to ensure it hasn't been modified externally
@@ -199,6 +199,28 @@ class OrderManagementSystem:
                     if order:
                         order.status = OrderStatus.CANCELED
                         payload = dict(order.payload) if order.payload else {}
+                        
+                        # Handle Dusting: Verify if there was any partial fill immediately prior to cancel
+                        try:
+                            # We check the API directly for size_matched
+                            # Note: self.client methods are typically synchronous HTTP calls. 
+                            # Wrapping in to_thread to prevent event loop blocking during HFT load.
+                            order_info = await asyncio.to_thread(self.client.get_order, order_id)
+                            
+                            if isinstance(order_info, dict):
+                                size_matched = float(order_info.get("size_matched", 0.0))
+                                payload["filled_size_api_check"] = size_matched
+                                
+                                # If API indicates it matched before being canceled, note it.
+                                # The user_stream WebSocket is the primary source of truth, but this is a fail-safe.
+                                if size_matched > 0 and size_matched < float(order.size):
+                                    logger.warning(f"[{order_id}] Cancelled, but API shows Partial Fill ({size_matched}/{order.size})")
+                                    payload["status_detail"] = "PARTIALLY_FILLED_AND_CANCELED"
+                                    # We don't forcefully overwrite filled_size here because user_stream 
+                                    # maintains the atomic ledger. We just keep the audit trail.
+                        except Exception as fetch_e:
+                            logger.debug(f"Could not fetch final order status for {order_id} to check dust: {fetch_e}")
+
                         payload["cancel_response"] = res
                         order.payload = payload
                         logger.info(f"[LIVE] Order successfully canceled on CLOB: {order_id}")
@@ -213,7 +235,7 @@ class OrderManagementSystem:
 
     async def cancel_market_orders(self, condition_id: str):
         """Emergency cancel all OPEN/PENDING orders for a specific market"""
-        logger.warning(f"Initiating cancel_market_orders for {condition_id}")
+        logger.warning(f"Initiating TRUE KILL SWITCH (Cancel All) for {condition_id}")
         async with AsyncSessionLocal() as session:
             stmt = select(OrderJournal).filter(
                 OrderJournal.market_id == condition_id,
@@ -230,10 +252,17 @@ class OrderManagementSystem:
         for order in active_orders:
             tasks.append(self.cancel_order(order.order_id))
             
-        # Execute concurrently
+        # Execute concurrently, wait for all
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        
         success_count = sum(1 for r in results if r is True)
-        logger.info(f"Canceled {success_count}/{len(active_orders)} orders for {condition_id}")
+        failed_count = len(active_orders) - success_count
+        
+        if failed_count > 0:
+            logger.critical(f"🚨 KILL SWITCH INCOMPLETE: {failed_count} orders failed to cancel for {condition_id}!")
+            return False
+            
+        logger.info(f"KILL SWITCH SUCCESS: {success_count}/{len(active_orders)} orders canceled for {condition_id}")
         return True
 
 oms = OrderManagementSystem()
