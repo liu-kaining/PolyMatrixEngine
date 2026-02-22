@@ -17,13 +17,50 @@ class AlphaPricingModel:
         # Default 50/50 for MVP. In reality, query AI or sportsbook data.
         return 0.50
 
+class AlphaModel:
+    """Calculates baseline probability and spread adjustments based on orderbook imbalance."""
+    def __init__(self):
+        self.base_spread = 0.02
+
+    async def calculate_alpha(self, bids: list, asks: list) -> Tuple[float, float]:
+        """
+        Returns (fair_value, dynamic_spread_margin)
+        Uses orderbook imbalance to skew the mid-price and widen/tighten the spread.
+        """
+        best_bid_price = float(bids[0]["price"])
+        best_ask_price = float(asks[0]["price"])
+        
+        best_bid_size = float(bids[0]["size"])
+        best_ask_size = float(asks[0]["size"])
+        
+        # 1. Base Mid-Price
+        mid_price = (best_bid_price + best_ask_price) / 2.0
+        
+        # 2. Orderbook Imbalance (OBI)
+        # Ranges from -1 (all asks) to +1 (all bids)
+        total_size = best_bid_size + best_ask_size
+        obi = (best_bid_size - best_ask_size) / total_size if total_size > 0 else 0.0
+        
+        # 3. Dynamic Skew
+        # If OBI is highly positive (+0.8), buyers are aggressive, we skew fair value up.
+        max_skew = 0.01
+        skewed_fair_value = mid_price + (obi * max_skew)
+        
+        # 4. Dynamic Spread
+        # Widen spread when highly imbalanced (volatile/directional flow)
+        dynamic_spread = self.base_spread * (1.0 + abs(obi))
+        
+        return skewed_fair_value, dynamic_spread
+
+
 class QuotingEngine:
     def __init__(self, condition_id: str, token_id: str):
         self.condition_id = condition_id
         self.token_id = token_id
         
+        self.alpha_model = AlphaModel()
+        
         # Grid settings
-        self.profit_margin = 0.02 # Fixed spread anchor target (Mid +/- 0.01)
         self.grid_levels = 2  # Bid1, Bid2 and Ask1, Ask2
         self.tick_size = 0.01 # $0.01 per share offset
         self.base_size = 10.0 # $10 per order
@@ -85,32 +122,27 @@ class QuotingEngine:
             return
             
         async with self._trade_lock:
-            # 1. Calculate Mid-Price and Spread based on Top 1
-            best_bid = float(bids[0]["price"])
-            best_ask = float(asks[0]["price"])
-            
-            mid_price = (best_bid + best_ask) / 2.0
-            spread = best_ask - best_bid
+            # 1. Calculate Alpha, Fair Value and Dynamic Spread
+            fair_value, dynamic_spread = await self.alpha_model.calculate_alpha(bids, asks)
             
             # 2. Debounce / Throttle Mechanism Check
             if self.last_anchor_mid_price is not None:
-                price_diff = abs(mid_price - self.last_anchor_mid_price)
+                price_diff = abs(fair_value - self.last_anchor_mid_price)
                 if price_diff <= self.price_offset_threshold:
                     logger.debug(
-                        f"[{self.token_id[:6]}] Tick ignored: Mid-Price diff ({price_diff:.4f}) "
+                        f"[{self.token_id[:6]}] Tick ignored: Fair Value diff ({price_diff:.4f}) "
                         f"<= threshold ({self.price_offset_threshold}). Skip Grid Reset."
                     )
                     return
                     
             # Update the baseline anchor mid-price for future comparisons
-            self.last_anchor_mid_price = mid_price
+            self.last_anchor_mid_price = fair_value
             
-            # 3. Calculate optimal grid bounds based on Mid-Price
-            # Margin is 0.02, meaning distance from Mid is 0.01
-            anchor_distance = self.profit_margin / 2.0
+            # 3. Calculate optimal grid bounds based on Fair Value and Dynamic Spread
+            anchor_distance = dynamic_spread / 2.0
             
-            bid_1 = round(mid_price - anchor_distance, 2)
-            ask_1 = round(mid_price + anchor_distance, 2)
+            bid_1 = round(fair_value - anchor_distance, 2)
+            ask_1 = round(fair_value + anchor_distance, 2)
             
             # Construct grid orders JSON
             orders_payload = []
@@ -141,9 +173,9 @@ class QuotingEngine:
                     })
                     
             # 3. Log Mock output instead of firing to actual OMS right now
-            logger.info(f"==== [GRID MOCK] Condition: {self.condition_id[:6]}... | Token: {self.token_id[:6]}... ====")
-            logger.info(f"Top Book -> Bid: {best_bid:.3f} | Ask: {best_ask:.3f}")
-            logger.info(f"Calculated -> Mid-Price: {mid_price:.3f} | Spread: {spread:.3f}")
+            logger.info(f"==== [GRID EXEC] Condition: {self.condition_id[:6]}... | Token: {self.token_id[:6]}... ====")
+            logger.info(f"Top Book -> Bid: {bids[0]['price']} ({bids[0]['size']}) | Ask: {asks[0]['price']} ({asks[0]['size']})")
+            logger.info(f"Alpha -> Fair Value: {fair_value:.3f} | Dynamic Spread: {dynamic_spread:.3f}")
             logger.info("Order Instructions Payload:")
             # Enum serialization requires .value if doing standard json.dumps, but we'll format it simply:
             log_payload = [

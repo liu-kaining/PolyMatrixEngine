@@ -98,24 +98,31 @@ class UserStreamGateway:
                 logger.error(f"Error processing User WS message: {e}")
 
     async def process_message(self, data: dict):
+        # We need to handle trades and cancellations carefully
+        
+        # 1. Order Canceled/Closed (Could be full cancel, or the remainder of a partial fill)
+        if isinstance(data, list) and len(data) > 0 and "event_type" in data[0]:
+            # Sometimes polymarket sends arrays of events
+            for event in data:
+                await self._process_single_event(event)
+        elif isinstance(data, dict):
+            await self._process_single_event(data)
+
+    async def _process_single_event(self, data: dict):
         event_type = data.get("event_type")
         
-        # We care about trade matches (Fills) and order cancellations
         if event_type == "trade":
             # Match status is usually "MATCHED" for a fill
             status = data.get("status")
             if status == "MATCHED":
-                # The trade contains the taker_order_id and maker_orders
                 maker_orders = data.get("maker_orders", [])
                 taker_order_id = data.get("taker_order_id")
                 
-                # Check maker orders
+                # We need to process each maker order we might own
                 for maker in maker_orders:
                     order_id = maker.get("order_id")
                     matched_amount = float(maker.get("matched_amount", 0))
                     price = float(maker.get("price", 0))
-                    # The message doesn't explicitly give the token_id mapping easily to YES/NO side 
-                    # but we can resolve it using the order_id in our database.
                     if order_id:
                         asyncio.create_task(self.handle_fill(order_id, matched_amount, price))
                         
@@ -126,9 +133,11 @@ class UserStreamGateway:
                     asyncio.create_task(self.handle_fill(taker_order_id, size, price))
                     
         elif event_type == "order":
+            # For CANCELLATION or CLOSED events, we check if it was partially filled before
             status = data.get("status")
-            if status == "CANCELLATION":
-                order_id = data.get("id")
+            if status in ["CANCELLATION", "CLOSED", "CANCELED"]:
+                order_id = data.get("id") or data.get("order_id")
+                
                 if order_id:
                     asyncio.create_task(self.handle_cancellation(order_id))
 
@@ -145,14 +154,25 @@ class UserStreamGateway:
                 # Could be an order from another session or before tracking
                 return
                 
-            # If already marked as filled, avoid double counting
-            # (Though polymarket might send partial fills, we need to track accumulated size.
-            # For simplicity, assuming full fills for MVP or transitioning state)
-            if order.status == OrderStatus.FILLED:
-                return
-                
-            # Update order state
-            order.status = OrderStatus.FILLED
+            # Track cumulative fills to support partial fills and dust handling
+            # We initialize a "filled_size" counter in payload if not exists
+            payload = dict(order.payload) if order.payload else {}
+            current_filled = float(payload.get("filled_size", 0.0))
+            new_total_filled = current_filled + filled_size
+            
+            payload["filled_size"] = new_total_filled
+            order.payload = payload
+            
+            original_size = float(order.size)
+            
+            # Determine if fully filled or partially filled
+            if new_total_filled >= original_size - 1e-6: # Dust tolerance
+                order.status = OrderStatus.FILLED
+            else:
+                # Mark as partially filled (using a string or creating a new enum, 
+                # but if enum is strictly FILLED, we might just leave it OPEN but with accumulated fill payload)
+                # To stick to existing enum, we keep it OPEN, but the payload tracks filled size.
+                order.status = OrderStatus.OPEN
             
             # 2. Update Inventory Ledger atomically
             market_id = order.market_id
@@ -200,14 +220,26 @@ class UserStreamGateway:
             logger.info(f"Order {order_id} marked as FILLED. Size: {filled_size} @ {fill_price}")
 
     async def handle_cancellation(self, order_id: str):
+        """Handle order cancellation, including dust/partial fill cleanup."""
         async with AsyncSessionLocal() as session:
-            stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id)
+            stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id).with_for_update()
             result = await session.execute(stmt)
             order = result.scalar_one_or_none()
             
-            if order and order.status != OrderStatus.CANCELED and order.status != OrderStatus.FILLED:
+            if order and order.status not in [OrderStatus.CANCELED, OrderStatus.FILLED]:
+                payload = dict(order.payload) if order.payload else {}
+                filled_size = float(payload.get("filled_size", 0.0))
+                original_size = float(order.size)
+                
+                # Check for partial fill vs complete cancellation
+                if filled_size > 0:
+                    logger.info(f"Order {order_id} canceled after partial fill. (Filled: {filled_size}/{original_size})")
+                    payload["status_detail"] = "PARTIALLY_FILLED_AND_CANCELED"
+                else:
+                    logger.info(f"Order {order_id} fully canceled.")
+                    
+                order.payload = payload
                 order.status = OrderStatus.CANCELED
                 await session.commit()
-                logger.info(f"Order {order_id} marked as CANCELED via WS event")
 
 user_stream = UserStreamGateway()

@@ -70,12 +70,50 @@ with st.sidebar.form("start_market_form"):
                         data = response.json()
                         st.success(f"Started quoting for {condition_id[:8]}...")
                         st.json(data)
+                        st.rerun()
                     else:
                         st.error(f"Failed: {response.text}")
             except Exception as e:
                 st.error(f"API Connection Error: {e}")
         else:
             st.warning("Please enter a Condition ID.")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Emergency Controls")
+
+kill_condition_id = st.sidebar.text_input("Target Condition ID", placeholder="0x...", key="kill_input")
+
+col_stop, col_liq = st.sidebar.columns(2)
+
+with col_stop:
+    if st.button("🛑 Stop", help="Soft Cancel all orders and suspend engine for this market"):
+        if kill_condition_id:
+            try:
+                res = requests.post(f"{API_URL}/markets/{kill_condition_id}/stop")
+                if res.status_code == 200:
+                    st.success("Stopped")
+                    st.rerun()
+                else:
+                    st.error(res.text)
+            except Exception as e:
+                st.error(f"API Error: {e}")
+        else:
+            st.warning("Enter ID")
+
+with col_liq:
+    if st.button("☢️ Liquidate All", help="Cancel orders and Market Dump to clear exposure"):
+        if kill_condition_id:
+            try:
+                res = requests.post(f"{API_URL}/markets/{kill_condition_id}/liquidate")
+                if res.status_code == 200:
+                    st.success("Liquidating")
+                    st.rerun()
+                else:
+                    st.error(res.text)
+            except Exception as e:
+                st.error(f"API Error: {e}")
+        else:
+            st.warning("Enter ID")
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Refresh Data", use_container_width=True):

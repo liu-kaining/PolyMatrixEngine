@@ -90,6 +90,33 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
             market.no_token_id = no_token_id
             
         await db.commit()
+        
+    # Pre-flight Check: USDC Balance
+    # We require a basic buffer to run the grid (e.g. $50 minimum)
+    MIN_REQUIRED_USDC = 50.0
+    from app.oms.core import oms
+    if oms.client and settings.LIVE_TRADING_ENABLED:
+        try:
+            # We fetch allowance first
+            # The client usually connects to Polygon directly using Web3 if needed for on-chain.
+            allowance_obj = oms.client.get_allowance()
+            
+            # Since fetching balance directly via py-clob-client is tricky without raw Web3,
+            # we check allowance as a proxy. For true balance, you need a web3 provider.
+            # However, if there's an API wrapper, we try it:
+            if hasattr(oms.client, 'get_balance'):
+                balance = float(oms.client.get_balance())
+                if balance < MIN_REQUIRED_USDC:
+                    logger.error(f"Insufficient USDC balance: {balance} < {MIN_REQUIRED_USDC}")
+                    raise HTTPException(status_code=400, detail=f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, Available: {balance} USDC")
+                logger.info(f"Pre-flight check passed. USDC Balance: {balance}")
+            else:
+                logger.warning("ClobClient does not support get_balance natively without web3 setup.")
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Could not verify USDC balance during pre-flight (might be offline/dry-run): {e}")
     
     # Subscribe to WS with token IDs (asset_ids)
     await md_gateway.subscribe([market.yes_token_id, market.no_token_id])
@@ -112,6 +139,86 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
             "NO": market.no_token_id
         }
     }
+
+@app.post("/markets/{condition_id}/stop")
+async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
+    """Soft stop: Cancel all orders and suspend quoting engine for this market"""
+    from app.oms.core import oms
+    
+    # Send pub/sub message to tell engine to halt immediately
+    await redis_client.publish(f"control:{condition_id}", {"action": "suspend"})
+    logger.info(f"Published suspend signal for {condition_id}")
+    
+    # Soft Cancel via Relayer (Cancel all active orders for this market)
+    await oms.cancel_market_orders(condition_id)
+    
+    # Update DB status
+    result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
+    market = result.scalar_one_or_none()
+    if market:
+        market.status = "suspended"
+        await db.commit()
+        
+    return {"status": "stopped", "condition_id": condition_id}
+
+@app.post("/markets/{condition_id}/liquidate")
+async def liquidate_market(condition_id: str, db: AsyncSession = Depends(get_db)):
+    """Liquidate all positions: Cancel orders and market dump (Cross the spread)"""
+    from app.oms.core import oms
+    
+    # 1. Immediate Suspension and Soft Cancel
+    await redis_client.publish(f"control:{condition_id}", {"action": "suspend"})
+    await oms.cancel_market_orders(condition_id)
+    
+    # Update DB status
+    result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
+    market = result.scalar_one_or_none()
+    if market:
+        market.status = "suspended"
+        
+    # 2. Get current inventory
+    result_inv = await db.execute(select(InventoryLedger).filter(InventoryLedger.market_id == condition_id))
+    inv = result_inv.scalar_one_or_none()
+    
+    if not inv or not market:
+        await db.commit()
+        return {"status": "liquidated (no inventory)", "condition_id": condition_id}
+        
+    # 3. Liquidate Yes/No Exposure by crossing the spread (Taker)
+    yes_exp = float(inv.yes_exposure)
+    no_exp = float(inv.no_exposure)
+    
+    # We construct market orders (Taker). For CLOB, we place limit orders deep into the book to guarantee execution.
+    tasks = []
+    
+    # Selling Yes exposure (If we hold YES, we SELL YES at $0.01 to guarantee fill)
+    if yes_exp > 0:
+        logger.warning(f"Liquidating {yes_exp} YES exposure for {condition_id}")
+        tasks.append(oms.create_order(
+            condition_id=condition_id, 
+            token_id=market.yes_token_id, 
+            side=OrderSide.SELL, 
+            price=0.01, # Floor price to match any bid
+            size=yes_exp
+        ))
+    
+    # Selling No exposure (If we hold NO, we SELL NO at $0.01 to guarantee fill)
+    if no_exp > 0:
+        logger.warning(f"Liquidating {no_exp} NO exposure for {condition_id}")
+        tasks.append(oms.create_order(
+            condition_id=condition_id, 
+            token_id=market.no_token_id, 
+            side=OrderSide.SELL, 
+            price=0.01, # Floor price to match any bid
+            size=no_exp
+        ))
+        
+    if tasks:
+        # We don't wait for fills here; they will be handled by the user stream and update the DB automatically.
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    await db.commit()
+    return {"status": "liquidating", "condition_id": condition_id, "yes_liquidated": yes_exp, "no_liquidated": no_exp}
 
 @app.get("/markets/{condition_id}/risk")
 async def get_market_risk(condition_id: str, db: AsyncSession = Depends(get_db)):
