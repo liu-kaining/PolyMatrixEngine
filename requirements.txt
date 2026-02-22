@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+redis
+sqlalchemy
+asyncpg
+alembic
+pydantic
+pydantic-settings
+websockets
+python-dotenv
+web3
+py-clob-client
+httpx
