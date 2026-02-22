@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     ALCHEMY_RPC_URL: str = ""
     
     # Trading params
-    MAX_EXPOSURE_PER_MARKET: float = 1000.0 # Example limit
+    MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch
 
     class Config:
         env_file = ".env"

@@ -211,4 +211,29 @@ class OrderManagementSystem:
             logger.error(f"[LIVE] Failed to cancel order {order_id}: {e}")
             return False
 
+    async def cancel_market_orders(self, condition_id: str):
+        """Emergency cancel all OPEN/PENDING orders for a specific market"""
+        logger.warning(f"Initiating cancel_market_orders for {condition_id}")
+        async with AsyncSessionLocal() as session:
+            stmt = select(OrderJournal).filter(
+                OrderJournal.market_id == condition_id,
+                OrderJournal.status.in_([OrderStatus.PENDING, OrderStatus.OPEN])
+            )
+            result = await session.execute(stmt)
+            active_orders = result.scalars().all()
+            
+        if not active_orders:
+            logger.info(f"No active orders found for {condition_id} to cancel.")
+            return True
+            
+        tasks = []
+        for order in active_orders:
+            tasks.append(self.cancel_order(order.order_id))
+            
+        # Execute concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success_count = sum(1 for r in results if r is True)
+        logger.info(f"Canceled {success_count}/{len(active_orders)} orders for {condition_id}")
+        return True
+
 oms = OrderManagementSystem()

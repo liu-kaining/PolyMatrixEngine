@@ -34,25 +34,46 @@ class QuotingEngine:
         
         self._trade_lock = asyncio.Lock()   # Lock for atomic order updates
         self.active_orders: Dict[str, str] = {}
+        
+        self.suspended = False # Internal flag for Kill Switch
 
     async def run(self):
         """Main loop for the quoting engine"""
         pubsub = redis_client.client.pubsub()
-        await pubsub.subscribe(f"tick:{self.token_id}")
-        logger.info(f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. Listening to tick:{self.token_id}")
+        # Subscribe to market ticks and control signals for this specific market
+        await pubsub.subscribe(f"tick:{self.token_id}", f"control:{self.condition_id}")
+        logger.info(f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. Listening to tick & control.")
         
         try:
             async for message in pubsub.listen():
                 if message['type'] == 'message':
-                    tick_data = json.loads(message['data'])
-                    await self.on_tick(tick_data)
+                    channel = message['channel']
+                    data = json.loads(message['data'])
+                    
+                    if channel == f"control:{self.condition_id}":
+                        await self.on_control_message(data)
+                    elif channel == f"tick:{self.token_id}":
+                        if not self.suspended:
+                            await self.on_tick(data)
         except asyncio.CancelledError:
             logger.info(f"QuotingEngine shutting down for Token {self.token_id}")
         finally:
             # Ensure Redis resources are released
-            await pubsub.unsubscribe(f"tick:{self.token_id}")
+            await pubsub.unsubscribe(f"tick:{self.token_id}", f"control:{self.condition_id}")
             await pubsub.close()
             logger.info(f"Redis PubSub closed for Token {self.token_id}")
+
+    async def on_control_message(self, data: dict):
+        """Handle incoming signals from the Watchdog or API"""
+        action = data.get("action")
+        if action == "suspend":
+            async with self._trade_lock:
+                self.suspended = True
+                logger.critical(f"[{self.token_id[:6]}] QuotingEngine SUSPENDED by Control Signal. Halting all new orders.")
+        elif action == "resume":
+            async with self._trade_lock:
+                self.suspended = False
+                logger.info(f"[{self.token_id[:6]}] QuotingEngine RESUMED by Control Signal.")
                 
     async def on_tick(self, tick_data: dict):
         """Evaluate orderbook, calculate Mid-Price, and print Mock Grid Payload"""
