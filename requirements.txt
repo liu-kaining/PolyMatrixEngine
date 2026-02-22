@@ -11,3 +11,6 @@ python-dotenv
 web3
 py-clob-client
 httpx
+streamlit
+pandas
+psycopg2-binary

@@ -21,6 +21,20 @@ services:
     volumes:
       - ./.env:/app/.env
 
+  dashboard:
+    build: .
+    container_name: polymatrix_dashboard
+    restart: always
+    ports:
+      - "8501:8501"
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres_password@postgres:5432/polymatrix
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+      - postgres
+
   postgres:
     image: postgres:15-alpine
     container_name: polymatrix_postgres

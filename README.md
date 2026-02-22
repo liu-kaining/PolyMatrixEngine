@@ -31,9 +31,9 @@ The entire application runs inside Docker.
    ```
 
 3. **Start the Application:**
-   Run the following command to build the image and start the FastAPI server, PostgreSQL, and Redis in the background:
+   Run the following command to build the image and start the FastAPI server, Streamlit Dashboard, PostgreSQL, and Redis in the background:
    ```bash
-   docker compose up -d
+   docker compose up --build -d
    ```
    
    The database tables will be automatically initialized via `alembic` when the `api` container starts.
@@ -42,6 +42,18 @@ To view the application logs:
 ```bash
 docker compose logs -f api
 ```
+
+## Dashboard & Monitoring
+
+PolyMatrix Engine comes with a built-in real-time monitoring dashboard powered by Streamlit.
+
+Once the containers are running, open your browser and navigate to:
+**[http://localhost:8501](http://localhost:8501)**
+
+Features of the dashboard:
+- **Control Panel:** Enter a Polymarket `condition_id` and start the Quoting Engine.
+- **Inventory & Risk:** Real-time visual bar charts of your `yes_exposure` and `no_exposure` across all markets, including Realized PnL.
+- **Active Orders:** View all resting orders (`OPEN` / `PENDING`) currently on the Polymarket CLOB.
 
 ## API Usage
 
