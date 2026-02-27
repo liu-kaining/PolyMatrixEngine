@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch
     BASE_ORDER_SIZE: float = 10.0         # Default $ size per order (can be overridden via .env)
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
+    # Strategy: 少而精 — we only get filled when the market hits our price (below fair value). No chasing fills.
+    QUOTE_BASE_SPREAD: float = 0.02       # Edge per fill: BUY at fair_value - spread/2 (wider = more edge, fewer fills)
+    QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.005  # Refresh grid when mid moves this much (keep quotes in line with fair value)
 
     class Config:
         env_file = ".env"

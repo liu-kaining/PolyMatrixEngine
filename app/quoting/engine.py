@@ -21,7 +21,7 @@ class AlphaPricingModel:
 class AlphaModel:
     """Calculates baseline probability and spread adjustments based on orderbook imbalance and inventory."""
     def __init__(self):
-        self.base_spread = 0.02
+        self.base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
         self.inventory_skew_factor = 0.0005  # Lower/raise price by $0.0005 per $1 of exposure (Example parameter)
 
     async def calculate_alpha(self, bids: list, asks: list, current_exposure: float) -> Tuple[float, float]:
@@ -80,8 +80,8 @@ class QuotingEngine:
         # Polymarket requires minimum order size 5, enforce that here.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
         
-        # Debounce/Throttle Settings
-        self.price_offset_threshold = 0.005 # Mid-Price deviation threshold
+        # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
+        self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
         self.last_anchor_mid_price = None   # Base anchor price
         
         self.is_yes_token = None # Resolved dynamically
@@ -225,12 +225,13 @@ class QuotingEngine:
                 )
 
             else:
-                # State A: neutral / light exposure → normal maker, focus on buying inventory cheaply.
+                # State A: neutral / light exposure — 少而精，高概率赚钱。
+                # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
+                # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
                 for i in range(self.grid_levels):
-                    # Bid tiers around fair value: Mid - 0.01, Mid - 0.02...
                     bid_price = round(bid_1 - (i * self.tick_size), 2)
 
-                    # Only place BUY orders to accumulate inventory.
+                    # Only place BUY orders to accumulate inventory at our target price.
                     if 0.01 <= bid_price <= 0.99:
                         orders_payload.append(
                             {

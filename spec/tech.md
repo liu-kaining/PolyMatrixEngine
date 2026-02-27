@@ -68,6 +68,8 @@
 
 #### 2.3 Quoting Engine (`app/quoting/engine.py`)
 
+- **报价原则：少而精，高概率赚钱。** 不为了成交而成交：BUY 仅挂在 `fair_value - spread/2` 及以下，不贴 Best Bid；只有市场主动卖到我们挂单价时才成交，保证每笔成交都有正 edge。不轻易出手，一出手就要能高概率赚钱。
+
 - 核心结构：
 
   ```python
