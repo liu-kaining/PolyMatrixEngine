@@ -12,9 +12,39 @@ st.set_page_config(page_title="PolyMatrix Engine Dashboard", layout="wide", page
 
 # Environment variables
 # We replace asyncpg with psycopg2 because pandas read_sql uses sync sqlalchemy engine
-DB_URL_ASYNC = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres_password@localhost:5432/polymatrix")
-DB_URL_SYNC = DB_URL_ASYNC.replace("+asyncpg", "+psycopg2") if "+asyncpg" in DB_URL_ASYNC else DB_URL_ASYNC
+DB_URL_ASYNC = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres_password@localhost:5432/polymatrix",
+)
+DB_URL_SYNC = (
+    DB_URL_ASYNC.replace("+asyncpg", "+psycopg2")
+    if "+asyncpg" in DB_URL_ASYNC
+    else DB_URL_ASYNC
+)
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+
+# Path to backend trading log (can be overridden by TRADING_LOG_PATH)
+LOG_FILE_PATH = os.getenv(
+    "TRADING_LOG_PATH",
+    os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "data",
+        "logs",
+        "trading.log",
+    ),
+)
+
+# Session state for two-step confirmations
+if "pending_start_condition_id" not in st.session_state:
+    st.session_state["pending_start_condition_id"] = None
+if "pending_screener_start_cid" not in st.session_state:
+    st.session_state["pending_screener_start_cid"] = None
+if "pending_screener_question" not in st.session_state:
+    st.session_state["pending_screener_question"] = ""
+if "pending_kill_action" not in st.session_state:
+    st.session_state["pending_kill_action"] = None
+if "pending_kill_condition_id" not in st.session_state:
+    st.session_state["pending_kill_condition_id"] = None
 
 @st.cache_resource
 def get_engine():
@@ -89,6 +119,43 @@ def fetch_active_orders():
         st.error(f"Error fetching active orders: {e}")
         return pd.DataFrame()
 
+
+def tail_logs(filepath: str, lines: int = 500) -> str:
+    """
+    Efficiently read the last N lines from a potentially large log file.
+    Falls back to full read if file is small.
+    """
+    if not os.path.exists(filepath):
+        return "Log file not found."
+
+    try:
+        # Basic, robust implementation: read from end in chunks
+        # to avoid loading very large files fully into memory.
+        line_separator = b"\n"
+        chunk_size = 8192
+        buffer = b""
+        line_count = 0
+
+        with open(filepath, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            position = file_size
+
+            while position > 0 and line_count <= lines:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                f.seek(position)
+                data = f.read(read_size)
+                buffer = data + buffer
+                line_count = buffer.count(line_separator)
+
+        # Decode and slice the last N lines
+        text = buffer.decode("utf-8", errors="replace")
+        all_lines = text.splitlines()
+        return "\n".join(all_lines[-lines:])
+    except Exception as e:
+        return f"Error reading log file: {e}"
+
 @st.cache_data
 def resolve_condition_id(market_input: str) -> str | None:
     """
@@ -158,18 +225,36 @@ with st.sidebar.form("start_market_form"):
             if not condition_id:
                 st.error("Could not resolve a valid condition_id from the input. Please check the URL or ID.")
             else:
-                try:
-                    with st.spinner("Initializing Quoting Engine..."):
-                        response = requests.post(f"{API_URL}/markets/{condition_id}/start")
-                        if response.status_code == 200:
-                            data = response.json()
-                            st.success(f"Started quoting for {condition_id[:8]}...")
-                            st.json(data)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed: {response.text}")
-                except Exception as e:
-                    st.error(f"API Connection Error: {e}")
+                # Defer actual API call to a second explicit confirmation step
+                st.session_state["pending_start_condition_id"] = condition_id
+
+# Sidebar confirmation for starting market making
+pending_cid = st.session_state.get("pending_start_condition_id")
+if pending_cid:
+    st.sidebar.warning(
+        f"Confirm starting quoting strategy for market {pending_cid[:8]}... "
+        "This may place real orders with current config."
+    )
+    c_col1, c_col2 = st.sidebar.columns(2)
+    with c_col1:
+        if st.button("✅ Confirm Start", key="confirm_start_sidebar"):
+            try:
+                with st.spinner("Initializing Quoting Engine..."):
+                    response = requests.post(f"{API_URL}/markets/{pending_cid}/start")
+                if response.status_code == 200:
+                    data = response.json()
+                    st.success(f"Started quoting for {pending_cid[:8]}...")
+                    st.json(data)
+                    st.session_state["pending_start_condition_id"] = None
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {response.text}")
+            except Exception as e:
+                st.error(f"API Connection Error: {e}")
+                st.session_state["pending_start_condition_id"] = None
+    with c_col2:
+        if st.button("Cancel", key="cancel_start_sidebar"):
+            st.session_state["pending_start_condition_id"] = None
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Emergency Controls")
@@ -181,32 +266,51 @@ col_stop, col_liq = st.sidebar.columns(2)
 with col_stop:
     if st.button("🛑 Stop", help="Soft Cancel all orders and suspend engine for this market"):
         if kill_condition_id:
-            try:
-                res = requests.post(f"{API_URL}/markets/{kill_condition_id}/stop")
-                if res.status_code == 200:
-                    st.success("Stopped")
-                    st.rerun()
-                else:
-                    st.error(res.text)
-            except Exception as e:
-                st.error(f"API Error: {e}")
+            st.session_state["pending_kill_action"] = "stop"
+            st.session_state["pending_kill_condition_id"] = kill_condition_id
         else:
             st.warning("Enter ID")
 
 with col_liq:
     if st.button("☢️ Liquidate All", help="Cancel orders and Market Dump to clear exposure"):
         if kill_condition_id:
+            st.session_state["pending_kill_action"] = "liquidate"
+            st.session_state["pending_kill_condition_id"] = kill_condition_id
+        else:
+            st.warning("Enter ID")
+
+# Sidebar confirmation for Stop / Liquidate
+pending_kill_action = st.session_state.get("pending_kill_action")
+pending_kill_cid = st.session_state.get("pending_kill_condition_id")
+if pending_kill_action and pending_kill_cid:
+    label = "Stop" if pending_kill_action == "stop" else "Liquidate All"
+    st.sidebar.warning(
+        f"Confirm {label} for market {pending_kill_cid[:8]}... "
+        "This will affect live strategy state."
+    )
+    k_col1, k_col2 = st.sidebar.columns(2)
+    with k_col1:
+        if st.button(f"✅ Confirm {label}", key="confirm_kill_action"):
+            endpoint = "stop" if pending_kill_action == "stop" else "liquidate"
             try:
-                res = requests.post(f"{API_URL}/markets/{kill_condition_id}/liquidate")
+                res = requests.post(f"{API_URL}/markets/{pending_kill_cid}/{endpoint}")
                 if res.status_code == 200:
-                    st.success("Liquidating")
+                    st.success(f"{label} executed")
+                    st.session_state["pending_kill_action"] = None
+                    st.session_state["pending_kill_condition_id"] = None
                     st.rerun()
                 else:
                     st.error(res.text)
+                    st.session_state["pending_kill_action"] = None
+                    st.session_state["pending_kill_condition_id"] = None
             except Exception as e:
                 st.error(f"API Error: {e}")
-        else:
-            st.warning("Enter ID")
+                st.session_state["pending_kill_action"] = None
+                st.session_state["pending_kill_condition_id"] = None
+    with k_col2:
+        if st.button("Cancel", key="cancel_kill_action"):
+            st.session_state["pending_kill_action"] = None
+            st.session_state["pending_kill_condition_id"] = None
 
 st.sidebar.markdown("---")
 
@@ -304,7 +408,7 @@ mode_col, _ = st.columns([1, 3])
 with mode_col:
     screener_mode = st.selectbox(
         "Screener mode",
-        options=["Conservative", "Normal", "Aggressive"],
+        options=["Conservative", "Normal", "Aggressive", "Ultra"],
         index=0,
         help="Conservative = strict filters; Aggressive = looser filters showing more markets.",
     )
@@ -318,7 +422,8 @@ with col_load:
                 params={
                     "active": "true",
                     "closed": "false",
-                    "limit": 200,
+                    # Try to approximate full universe rather than a tiny top slice
+                    "limit": 500,
                 },
                 timeout=5,
             )
@@ -329,25 +434,129 @@ with col_load:
                 screened = []
                 now = datetime.now(timezone.utc)
 
-                # Configure thresholds based on screener mode
+                # Configure thresholds based on screener mode.
+                # Conservative: original strict filters for high-quality liquidity.
+                # Normal: relaxed, good daily MM candidates.
+                # Aggressive: very loose filters.
+                # Ultra: almost full universe (only binary + category filters),
+                #        no DTE/volume/liquidity/odds band constraints.
                 if screener_mode == "Conservative":
                     min_dte = timedelta(days=7)
                     min_vol = 50_000.0
                     min_liq = 10_000.0
                     price_low, price_high = 0.25, 0.75
                 elif screener_mode == "Normal":
-                    min_dte = timedelta(days=5)
-                    min_vol = 20_000.0
-                    min_liq = 5_000.0
-                    price_low, price_high = 0.20, 0.80
-                else:  # Aggressive
                     min_dte = timedelta(days=3)
-                    min_vol = 5_000.0
-                    min_liq = 2_000.0
-                    price_low, price_high = 0.15, 0.85
+                    min_vol = 10_000.0
+                    min_liq = 3_000.0
+                    price_low, price_high = 0.20, 0.80
+                elif screener_mode == "Aggressive":
+                    min_dte = timedelta(days=1)
+                    min_vol = 1_000.0
+                    min_liq = 500.0
+                    price_low, price_high = 0.10, 0.90
+                else:  # Ultra
+                    # Placeholders; we will skip these checks entirely for Ultra.
+                    min_dte = timedelta(days=0)
+                    min_vol = 0.0
+                    min_liq = 0.0
+                    price_low, price_high = 0.0, 1.0
+
+                # V1.1 Category & Semantic Filtering
+                # Hard blacklist for Sports / live event markets
+                sports_blacklist = {
+                    "sports",
+                    "sport",
+                    "nfl",
+                    "nba",
+                    "mlb",
+                    "nhl",
+                    "soccer",
+                    "football",
+                    "premier-league",
+                    "premier league",
+                    "champions-league",
+                    "champions league",
+                }
+                question_blacklist = {
+                    "win the match",
+                    "wins the match",
+                    "to win the match",
+                    "halftime",
+                    "half-time",
+                    "in-play",
+                    "in play",
+                    "live betting",
+                    "live market",
+                    "live odds",
+                }
+                premium_keywords = {
+                    "politics",
+                    "elections",
+                    "election",
+                    "culture",
+                }
 
                 for m in raw_markets:
+                    # ---------------------------
+                    # 0) Category & semantic pre-filter (hard ban toxic flow)
+                    # ---------------------------
+                    tags_raw = m.get("tags")
+                    tags_list = []
+                    if tags_raw:
+                        if isinstance(tags_raw, str):
+                            # Try JSON first, otherwise treat as comma-separated
+                            try:
+                                parsed = json.loads(tags_raw)
+                                if isinstance(parsed, list):
+                                    tags_list = parsed
+                                elif isinstance(parsed, str):
+                                    tags_list = [parsed]
+                            except Exception:
+                                tags_list = [
+                                    t.strip()
+                                    for t in tags_raw.replace(";", ",").split(",")
+                                    if t.strip()
+                                ]
+                        elif isinstance(tags_raw, list):
+                            tags_list = tags_raw
+
+                    category_raw = m.get("category") or m.get("subCategory") or ""
+                    slug = (m.get("slug") or "").lower()
+                    question_text = m.get("question") or ""
+                    question_lower = question_text.lower()
+
+                    # Build a text bag for sports blacklist matching
+                    tag_text = " ".join(str(t) for t in tags_list)
+                    category_haystack = " ".join(
+                        [category_raw, tag_text, slug]
+                    ).lower()
+
+                    if any(kw in category_haystack for kw in sports_blacklist):
+                        # Hard drop sports / leagues / obvious sports categories
+                        continue
+                    if any(kw in question_lower for kw in question_blacklist):
+                        # Hard drop live / in-play style questions
+                        continue
+
+                    # Derive a display category and premium flag (Politics / Elections / Culture)
+                    cat_source = category_raw.strip() or (
+                        tags_list[0].strip() if tags_list else ""
+                    )
+                    cat_match_text = (
+                        (category_raw or "") + " " + tag_text
+                    ).lower()
+                    is_premium = any(
+                        pk in cat_match_text for pk in premium_keywords
+                    )
+                    display_category = cat_source
+                    if is_premium:
+                        # Premium highlight for ideal maker tracks
+                        display_category = f"⭐ {cat_source or 'Premium'}"
+
+                    # ---------------------------
                     # 1) Binary ONLY: outcomes == ["Yes", "No"] (case-insensitive)
+                    # ---------------------------
                     outcomes_raw = m.get("outcomes")
                     outcomes = []
                     if outcomes_raw:
@@ -362,25 +571,18 @@ with col_load:
                     if outcomes_lower != {"yes", "no"}:
                         continue
 
-                    # 2) DTE >= 7 days
+                    # 2) DTE, volume, liquidity & odds filters (skipped in Ultra mode)
                     end_raw = m.get("endDate")
                     try:
                         end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
                     except Exception:
                         continue
-                    if end_dt - now < min_dte:
-                        continue
-
-                    # 3) Volume & Liquidity thresholds
                     try:
                         vol_24h = float(m.get("volume24hr") or 0.0)
                         liq = float(m.get("liquidityNum") or 0.0)
                     except Exception:
                         continue
-                    if vol_24h <= min_vol or liq <= min_liq:
-                        continue
 
-                    # 4) Goldilocks YES price band, if prices are present
                     yes_price = None
                     prices_raw = m.get("outcomePrices")
                     if prices_raw:
@@ -398,18 +600,25 @@ with col_load:
                                 yes_price = float(prices[0])
                             except Exception:
                                 yes_price = None
-                    if yes_price is not None and not (price_low <= yes_price <= price_high):
-                        continue
+
+                    if screener_mode != "Ultra":
+                        if end_dt - now < min_dte:
+                            continue
+                        if vol_24h <= min_vol or liq <= min_liq:
+                            continue
+                        if yes_price is not None and not (price_low <= yes_price <= price_high):
+                            continue
 
                     screened.append(
                         {
-                            "question": m.get("question", ""),
+                            "question": question_text,
                             "yes_price": yes_price,
                             "volume24hr": vol_24h,
                             "liquidity": liq,
                             "end_date": end_dt,
                             "condition_id": m.get("conditionId"),
                             "slug": m.get("slug"),
+                            "category": display_category,
                         }
                     )
 
@@ -426,6 +635,7 @@ if screened_markets:
         [
             {
                 "Question": m["question"],
+                "Category/Tag": m.get("category", ""),
                 "YES Price": m["yes_price"],
                 "Volume 24h": m["volume24hr"],
                 "Liquidity": m["liquidity"],
@@ -438,10 +648,21 @@ if screened_markets:
     )
 
     st.dataframe(
-        df_screen[["Question", "YES Price", "Volume 24h", "Liquidity", "End Date", "Condition ID"]],
+        df_screen[
+            [
+                "Question",
+                "Category/Tag",
+                "YES Price",
+                "Volume 24h",
+                "Liquidity",
+                "End Date",
+                "Condition ID",
+            ]
+        ],
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Category/Tag": st.column_config.TextColumn("Category/Tag"),
             "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
             "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
             "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
@@ -449,41 +670,135 @@ if screened_markets:
     )
 
     st.markdown("#### Launch Quoting from Screener")
-    for m in screened_markets:
-        cid = m["condition_id"]
-        cols = st.columns([6, 1])
-        with cols[0]:
-            st.markdown(f"**{m['question']}**")
-            st.markdown(
-                f"- YES Price: `{m['yes_price'] if m['yes_price'] is not None else 'N/A'}`  "
-                f"- 24h Volume: `${m['volume24hr']:.0f}`  "
-                f"- Liquidity: `${m['liquidity']:.0f}`  "
-                f"- End Date: `{m['end_date'].strftime('%Y-%m-%d')}`"
-            )
-        with cols[1]:
-            if st.button(
-                "✅ Start",
-                key=f"screener_start_{cid}",
-                help="Use current .env config to start quoting this market",
-            ):
-                if not cid:
-                    st.error("Missing conditionId for this market.")
-                else:
-                    try:
-                        with st.spinner("Starting quoting for selected market..."):
-                            res = requests.post(f"{API_URL}/markets/{cid}/start")
-                            if res.status_code == 200:
-                                st.success(f"Started quoting for {cid[:8]}...")
-                                st.json(res.json())
-                                st.rerun()
-                            else:
-                                st.error(res.text)
-                    except Exception as e:
-                        st.error(f"API Error: {e}")
+
+    # Compact launcher: select a market from dropdown, then confirm.
+    indices = list(range(len(screened_markets)))
+
+    def _format_option(i: int) -> str:
+        m = screened_markets[i]
+        yes_p = m["yes_price"]
+        yes_str = f"{yes_p:.3f}" if yes_p is not None else "N/A"
+        return (
+            f"{m['question']} | YES {yes_str} | "
+            f"Vol {m['volume24hr']:.0f} | Liq {m['liquidity']:.0f}"
+        )
+
+    selected_idx = st.selectbox(
+        "Select a market to start quoting",
+        options=indices,
+        format_func=_format_option,
+    )
+
+    launch_col1, launch_col2 = st.columns(2)
+    with launch_col1:
+        if st.button(
+            "✅ Prepare Start from Screener",
+            key="prepare_screener_start",
+            help="Prepare to start quoting for the selected market (requires confirmation).",
+        ):
+            m_sel = screened_markets[selected_idx]
+            cid = m_sel["condition_id"]
+            if not cid:
+                st.error("Missing conditionId for this market.")
+            else:
+                st.session_state["pending_screener_start_cid"] = cid
+                st.session_state["pending_screener_question"] = m_sel["question"]
+    with launch_col2:
+        st.write("")  # spacer
+        st.write(f"Total screened markets: **{len(screened_markets)}**")
+
+    # Global confirmation for screener-based starts
+    pending_screener_cid = st.session_state.get("pending_screener_start_cid")
+    if pending_screener_cid:
+        pending_question = st.session_state.get("pending_screener_question", "")
+        st.warning(
+            f"Confirm starting quoting strategy for screener-selected market "
+            f"{pending_screener_cid[:8]}:\n\n{pending_question}"
+        )
+        s_col1, s_col2 = st.columns(2)
+        with s_col1:
+            if st.button("✅ Confirm Screener Start", key="confirm_screener_start"):
+                try:
+                    with st.spinner("Starting quoting for selected market..."):
+                        res = requests.post(
+                            f"{API_URL}/markets/{pending_screener_cid}/start"
+                        )
+                    if res.status_code == 200:
+                        st.success(
+                            f"Started quoting for {pending_screener_cid[:8]}..."
+                        )
+                        st.json(res.json())
+                        st.session_state["pending_screener_start_cid"] = None
+                        st.session_state["pending_screener_question"] = ""
+                        st.rerun()
+                    else:
+                        st.error(res.text)
+                        st.session_state["pending_screener_start_cid"] = None
+                        st.session_state["pending_screener_question"] = ""
+                except Exception as e:
+                    st.error(f"API Error: {e}")
+                    st.session_state["pending_screener_start_cid"] = None
+                    st.session_state["pending_screener_question"] = ""
+        with s_col2:
+            if st.button("Cancel", key="cancel_screener_start"):
+                st.session_state["pending_screener_start_cid"] = None
+                st.session_state["pending_screener_question"] = ""
 else:
     st.info("Click 'Load & Screen Markets' to fetch binary, liquid, medium-term markets from Gamma.")
 
 st.markdown("---")
+
+# 2.5 System Logs (Tail & Search)
+st.header("📝 System Logs (Tail & Search)")
+with st.expander("View trading engine logs", expanded=False):
+    col_search, col_level, col_refresh = st.columns([3, 1, 1])
+    with col_search:
+        log_filter = st.text_input(
+            "Search Filter (substring match)",
+            value="",
+            placeholder="keyword, condition_id, token_id, etc.",
+        )
+    with col_level:
+        level_filter = st.selectbox(
+            "Level",
+            options=["ALL", "INFO", "WARNING", "ERROR"],
+            index=0,
+        )
+    with col_refresh:
+        refresh = st.button("🔄 Refresh Logs", use_container_width=True)
+
+    # Always render current tail of the log; pressing the button simply triggers a rerun
+    raw_logs = tail_logs(LOG_FILE_PATH, lines=500)
+
+    # If tail_logs returned an error message, show directly
+    if raw_logs.startswith("Error reading log file") or raw_logs.startswith(
+        "Log file not found"
+    ):
+        st.code(raw_logs, language="log")
+    else:
+        filtered_lines = []
+        level_filter_upper = level_filter.upper()
+        keyword = (log_filter or "").strip().lower()
+
+        for line in raw_logs.splitlines():
+            line_strip = line.strip()
+            if not line_strip:
+                continue
+
+            # Level filtering: naive contains check on " | LEVEL | "
+            if level_filter_upper != "ALL":
+                level_tag = f"| {level_filter_upper} |"
+                if level_tag not in line_strip:
+                    continue
+
+            # Keyword filtering
+            if keyword and keyword not in line_strip.lower():
+                continue
+
+            filtered_lines.append(line_strip)
+
+        display_text = "\n".join(filtered_lines) if filtered_lines else "No logs matched the current filters."
+        st.code(display_text, language="log")
 
 # 3. Active Orders Panel
 st.header("📋 Active Orders")

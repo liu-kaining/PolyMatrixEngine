@@ -18,6 +18,7 @@ from app.market_data.gamma_client import gamma_client
 from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
 from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide
+from logging.handlers import RotatingFileHandler
 
 # Force application timezone to Beijing (UTC+8) for consistent logging timestamps.
 os.environ.setdefault("TZ", "Asia/Shanghai")
@@ -27,8 +28,34 @@ except Exception:
     # tzset may not be available on some platforms; ignore if so.
     pass
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# --- Logging configuration: console + rotating file ---
+log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+# Configure root logger to at least INFO and keep console handler
+logging.basicConfig(level=logging.INFO, format=log_format)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Determine log file path (can be overridden via TRADING_LOG_PATH)
+env_log_path = os.getenv("TRADING_LOG_PATH")
+if env_log_path:
+    log_path = env_log_path
+    log_dir = os.path.dirname(log_path) or "."
+else:
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    log_dir = os.path.join(base_dir, "data", "logs")
+    log_path = os.path.join(log_dir, "trading.log")
+
+os.makedirs(log_dir, exist_ok=True)
+
+file_handler = RotatingFileHandler(
+    log_path,
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=3,
+    encoding="utf-8",
+)
+file_handler.setFormatter(logging.Formatter(log_format))
+logger.addHandler(file_handler)
 
 # Reduce noise from SQLAlchemy internals; focus logs on business events.
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)

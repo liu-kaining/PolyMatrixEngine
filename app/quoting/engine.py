@@ -75,9 +75,10 @@ class QuotingEngine:
         # Grid settings (number of price levels per side)
         # Configurable via .env → GRID_LEVELS
         self.grid_levels = int(getattr(settings, "GRID_LEVELS", 1))
-        self.tick_size = 0.01 # $0.01 per share offset
+        self.tick_size = 0.01  # $0.01 per share offset
         # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
-        self.base_size = float(getattr(settings, "BASE_ORDER_SIZE", 10.0))
+        # Polymarket requires minimum order size 5, enforce that here.
+        self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
         
         # Debounce/Throttle Settings
         self.price_offset_threshold = 0.005 # Mid-Price deviation threshold
@@ -178,42 +179,87 @@ class QuotingEngine:
             
             # 4. Calculate optimal grid bounds based on Skewed Fair Value and Dynamic Spread
             anchor_distance = dynamic_spread / 2.0
-            
             bid_1 = round(fair_value - anchor_distance, 2)
             ask_1 = round(fair_value + anchor_distance, 2)
-            
+
             # Construct grid orders JSON
-            orders_payload = []
-            
-            for i in range(self.grid_levels):
-                # Bid tier: Mid - 0.01, Mid - 0.02...
-                bid_price = round(bid_1 - (i * self.tick_size), 2)
-                # Ask tier: Mid + 0.01, Mid + 0.02...
-                ask_price = round(ask_1 + (i * self.tick_size), 2)
-                
-                # Polymarket boundaries bounds check (0.01 to 0.99)
-                if 0.01 <= bid_price <= 0.99:
-                    orders_payload.append({
-                        "condition_id": self.condition_id,
-                        "token_id": self.token_id,
-                        "side": OrderSide.BUY,
-                        "price": bid_price,
-                        "size": self.base_size
-                    })
-                    
-                if 0.01 <= ask_price <= 0.99:
-                    orders_payload.append({
+            orders_payload: List[dict] = []
+
+            # V1.1 Inventory-Aware Asymmetric Quoting
+            # State A: Neutral / light position (current_exposure < 5.0) → hungry maker, focus on BUY
+            # State B: Long (current_exposure >= 5.0) → liquidation mode, only aggressive SELL
+            is_long = current_exposure >= 5.0
+
+            if is_long:
+                # State B: Long inventory → aggressive sell to unwind
+                logger.warning(
+                    f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
+                    "Entering AGGRESSIVE SELL MODE."
+                )
+
+                # No new BUYs in this mode – protect cash.
+                # Aggressive ask: try to be at or inside best ask while keeping at least +0.01 edge over fair value.
+                best_ask = float(asks[0]["price"])
+                aggressive_ask = min(fair_value + 0.01, best_ask - 0.01)
+
+                # Pricing Formula: Ask_Price = min(Fair Value + 0.01, Best_Ask - 0.01), clamped to [0.01, 0.99].
+                ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
+
+                # Respect Polymarket minimum size 5 and never oversell inventory.
+                target_size = max(self.base_size, 5.0)
+                sell_size = min(current_exposure, target_size)
+
+                orders_payload.append(
+                    {
                         "condition_id": self.condition_id,
                         "token_id": self.token_id,
                         "side": OrderSide.SELL,
                         "price": ask_price,
-                        "size": self.base_size
-                    })
-                    
+                        "size": sell_size,
+                    }
+                )
+
+                logger.info(
+                    f"[{self.token_id[:6]}] AGGRESSIVE SELL: Ask {ask_price} | Size {sell_size:.2f} | "
+                    f"Exposure {current_exposure:.2f}"
+                )
+
+            else:
+                # State A: neutral / light exposure → normal maker, focus on buying inventory cheaply.
+                for i in range(self.grid_levels):
+                    # Bid tiers around fair value: Mid - 0.01, Mid - 0.02...
+                    bid_price = round(bid_1 - (i * self.tick_size), 2)
+
+                    # Only place BUY orders to accumulate inventory.
+                    if 0.01 <= bid_price <= 0.99:
+                        orders_payload.append(
+                            {
+                                "condition_id": self.condition_id,
+                                "token_id": self.token_id,
+                                "side": OrderSide.BUY,
+                                "price": bid_price,
+                                "size": self.base_size,
+                            }
+                        )
+
+                    # SELL side is intentionally skipped in neutral state to avoid inefficient capital lockup
+                    # when we have very limited test capital and no shorting/minting capacity.
+                    # Once inventory >= 5.0, the engine automatically switches to the aggressive SELL mode above.
+
             # 5. Log Execution output
-            logger.info(f"==== [GRID EXEC] Condition: {self.condition_id[:6]}... | Token: {self.token_id[:6]}... ====")
-            logger.info(f"Top Book -> Bid: {bids[0]['price']} ({bids[0]['size']}) | Ask: {asks[0]['price']} ({asks[0]['size']})")
-            logger.info(f"Alpha -> Fair Value: {fair_value:.4f} | Dynamic Spread: {dynamic_spread:.4f} | Inventory Skew Exp: {current_exposure:.2f}")
+            logger.info(
+                f"==== [GRID EXEC] Condition: {self.condition_id[:6]}... | Token: {self.token_id[:6]}... ===="
+            )
+            logger.info(
+                f"Top Book -> Bid: {bids[0]['price']} ({bids[0]['size']}) | "
+                f"Ask: {asks[0]['price']} ({asks[0]['size']})"
+            )
+            logger.info(
+                "Alpha -> Fair Value: "
+                f"{fair_value:.4f} | Dynamic Spread: {dynamic_spread:.4f} | "
+                f"Inventory Skew Exp: {current_exposure:.2f} | Mode: "
+                f"{'LIQUIDATE_LONG' if is_long else 'NEUTRAL_ACCUMULATE'}"
+            )
             logger.info("Order Instructions Payload:")
             # Enum serialization requires .value if doing standard json.dumps, but we'll format it simply:
             log_payload = [

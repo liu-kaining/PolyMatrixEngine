@@ -15,6 +15,7 @@ services:
       - FUNDER_ADDRESS=${FUNDER_ADDRESS}
       - LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-False}
       - MAX_EXPOSURE_PER_MARKET=${MAX_EXPOSURE_PER_MARKET:-50.0}
+      - TRADING_LOG_PATH=/app/data/logs/trading.log
     depends_on:
       postgres:
         condition: service_healthy
@@ -22,6 +23,8 @@ services:
         condition: service_started
     volumes:
       - ./.env:/app/.env
+      # Shared log volume so dashboard can read trading.log
+      - logs_data:/app/data/logs
 
   dashboard:
     build: .
@@ -33,6 +36,10 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres_password@postgres:5432/polymatrix
       - API_URL=http://api:8000
+      - TRADING_LOG_PATH=/app/data/logs/trading.log
+    volumes:
+      # Mount the same logs volume used by the API so we can read trading.log
+      - logs_data:/app/data/logs
     depends_on:
       - api
       - postgres
@@ -68,3 +75,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  logs_data:
