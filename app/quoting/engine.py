@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from typing import Dict, List, Tuple
+from app.core.config import settings
 from app.core.redis import redis_client
 from app.oms.core import oms
 from app.models.db_models import OrderSide
@@ -71,10 +72,12 @@ class QuotingEngine:
         
         self.alpha_model = AlphaModel()
         
-        # Grid settings
-        self.grid_levels = 2  # Bid1, Bid2 and Ask1, Ask2
+        # Grid settings (number of price levels per side)
+        # Configurable via .env → GRID_LEVELS
+        self.grid_levels = int(getattr(settings, "GRID_LEVELS", 1))
         self.tick_size = 0.01 # $0.01 per share offset
-        self.base_size = 10.0 # $10 per order
+        # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
+        self.base_size = float(getattr(settings, "BASE_ORDER_SIZE", 10.0))
         
         # Debounce/Throttle Settings
         self.price_offset_threshold = 0.005 # Mid-Price deviation threshold
@@ -245,35 +248,26 @@ class QuotingEngine:
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Store active order IDs
-        for i, res in enumerate(results):
+        for res in results:
             if isinstance(res, str):
-                self.active_orders[f"order_{i}_{self.token_id}"] = res
+                self.active_orders[res] = res
 
     async def cancel_all_orders(self):
         """Cancel current active grid and ensure no orphan orders remain."""
         if not self.active_orders:
             return
             
-        order_ids = list(self.active_orders.values())
+        order_ids = list(self.active_orders.keys())
         logger.info(f"[{self.token_id[:6]}] Canceling {len(order_ids)} active orders...")
         
-        # Issue cancel commands concurrently
-        tasks = [oms.cancel_order(order_id) for order_id in order_ids]
+        tasks = [oms.cancel_order(oid) for oid in order_ids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Orphan Order Elimination: Validate receipts
         for order_id, success in zip(order_ids, results):
-            # Check internal dictionary key by value
-            key_to_del = next((k for k, v in self.active_orders.items() if v == order_id), None)
-            
             if success is True:
-                if key_to_del:
-                    del self.active_orders[key_to_del]
+                del self.active_orders[order_id]
             else:
-                logger.error(f"[{self.token_id[:6]}] 🚨 CRITICAL: Failed to cancel order {order_id}. Reason: {success}")
-                # We intentionally do NOT remove it from self.active_orders. 
-                # This guarantees it will be retried on the next tick or kill switch trigger.
+                logger.error(f"[{self.token_id[:6]}] CRITICAL: Failed to cancel order {order_id}. Reason: {success}")
 
 async def start_quoting_engine(condition_id: str, token_id: str):
     engine = QuotingEngine(condition_id, token_id)

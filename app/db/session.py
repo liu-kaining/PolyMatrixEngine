@@ -4,7 +4,8 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.models.db_models import Base
 
-engine = create_async_engine(settings.DATABASE_URL, echo=settings.DEBUG)
+# SQL echo is extremely noisy in production; keep it off by default.
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
 
 AsyncSessionLocal = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False

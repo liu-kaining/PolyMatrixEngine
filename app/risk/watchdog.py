@@ -120,9 +120,9 @@ class RiskMonitor:
             else:
                 actual_inventory[cid]["no"] += size
 
-        # 2. Compare with DB Ledger
+        # 2. Compare with DB Ledger (row-level lock to prevent dirty writes from concurrent handle_fill)
         async with AsyncSessionLocal() as session:
-            stmt = select(InventoryLedger)
+            stmt = select(InventoryLedger).with_for_update()
             result = await session.execute(stmt)
             db_inventories = result.scalars().all()
             
@@ -141,7 +141,6 @@ class RiskMonitor:
                     logger.error(f"DB -> YES: {db_yes:.2f}, NO: {db_no:.2f}")
                     logger.error(f"API -> YES: {actual['yes']:.2f}, NO: {actual['no']:.2f}")
                     
-                    # Force correct the local ledger
                     db_inv.yes_exposure = actual["yes"]
                     db_inv.no_exposure = actual["no"]
                     logger.info(f"Local ledger overwritten with on-chain data for {cid[:8]}")

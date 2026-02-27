@@ -1,5 +1,7 @@
+import os
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -14,10 +16,22 @@ from app.market_data.user_stream import user_stream
 from app.market_data.gamma_client import gamma_client
 from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
-from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal
+from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide
+
+# Force application timezone to Beijing (UTC+8) for consistent logging timestamps.
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except Exception:
+    # tzset may not be available on some platforms; ignore if so.
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Reduce noise from SQLAlchemy internals; focus logs on business events.
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
 
 # Application state for background tasks
 background_tasks = set()
@@ -67,20 +81,19 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
     result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
     market = result.scalar_one_or_none()
     
-    if not market or not market.yes_token_id or not market.no_token_id:
-        # Fetch tokens from Gamma API
-        tokens = await gamma_client.get_market_tokens_by_condition_id(condition_id)
-        if not tokens:
-            raise HTTPException(status_code=404, detail="Market tokens not found in Polymarket Gamma API")
-            
+    # Always refresh token IDs from Gamma to ensure we use current CLOB tokens.
+    tokens = await gamma_client.get_market_tokens_by_condition_id(condition_id)
+    if not tokens and (not market or not market.yes_token_id or not market.no_token_id):
+        raise HTTPException(status_code=404, detail="Market tokens not found in Polymarket Gamma API")
+    
+    if tokens:
         yes_token_id, no_token_id = tokens
-        
         if not market:
             market = MarketMeta(
-                condition_id=condition_id, 
+                condition_id=condition_id,
                 status="active",
                 yes_token_id=yes_token_id,
-                no_token_id=no_token_id
+                no_token_id=no_token_id,
             )
             new_inventory = InventoryLedger(market_id=condition_id)
             db.add(market)
@@ -88,31 +101,24 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
         else:
             market.yes_token_id = yes_token_id
             market.no_token_id = no_token_id
-            
         await db.commit()
         
-    # Pre-flight Check: USDC Balance
-    # We require a basic buffer to run the grid (e.g. $50 minimum)
+    # Pre-flight Check: USDC Balance (best-effort, only when LIVE_TRADING_ENABLED=True and SDK exposes it)
     MIN_REQUIRED_USDC = 50.0
     from app.oms.core import oms
     if oms.client and settings.LIVE_TRADING_ENABLED:
         try:
-            # We fetch allowance first
-            # The client usually connects to Polygon directly using Web3 if needed for on-chain.
-            allowance_obj = oms.client.get_allowance()
-            
-            # Since fetching balance directly via py-clob-client is tricky without raw Web3,
-            # we check allowance as a proxy. For true balance, you need a web3 provider.
-            # However, if there's an API wrapper, we try it:
-            if hasattr(oms.client, 'get_balance'):
+            if hasattr(oms.client, "get_balance"):
                 balance = float(oms.client.get_balance())
                 if balance < MIN_REQUIRED_USDC:
                     logger.error(f"Insufficient USDC balance: {balance} < {MIN_REQUIRED_USDC}")
-                    raise HTTPException(status_code=400, detail=f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, Available: {balance} USDC")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, Available: {balance} USDC",
+                    )
                 logger.info(f"Pre-flight check passed. USDC Balance: {balance}")
             else:
-                logger.warning("ClobClient does not support get_balance natively without web3 setup.")
-                
+                logger.warning("ClobClient does not expose balance API; skipping capital pre-flight check.")
         except HTTPException:
             raise
         except Exception as e:
@@ -124,12 +130,28 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
     # Subscribe to private User Stream (uses condition_id)
     await user_stream.subscribe(condition_id)
     
-    # Start Quoting Engine Daemon for both YES and NO tokens
+    # Start Quoting Engine Daemon FIRST so they subscribe to Redis PubSub
+    # before we publish the initial snapshot tick.
     task_quoting_yes = asyncio.create_task(start_quoting_engine(condition_id, market.yes_token_id))
     task_quoting_no = asyncio.create_task(start_quoting_engine(condition_id, market.no_token_id))
     
     background_tasks.add(task_quoting_yes)
     background_tasks.add(task_quoting_no)
+    
+    # Give engines a moment to complete their Redis PubSub subscribe.
+    # asyncio.create_task schedules them but they need one event-loop turn
+    # to actually reach `await pubsub.subscribe(...)` inside engine.run().
+    await asyncio.sleep(0.5)
+    
+    # NOW seed the local orderbook from REST and publish the initial tick.
+    # The engines are already listening so they will receive this immediately.
+    await md_gateway.fetch_initial_snapshot(market.yes_token_id)
+    await md_gateway.fetch_initial_snapshot(market.no_token_id)
+
+    logger.info(
+        f"Market making started for {condition_id[:10]}... "
+        f"YES={market.yes_token_id[:10]}... NO={market.no_token_id[:10]}..."
+    )
     
     return {
         "status": "started", 

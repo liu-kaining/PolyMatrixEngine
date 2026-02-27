@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     
     # Trading params
     MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch
+    BASE_ORDER_SIZE: float = 10.0         # Default $ size per order (can be overridden via .env)
+    GRID_LEVELS: int = 2                  # Default number of grid levels per side
 
     class Config:
         env_file = ".env"

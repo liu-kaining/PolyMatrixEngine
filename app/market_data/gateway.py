@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import httpx
 import websockets
 from typing import List, Set, Dict, Optional
 from app.core.config import settings
@@ -8,84 +9,82 @@ from app.core.redis import redis_client
 
 logger = logging.getLogger(__name__)
 
-class OrderbookParser:
+
+class LocalOrderbook:
+    """
+    Maintains a full local copy of the orderbook per asset_id.
+    All WS deltas are merged into this state; every publish to Redis
+    is a complete top-N snapshot so the QuotingEngine never sees partial data.
+    """
     def __init__(self):
-        # Dictionary of asset_id -> {"bids": {price: size}, "asks": {price: size}}
         self.books: Dict[str, Dict[str, Dict[str, float]]] = {}
-        
-    def process_message(self, data: dict) -> List[dict]:
-        """Parses WS message, updates local state, returns top 5 levels for updated assets"""
+
+    def seed(self, asset_id: str, bids: list, asks: list):
+        """Seed the local book from a REST API full snapshot."""
+        self.books[asset_id] = {"bids": {}, "asks": {}}
+        for b in bids:
+            self.books[asset_id]["bids"][str(b["price"])] = float(b["size"])
+        for a in asks:
+            self.books[asset_id]["asks"][str(a["price"])] = float(a["size"])
+
+    def apply_event(self, data: dict) -> List[str]:
+        """Apply a single WS event (book or price_change) and return updated asset_ids."""
         event_type = data.get("event_type")
-        
+        updated: Set[str] = set()
+
         if event_type == "book":
             asset_id = data.get("asset_id")
-            if not asset_id:
-                return []
-                
-            self.books[asset_id] = {"bids": {}, "asks": {}}
-            for bid in data.get("bids", []):
-                self.books[asset_id]["bids"][bid["price"]] = float(bid["size"])
-            for ask in data.get("asks", []):
-                self.books[asset_id]["asks"][ask["price"]] = float(ask["size"])
-                
-            top_5 = self.get_top_5(asset_id)
-            return [top_5] if top_5 else []
-            
+            if asset_id:
+                self.books[asset_id] = {"bids": {}, "asks": {}}
+                for b in data.get("bids", []):
+                    self.books[asset_id]["bids"][str(b["price"])] = float(b["size"])
+                for a in data.get("asks", []):
+                    self.books[asset_id]["asks"][str(a["price"])] = float(a["size"])
+                updated.add(asset_id)
+
         elif event_type == "price_change":
-            changes = data.get("price_changes", [])
-            asset_ids_updated = set()
-            
-            for change in changes:
+            for change in data.get("price_changes", []):
                 asset_id = change.get("asset_id")
                 if not asset_id:
                     continue
-                
                 if asset_id not in self.books:
                     self.books[asset_id] = {"bids": {}, "asks": {}}
-                    
+
                 side = change.get("side", "").upper()
-                price = change.get("price")
+                price = str(change.get("price"))
                 size = float(change.get("size", "0"))
-                
+
                 if side == "BUY":
-                    target_book = self.books[asset_id]["bids"]
+                    book = self.books[asset_id]["bids"]
                 elif side == "SELL":
-                    target_book = self.books[asset_id]["asks"]
+                    book = self.books[asset_id]["asks"]
                 else:
                     continue
-                
-                if size == 0:
-                    target_book.pop(price, None)
-                else:
-                    target_book[price] = size
-                    
-                asset_ids_updated.add(asset_id)
-                
-            updates = []
-            for aid in asset_ids_updated:
-                top_5 = self.get_top_5(aid)
-                if top_5:
-                    updates.append(top_5)
-            return updates
-            
-        return []
 
-    def get_top_5(self, asset_id: str) -> Optional[dict]:
+                if size == 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = size
+                updated.add(asset_id)
+
+        return list(updated)
+
+    def snapshot(self, asset_id: str, depth: int = 5) -> Optional[dict]:
+        """Return a complete top-N snapshot for the given asset."""
         if asset_id not in self.books:
             return None
-            
         bids = self.books[asset_id]["bids"]
         asks = self.books[asset_id]["asks"]
-        
-        # Bids sorted descending
-        top_bids = sorted(bids.items(), key=lambda x: float(x[0]), reverse=True)[:5]
-        # Asks sorted ascending
-        top_asks = sorted(asks.items(), key=lambda x: float(x[0]))[:5]
-        
+        if not bids and not asks:
+            return None
+        top_bids = sorted(bids.items(), key=lambda x: float(x[0]), reverse=True)[:depth]
+        top_asks = sorted(asks.items(), key=lambda x: float(x[0]))[:depth]
+        if not top_bids or not top_asks:
+            return None
         return {
             "asset_id": asset_id,
             "bids": [{"price": p, "size": s} for p, s in top_bids],
-            "asks": [{"price": p, "size": s} for p, s in top_asks]
+            "asks": [{"price": p, "size": s} for p, s in top_asks],
         }
 
 
@@ -96,45 +95,81 @@ class MarketDataGateway:
         self.ws = None
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
-        self.parser = OrderbookParser()
+        self.orderbook = LocalOrderbook()
         self.ping_task = None
+
+    async def fetch_initial_snapshot(self, token_id: str):
+        """
+        Pull full orderbook via Polymarket CLOB REST API and seed the local book.
+        Then publish the snapshot to Redis so the QuotingEngine fires immediately.
+        """
+        url = f"{settings.PM_API_URL}/book"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params={"token_id": token_id})
+                resp.raise_for_status()
+                data = resp.json()
+
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if not bids and not asks:
+                logger.warning(f"REST snapshot for {token_id[:8]} returned empty book.")
+                return
+
+            self.orderbook.seed(token_id, bids, asks)
+            snap = self.orderbook.snapshot(token_id)
+            if snap:
+                await redis_client.set_state(f"ob:{token_id}", snap)
+                await redis_client.publish(f"tick:{token_id}", snap)
+                best_bid = snap["bids"][0]["price"] if snap["bids"] else "?"
+                best_ask = snap["asks"][0]["price"] if snap["asks"] else "?"
+                logger.info(f"Initial snapshot seeded for {token_id[:8]}: Bid={best_bid} Ask={best_ask} (bids={len(bids)} asks={len(asks)})")
+        except httpx.HTTPStatusError as e:
+            # 404 is common for illiquid / not-yet-listed books; treat as soft warning.
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning(
+                    f"Initial snapshot 404 for {token_id[:8]} – "
+                    "orderbook not available via REST yet; waiting for WS ticks."
+                )
+            else:
+                logger.error(f"Failed to fetch initial snapshot for {token_id[:8]}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch initial snapshot for {token_id[:8]}: {e}")
 
     async def connect(self):
         while True:
             try:
-                logger.info(f"Connecting to Polymarket WS: {self.ws_url}")
+                logger.debug(f"Connecting to Polymarket WS: {self.ws_url}")
                 async with websockets.connect(self.ws_url, ping_interval=None) as ws:
                     self.ws = ws
-                    self.reconnect_delay = 1.0 # Reset delay on success
-                    logger.info("Connected successfully.")
-                    
+                    self.reconnect_delay = 1.0
+                    logger.info("Market WS connected.")
+
                     self.ping_task = asyncio.create_task(self._heartbeat())
-                    
+
                     if self.subscribed_markets:
                         await self._resubscribe()
-                    
+
                     await self._listen()
-                    
+
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Connection closed: {e}. Reconnecting...")
+                logger.warning(f"Market WS connection closed: {e}. Reconnecting...")
             except Exception as e:
-                logger.error(f"WebSocket error: {e}. Reconnecting...")
+                logger.error(f"Market WS error: {e}. Reconnecting...")
             finally:
                 if self.ping_task:
                     self.ping_task.cancel()
                     self.ping_task = None
                 self.ws = None
-                
-                logger.info(f"Reconnecting in {self.reconnect_delay} seconds...")
+                logger.debug(f"Market WS reconnecting in {self.reconnect_delay}s...")
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
     async def _heartbeat(self):
-        """Send PING every 10 seconds per Polymarket documentation"""
         try:
             while True:
                 await asyncio.sleep(10)
-                if self.ws and self.ws.open:
+                if self.ws is not None and not getattr(self.ws, "closed", False):
                     await self.ws.send("PING")
                     logger.debug("Sent PING")
         except asyncio.CancelledError:
@@ -143,53 +178,51 @@ class MarketDataGateway:
             logger.error(f"Heartbeat error: {e}")
 
     async def subscribe(self, asset_ids: List[str]):
-        """Subscribe to a list of market asset/token IDs"""
         self.subscribed_markets.update(asset_ids)
-        if self.ws and self.ws.open:
+        if self.ws is not None and not getattr(self.ws, "closed", False):
             sub_msg = {
                 "assets_ids": list(self.subscribed_markets),
                 "type": "market",
-                "custom_feature_enabled": True
+                "operation": "subscribe",
+                "custom_feature_enabled": True,
             }
             await self.ws.send(json.dumps(sub_msg))
-            logger.info(f"Subscribed to assets: {asset_ids}")
+            logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
 
     async def _resubscribe(self):
-        """Internal resub on reconnect"""
-        if self.subscribed_markets:
+        if self.ws is not None and not getattr(self.ws, "closed", False) and self.subscribed_markets:
             sub_msg = {
                 "assets_ids": list(self.subscribed_markets),
                 "type": "market",
-                "custom_feature_enabled": True
+                "operation": "subscribe",
+                "custom_feature_enabled": True,
             }
             await self.ws.send(json.dumps(sub_msg))
-            logger.info("Resubscribed to active markets.")
+            logger.info("Resubscribed to active markets on Market WS.")
 
     async def _listen(self):
-        """Process incoming WS messages"""
         async for message in self.ws:
             try:
                 if message == "PONG":
-                    logger.debug("Received PONG")
                     continue
-                    
-                data = json.loads(message)
-                
-                # Use JSON parser to get top-5 book updates
-                updates = self.parser.process_message(data)
-                
-                for update in updates:
-                    asset_id = update["asset_id"]
-                    # 1. Update Snapshot in Redis Cache (for fast lookup)
-                    await redis_client.set_state(f"ob:{asset_id}", update)
-                    
-                    # 2. Publish tick to Quoting Engine
-                    await redis_client.publish(f"tick:{asset_id}", update)
-                    
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse WS message: {message}")
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
 
-# Global instance
+                data = json.loads(message)
+                items = data if isinstance(data, list) else [data]
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    updated_ids = self.orderbook.apply_event(item)
+                    for aid in updated_ids:
+                        snap = self.orderbook.snapshot(aid)
+                        if snap:
+                            await redis_client.set_state(f"ob:{aid}", snap)
+                            await redis_client.publish(f"tick:{aid}", snap)
+
+            except json.JSONDecodeError:
+                logger.debug(f"Non-JSON WS message (ignored): {message[:80]}")
+            except Exception as e:
+                logger.error(f"Error processing market WS message: {e}")
+
+
 md_gateway = MarketDataGateway()

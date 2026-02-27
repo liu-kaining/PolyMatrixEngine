@@ -24,16 +24,16 @@ class UserStreamGateway:
     async def connect(self):
         # We need the client credentials to connect
         while oms.client is None or not oms.client.creds:
-            logger.info("UserStreamGateway waiting for ClobClient initialization...")
+            logger.debug("UserStreamGateway waiting for ClobClient initialization...")
             await asyncio.sleep(2.0)
             
         while True:
             try:
-                logger.info(f"Connecting to Polymarket User WS: {self.ws_url}")
+                logger.debug(f"Connecting to Polymarket User WS: {self.ws_url}")
                 async with websockets.connect(self.ws_url, ping_interval=None) as ws:
                     self.ws = ws
                     self.reconnect_delay = 1.0
-                    logger.info("User WS Connected successfully.")
+                    logger.info("User WS connected.")
                     
                     self.ping_task = asyncio.create_task(self._heartbeat())
                     
@@ -43,7 +43,7 @@ class UserStreamGateway:
                     await self._listen()
                     
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"User WS Connection closed: {e}. Reconnecting...")
+                logger.warning(f"User WS connection closed: {e}. Reconnecting...")
             except Exception as e:
                 logger.error(f"User WS error: {e}. Reconnecting...")
             finally:
@@ -52,7 +52,7 @@ class UserStreamGateway:
                     self.ping_task = None
                 self.ws = None
                 
-                logger.info(f"User WS Reconnecting in {self.reconnect_delay} seconds...")
+                logger.debug(f"User WS reconnecting in {self.reconnect_delay} seconds...")
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
@@ -61,7 +61,7 @@ class UserStreamGateway:
         try:
             while True:
                 await asyncio.sleep(10)
-                if self.ws and self.ws.open:
+                if self.ws is not None and not getattr(self.ws, "closed", False):
                     await self.ws.send("PING")
         except asyncio.CancelledError:
             pass
@@ -71,7 +71,7 @@ class UserStreamGateway:
         await self._resubscribe()
         
     async def _resubscribe(self):
-        if self.ws and self.ws.open and self.subscribed_markets:
+        if self.ws is not None and not getattr(self.ws, "closed", False) and self.subscribed_markets:
             creds = oms.client.creds
             sub_msg = {
                 "auth": {

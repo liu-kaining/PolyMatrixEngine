@@ -11,8 +11,10 @@ services:
       - PM_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
       - PM_API_URL=https://clob.polymarket.com
       - PM_CHAIN_ID=137
-      - PK=${PK} # Inherit from host .env
+      - PK=${PK}
       - FUNDER_ADDRESS=${FUNDER_ADDRESS}
+      - LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-False}
+      - MAX_EXPOSURE_PER_MARKET=${MAX_EXPOSURE_PER_MARKET:-50.0}
     depends_on:
       postgres:
         condition: service_healthy

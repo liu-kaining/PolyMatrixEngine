@@ -16,8 +16,11 @@ class GammaAPIClient:
         """
         async with httpx.AsyncClient() as client:
             try:
-                # Gamma API lets you query by condition_id
-                response = await client.get(f"{self.base_url}/markets", params={"condition_id": condition_id})
+                # Prefer the documented `condition_ids` filter which returns CLOB token ids.
+                response = await client.get(
+                    f"{self.base_url}/markets",
+                    params={"condition_ids": condition_id},
+                )
                 response.raise_for_status()
                 data = response.json()
                 

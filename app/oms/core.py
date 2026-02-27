@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, FilterParams
+from py_clob_client.clob_types import OrderArgs, OrderType
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
@@ -122,18 +122,20 @@ class OrderManagementSystem:
         # Real Execution Mode
         else:
             try:
+                order_args = OrderArgs(
+                    price=price,
+                    size=size,
+                    side="BUY" if side == OrderSide.BUY else "SELL",
+                    token_id=token_id,
+                )
+
                 async def _place_order():
-                    # Format args for py-clob-client
-                    order_args = OrderArgs(
-                        price=price,
-                        size=size,
-                        side="BUY" if side == OrderSide.BUY else "SELL",
-                        token_id=token_id, # Must be the accurate Token ID
+                    # py-clob-client methods are synchronous HTTP; offload to thread
+                    # so we don't block the async event loop during signing + POST.
+                    return await asyncio.to_thread(
+                        self.client.create_and_post_order, order_args
                     )
-                    # We use create_and_post_order for automatic signing and API dispatch
-                    return self.client.create_and_post_order(order_args)
                 
-                # Wrapped in circuit breaker to handle rate limits (429) or gateway errors (502)
                 res = await self.circuit_breaker.execute(_place_order)
                 
                 if res and res.get("success") and res.get("orderID"):
@@ -188,8 +190,7 @@ class OrderManagementSystem:
         # Real Execution Mode
         try:
             async def _cancel():
-                # Real API cancel call using Polymarket Client
-                return self.client.cancel(order_id)
+                return await asyncio.to_thread(self.client.cancel, order_id)
             
             res = await self.circuit_breaker.execute(_cancel)
             
