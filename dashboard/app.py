@@ -206,6 +206,29 @@ with col_liq:
             st.warning("Enter ID")
 
 st.sidebar.markdown("---")
+
+# Danger Zone: Wipe all local data
+st.sidebar.markdown("### Danger Zone")
+with st.sidebar.form("wipe_form"):
+    st.markdown("**Wipe ALL local data (DB + Redis)**")
+    wipe_confirm = st.text_input("Type `WIPE` to confirm", value="")
+    wipe_submitted = st.form_submit_button("🔥 Wipe All Data")
+
+    if wipe_submitted:
+        if wipe_confirm.strip() != "WIPE":
+            st.warning("Please type `WIPE` exactly to confirm.")
+        else:
+            try:
+                res = requests.post(f"{API_URL}/admin/wipe")
+                if res.status_code == 200:
+                    st.success("All local data wiped. Please restart any running strategies if needed.")
+                    st.rerun()
+                else:
+                    st.error(res.text)
+            except Exception as e:
+                st.error(f"API Error: {e}")
+
+st.sidebar.markdown("---")
 if st.sidebar.button("Refresh Data", use_container_width=True):
     st.rerun()
 

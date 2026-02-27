@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import delete
 
 from app.core.config import settings
 from app.db.session import init_db, get_db
@@ -274,3 +275,27 @@ async def get_active_orders(db: AsyncSession = Depends(get_db)):
             "status": o.status
         } for o in orders
     ]
+
+
+@app.post("/admin/wipe")
+async def wipe_all_data(db: AsyncSession = Depends(get_db)):
+    """
+    DANGER: Wipe all local state (Postgres + Redis) for a clean reset.
+    Intended for development / manual recovery only.
+    """
+    # 1. Wipe Postgres tables in safe order (children first).
+    await db.execute(delete(OrderJournal))
+    await db.execute(delete(InventoryLedger))
+    await db.execute(delete(MarketMeta))
+    await db.commit()
+
+    # 2. Wipe Redis database (orderbooks, ticks, pubsub state cache).
+    try:
+        if redis_client.client is not None:
+            await redis_client.client.flushdb()
+            logger.warning("Redis DB flushed as part of admin wipe.")
+    except Exception as e:
+        logger.warning(f"Failed to flush Redis during admin wipe: {e}")
+
+    logger.critical("ADMIN WIPE executed: all local DB and Redis state cleared.")
+    return {"status": "wiped"}

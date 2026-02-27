@@ -193,8 +193,34 @@ class OrderManagementSystem:
                 return await asyncio.to_thread(self.client.cancel, order_id)
             
             res = await self.circuit_breaker.execute(_cancel)
-            
-            if res == "Canceled" or (isinstance(res, dict) and res.get("success", False) is True):
+
+            # Normalize different cancel response formats from the CLOB API.
+            cancel_success = False
+            already_closed = False
+
+            if res == "Canceled":
+                cancel_success = True
+            elif isinstance(res, dict):
+                # Newer API: {'not_canceled': {...}, 'canceled': [...]} or similar.
+                canceled_list = res.get("canceled") or []
+                not_canceled = res.get("not_canceled") or {}
+
+                # If our order_id is in the canceled list (or any were canceled at all),
+                # we consider this a successful cancel.
+                if order_id in canceled_list or (canceled_list and not not_canceled):
+                    cancel_success = True
+                # If the API says "already canceled or matched", then from our perspective
+                # the order is no longer active and we should mark it as canceled locally.
+                elif isinstance(not_canceled, dict) and order_id in not_canceled:
+                    reason = str(not_canceled.get(order_id, "")).lower()
+                    if "already canceled" in reason or "already matched" in reason:
+                        cancel_success = True
+                        already_closed = True
+                # Legacy success flag
+                elif res.get("success", False) is True:
+                    cancel_success = True
+
+            if cancel_success:
                 async with AsyncSessionLocal() as session:
                     order = await session.get(OrderJournal, order_id)
                     if order:
@@ -223,8 +249,14 @@ class OrderManagementSystem:
                             logger.debug(f"Could not fetch final order status for {order_id} to check dust: {fetch_e}")
 
                         payload["cancel_response"] = res
+                        if already_closed:
+                            payload["status_detail"] = payload.get("status_detail") or ""
+                            payload["status_detail"] += "|ALREADY_CLOSED_ON_CLOB"
                         order.payload = payload
-                        logger.info(f"[LIVE] Order successfully canceled on CLOB: {order_id}")
+                        if already_closed:
+                            logger.info(f"[LIVE] Order {order_id} already closed on CLOB; marking as CANCELED locally.")
+                        else:
+                            logger.info(f"[LIVE] Order successfully canceled on CLOB: {order_id}")
                         await session.commit()
                 return True
             else:
