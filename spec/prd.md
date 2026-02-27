@@ -66,6 +66,20 @@ PolyMatrix Engine 面向 Polymarket，提供自动化高频做市与轻量统计
     - 根据 OBI 大小自适应调节 spread 宽度（越失衡 → spread 越宽）。
   - Fair Value 必须限制在 [0.01, 0.99] 价格区间内。
 
+- **F4.1 — Inventory-Aware Asymmetric Quoting（库存感知不对称甩货）**
+  - 在传统“对称网格”（同时挂 BUY/SELL）的基础上，引入基于当前 token 敞口的状态机：
+    - **Neutral / 轻仓状态（|exposure| < 5）**：
+      - 仅在买方挂 BUY 网格（按 `GRID_LEVELS` & `BASE_ORDER_SIZE`），不主动挂 SELL；
+      - 目标是在小资金阶段优先“捡筹码”，避免对称挂单造成资金低效锁定。
+    - **Long / 重仓状态（exposure ≥ 5）**：
+      - 停止生成任何 BUY 订单，进入“甩货模式”；
+      - 仅生成极具攻击性的 SELL 订单：`Ask = min(FairValue + 0.01, BestAsk - 0.01)`，并裁剪在 [0.01, 0.99]；
+      - SELL size 至少为 5（满足 Polymarket `orderMinSize`），且不超过当前持仓，确保可以快速、分批套现。
+  - 产品要求：
+    - 在 Neutral 阶段，允许用户通过 `.env` 设置较小的 `BASE_ORDER_SIZE` 与少量网格层数，从散户抛压中慢慢吃筹。
+    - 一旦仓位达到“安全线”（如 5 份以上），引擎必须自动切到甩货模式，优先保护现金流与风险。
+    - `BASE_ORDER_SIZE` 的有效下限为 5，系统内部必须做 `max(5.0, BASE_ORDER_SIZE)` 处理，避免违反 CLOB 最小下单尺寸。
+
 - **F5 — Grid 配置**
   - 每边网格层数可配置：`GRID_LEVELS`。
   - 每单下单数量可配置：`BASE_ORDER_SIZE`，但必须 ≥ 市场 `orderMinSize`。
@@ -131,7 +145,8 @@ PolyMatrix Engine 面向 Polymarket，提供自动化高频做市与轻量统计
 - **F15 — Inventory & Risk 面板**
   - 展示所有正在做市/有仓位的市场列表：
     - `market_id`、Yes/No 敞口、realized PnL。
-    - 可视化 bar chart。
+    - 顶部以多张 Metric 卡展示 Active Markets 数量、总已实现 PnL、全市场粗敞口。
+    - Market Exposures 图表可折叠，避免在“零敞口”阶段占据过多空间。
     - Gamma / Polymarket 直接跳转链接。
 
 - **F16 — Active Orders**
@@ -142,6 +157,28 @@ PolyMatrix Engine 面向 Polymarket，提供自动化高频做市与轻量统计
   - 至少提供：
     - FastAPI `/health` 状态；
     - 引导用户通过 `docker compose logs -f api` 查看实时撮合日志。
+
+- **F18 — Market Screener (Gamma) V1.1**
+  - 替代早期的简单 “Market Explorer”，提供真正可运营的做市标的筛选能力：
+    - **数据源**：`GET https://gamma-api.polymarket.com/markets?active=true&closed=false&limit≈500`。
+    - **基本过滤**：
+      - 仅保留 Binary 市场（outcomes 解析为 Yes/No）。
+      - DTE、24h 成交量、流动性与 YES 赔率上下限根据模式（Conservative/Normal/Aggressive/Ultra）动态调整。
+    - **赛道风控**：
+      - 对 `tags/category/slug/question` 中出现 `sports, nfl, nba, soccer, win the match, in-play, live odds, halftime` 等关键词的市场做**硬拉黑**，完全不出现在列表中。
+      - 对 `president, election, senate, mayor, oscars, movie, series, ...` 等关键词做语义识别，将优质赛道标记为 `⭐ Politics` / `⭐ Culture` / `⭐ Premium`。
+    - **交互要求**：
+      - 筛选结果以表格形式展示，左侧有 `Select` 列供用户选中某一条。
+      - 选中后，下方必须有一个视觉突出的“选中市场卡片”展示核心指标，以及一个“从 Screener 启动”的按钮。
+      - 按钮点击后必须再弹出一个二次确认区域（或等价 UX），用户确认后才真正调用 `/markets/{condition_id}/start`。
+
+- **F19 — System Logs 视图**
+  - 产品侧要求在 Dashboard 内即可完成核心日志的 tail & 搜索，无需 SSH 或进入容器：
+    - FastAPI 通过 RotatingFileHandler 将日志写入共享卷 `data/logs/trading.log`。
+    - Dashboard 提供 `System Logs (Tail & Search)` 面板：
+      - 展示最近 N 行日志。
+      - 提供按级别（ALL/INFO/WARNING/ERROR）与关键字过滤的能力。
+      - 支持一键 Refresh。
 
 ### 4. 非功能性需求
 

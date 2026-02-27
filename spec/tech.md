@@ -130,8 +130,8 @@
     spread = base\_spread \times (1 + |obi|)
     \]
 
-- `on_tick(tick_data)` 流程：
-
+  - `on_tick(tick_data)` 流程（V1.1 引入库存感知的不对称甩货）：
+ 
   1. 若 `bids/asks` 缺失则跳过（LocalOrderbook 已保证正常情况下两边都有）。
   2. 在 `_trade_lock` 保护下：
      - 通过 DB 读取 `InventoryLedger` 和 `MarketMeta`，确定当前 exposure。
@@ -139,15 +139,40 @@
      - 若 `|fair_value - last_anchor_mid_price| <= price_offset_threshold`，则跳过重置。
      - 更新 `last_anchor_mid_price = fair_value`。
   3. 计算首档 bid/ask：
-
+ 
      ```python
      anchor = spread / 2
      bid_1 = round(fair_value - anchor, 2)
      ask_1 = round(fair_value + anchor, 2)
      ```
-
-  4. 按 `GRID_LEVELS` 生成 orders payload。
-  5. 打印完整决策日志（Top Book + Alpha 输出 + 指令 JSON）。
+ 
+  4. 根据当前敞口选择网格模式：
+ 
+     - **Neutral / 轻仓（|exposure| < 5）**：
+       - 仅生成 BUY 网格：
+ 
+         ```python
+         for i in range(self.grid_levels):
+             bid_price = round(bid_1 - i * tick_size, 2)
+             if 0.01 <= bid_price <= 0.99:
+                 orders.append(BUY at bid_price, size=base_size)
+         ```
+ 
+       - 不生成 SELL，专注于“接盘建仓”。
+ 
+     - **Long / 重仓（exposure >= 5）**：
+       - 完全停止 BUY，只生成单侧 Aggressive SELL：
+ 
+         ```python
+         best_ask = asks[0]["price"]
+         aggressive_ask = min(fair_value + 0.01, best_ask - 0.01)
+         ask_price = clip(round(aggressive_ask, 2), 0.01, 0.99)
+         sell_size = min(exposure, max(5.0, base_size))
+         orders = [SELL at ask_price, size=sell_size]
+         ```
+ 
+       - `BASE_ORDER_SIZE` 在内部会被 `max(5.0, base_size)` 处理，以满足 CLOB `orderMinSize`。
+  5. 打印完整决策日志（Top Book + Alpha 输出 + 模式 / 指令 JSON）。
   6. **同步：先 `cancel_all_orders()` 再 `place_orders(orders_payload)`**。
 
 - `cancel_all_orders` / `place_orders`：
@@ -217,13 +242,37 @@
 - 使用同步 SQLAlchemy + pandas：
   - `fetch_inventory()`：查询 `inventory_ledger`。
   - `fetch_active_orders()`：查询 `orders_journal` 中 `OPEN/PENDING` 订单。
-- 侧边栏：
-  - Start Market Making：POST `/markets/{condition_id}/start`。
-  - Emergency Controls：Stop / Liquidate。
-  - Refresh Data：`st.rerun()` 手动刷新。
-- Inventory Ledger：
-  - `gamma_link`：`https://gamma-api.polymarket.com/markets?condition_ids={market_id}`，在 UI 中用 `LinkColumn` 显示为 `condition_id`。
-  - `polymarket_link`：通过 Gamma 解析 `slug`，显示为 `slug`，链接到 `https://polymarket.com/event/{slug}`。
+- 侧边栏 Control Panel：
+  - 表单内输入 Condition ID 或 Polymarket URL，点击 `Start Quoting` 时：
+    - 若未勾选确认框或未填 ID/URL，则仅提示，不调用 API。
+    - 表单验证通过后，仅将解析出的 `condition_id` 写入 `st.session_state["pending_start_condition_id"]`。
+  - 表单下方渲染一个二次确认区域：
+    - 显示待启动的 `condition_id`。
+    - 用户点击 `✅ Confirm Start` 时才真正调用 `POST /markets/{condition_id}/start`。
+- Emergency Controls：
+  - Stop / Liquidate 按钮不再直接打 API，而是先在 `session_state` 里记录 `pending_kill_action` + `pending_kill_condition_id`。
+  - 在侧边栏渲染一个确认块，确认后调用 `/markets/{id}/stop` 或 `/markets/{id}/liquidate`，并 `st.rerun()`。
+- Inventory & Risk：
+  - 顶部三个 metric：Active Markets / Total Realized PnL / Total Gross Exposure。
+  - `Market Exposures (USDC)` 通过 `st.expander` 包裹，仅在有敞口时默认展开。
+  - Inventory Ledger 表增加：
+    - `gamma_link`：`https://gamma-api.polymarket.com/markets?condition_ids={market_id}`，在 UI 中用 `LinkColumn` 显示为 `condition_id`。
+    - `polymarket_link`：通过 Gamma 解析 `slug`，显示为 `slug`，链接到 `https://polymarket.com/event/{slug}`。
+- Market Screener (Gamma)：
+  - 从 Gamma 拉取 `active=true, closed=false` 的市场列表（limit 约 500），然后在本地做：
+    - Binary-only 过滤（outcomes 为 Yes/No）。
+    - Sports / Live 盘口黑名单（基于 tags/category/slug/question 的关键词匹配）。
+    - DTE / 成交量 / 流动性 / YES 赔率区间过滤（取决于 Conservative / Normal / Aggressive / Ultra 模式）。
+    - 基于标签和语义（question/slug）构建 `Category/Tag` 列，高亮 `⭐ Politics` / `⭐ Culture` 等优质赛道。
+  - 使用 `st.data_editor` 渲染 Screener 表格，增加 `Selected` 复选框列，并将选中行的 index 存入 `st.session_state["screener_selected_idx"]`。
+  - 下方 `Selected market` 卡片通过 HTML/CSS 渲染为高亮卡片，展示 Question 全文、Condition ID、YES Price、24h Volume、Liquidity 与 End Date。
+  - `Start from Screener` 按钮基于当前选中行，将 `pending_screener_start_cid` 写入 `session_state`，并在下方渲染确认区域；只有确认按钮点击后才调用 `/markets/{condition_id}/start`。
+- System Logs：
+  - FastAPI 通过 `RotatingFileHandler` 将业务日志写入 `/app/data/logs/trading.log`，并通过 `logs_data` 卷与 Dashboard 共享。
+  - Dashboard 中提供 `tail_logs(path, lines)` 工具函数从日志文件末尾读取最近若干行。
+  - `System Logs (Tail & Search)` 面板：
+    - 支持按级别（ALL/INFO/WARNING/ERROR）和关键词做简单 grep。
+    - 使用 `st.code(..., language="log")` 展示，并提供 `🔄 Refresh Logs` 按钮。
 
 ### 3. 数据模型
 
