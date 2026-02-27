@@ -1,4 +1,7 @@
 import os
+import json
+from datetime import datetime, timezone, timedelta
+
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine
@@ -294,47 +297,148 @@ else:
 
 st.markdown("---")
 
-# 2. Market Explorer (Gamma)
-st.header("🧭 Market Explorer (Gamma)")
+# 2. Market Screener (Gamma)
+st.header("🧭 Market Screener (Gamma)")
 
-explore_col1, explore_col2 = st.columns([1, 3])
-with explore_col1:
-    if st.button("Load Top Markets", use_container_width=True):
+col_load, _ = st.columns([1, 3])
+with col_load:
+    if st.button("Load & Screen Markets", use_container_width=True):
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
                 params={
                     "active": "true",
                     "closed": "false",
-                    "limit": 20,
+                    "limit": 200,
                 },
                 timeout=5,
             )
-            if resp.status_code == 200:
-                st.session_state["explorer_markets"] = resp.json()
-            else:
+            if resp.status_code != 200:
                 st.error(f"Failed to load markets from Gamma: {resp.text}")
+            else:
+                raw_markets = resp.json()
+                screened = []
+                now = datetime.now(timezone.utc)
+                min_dte = timedelta(days=7)
+
+                for m in raw_markets:
+                    # 1) Binary ONLY: outcomes == ["Yes", "No"] (case-insensitive)
+                    outcomes_raw = m.get("outcomes")
+                    outcomes = []
+                    if outcomes_raw:
+                        if isinstance(outcomes_raw, str):
+                            try:
+                                outcomes = json.loads(outcomes_raw)
+                            except Exception:
+                                outcomes = []
+                        elif isinstance(outcomes_raw, list):
+                            outcomes = outcomes_raw
+                    outcomes_lower = {str(o).strip().lower() for o in outcomes}
+                    if outcomes_lower != {"yes", "no"}:
+                        continue
+
+                    # 2) DTE >= 7 days
+                    end_raw = m.get("endDate")
+                    try:
+                        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if end_dt - now < min_dte:
+                        continue
+
+                    # 3) Volume & Liquidity thresholds
+                    try:
+                        vol_24h = float(m.get("volume24hr") or 0.0)
+                        liq = float(m.get("liquidityNum") or 0.0)
+                    except Exception:
+                        continue
+                    if vol_24h <= 50000 or liq <= 10000:
+                        continue
+
+                    # 4) Goldilocks YES price band, if prices are present
+                    yes_price = None
+                    prices_raw = m.get("outcomePrices")
+                    if prices_raw:
+                        if isinstance(prices_raw, str):
+                            try:
+                                prices = json.loads(prices_raw)
+                            except Exception:
+                                prices = []
+                        elif isinstance(prices_raw, list):
+                            prices = prices_raw
+                        else:
+                            prices = []
+                        if prices:
+                            try:
+                                yes_price = float(prices[0])
+                            except Exception:
+                                yes_price = None
+                    if yes_price is not None and not (0.25 <= yes_price <= 0.75):
+                        continue
+
+                    screened.append(
+                        {
+                            "question": m.get("question", ""),
+                            "yes_price": yes_price,
+                            "volume24hr": vol_24h,
+                            "liquidity": liq,
+                            "end_date": end_dt,
+                            "condition_id": m.get("conditionId"),
+                            "slug": m.get("slug"),
+                        }
+                    )
+
+                # Sort by 24h volume descending
+                screened.sort(key=lambda x: x["volume24hr"], reverse=True)
+                st.session_state["screener_markets"] = screened
         except Exception as e:
             st.error(f"Gamma API error: {e}")
 
-markets = st.session_state.get("explorer_markets", [])
-if markets:
-    for m in markets:
-        with st.expander(m.get("question", "Unknown market"), expanded=False):
-            cid = m.get("conditionId")
-            slug = m.get("slug")
-            liq = m.get("liquidityNum")
-            vol = m.get("volume24hr")
-            st.markdown(f"- **Condition ID**: `{cid}`")
-            st.markdown(f"- **Slug**: `{slug}`")
-            st.markdown(f"- **24h Volume**: `{vol}`")
-            st.markdown(f"- **Liquidity**: `{liq}`")
+screened_markets = st.session_state.get("screener_markets", [])
+if screened_markets:
+    # Structured table view
+    df_screen = pd.DataFrame(
+        [
+            {
+                "Question": m["question"],
+                "YES Price": m["yes_price"],
+                "Volume 24h": m["volume24hr"],
+                "Liquidity": m["liquidity"],
+                "End Date": m["end_date"].strftime("%Y-%m-%d"),
+                "Condition ID": m["condition_id"],
+                "Slug": m["slug"],
+            }
+            for m in screened_markets
+        ]
+    )
+
+    st.dataframe(
+        df_screen[["Question", "YES Price", "Volume 24h", "Liquidity", "End Date", "Condition ID"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
+            "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
+            "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
+        },
+    )
+
+    st.markdown("#### Launch Quoting from Screener")
+    for m in screened_markets:
+        cid = m["condition_id"]
+        cols = st.columns([6, 1])
+        with cols[0]:
+            st.markdown(f"**{m['question']}**")
             st.markdown(
-                f"- **Polymarket**: https://polymarket.com/event/{slug}"
+                f"- YES Price: `{m['yes_price'] if m['yes_price'] is not None else 'N/A'}`  "
+                f"- 24h Volume: `${m['volume24hr']:.0f}`  "
+                f"- Liquidity: `${m['liquidity']:.0f}`  "
+                f"- End Date: `{m['end_date'].strftime('%Y-%m-%d')}`"
             )
+        with cols[1]:
             if st.button(
-                "✅ Confirm & Start Quoting",
-                key=f"start_{cid}",
+                "✅ Start",
+                key=f"screener_start_{cid}",
                 help="Use current .env config to start quoting this market",
             ):
                 if not cid:
@@ -352,7 +456,7 @@ if markets:
                     except Exception as e:
                         st.error(f"API Error: {e}")
 else:
-    st.info("Click 'Load Top Markets' to fetch popular markets from Gamma.")
+    st.info("Click 'Load & Screen Markets' to fetch binary, liquid, medium-term markets from Gamma.")
 
 st.markdown("---")
 
