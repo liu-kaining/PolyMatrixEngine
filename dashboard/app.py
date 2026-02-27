@@ -300,6 +300,15 @@ st.markdown("---")
 # 2. Market Screener (Gamma)
 st.header("🧭 Market Screener (Gamma)")
 
+mode_col, _ = st.columns([1, 3])
+with mode_col:
+    screener_mode = st.selectbox(
+        "Screener mode",
+        options=["Conservative", "Normal", "Aggressive"],
+        index=0,
+        help="Conservative = strict filters; Aggressive = looser filters showing more markets.",
+    )
+
 col_load, _ = st.columns([1, 3])
 with col_load:
     if st.button("Load & Screen Markets", use_container_width=True):
@@ -319,7 +328,23 @@ with col_load:
                 raw_markets = resp.json()
                 screened = []
                 now = datetime.now(timezone.utc)
-                min_dte = timedelta(days=7)
+
+                # Configure thresholds based on screener mode
+                if screener_mode == "Conservative":
+                    min_dte = timedelta(days=7)
+                    min_vol = 50_000.0
+                    min_liq = 10_000.0
+                    price_low, price_high = 0.25, 0.75
+                elif screener_mode == "Normal":
+                    min_dte = timedelta(days=5)
+                    min_vol = 20_000.0
+                    min_liq = 5_000.0
+                    price_low, price_high = 0.20, 0.80
+                else:  # Aggressive
+                    min_dte = timedelta(days=3)
+                    min_vol = 5_000.0
+                    min_liq = 2_000.0
+                    price_low, price_high = 0.15, 0.85
 
                 for m in raw_markets:
                     # 1) Binary ONLY: outcomes == ["Yes", "No"] (case-insensitive)
@@ -352,7 +377,7 @@ with col_load:
                         liq = float(m.get("liquidityNum") or 0.0)
                     except Exception:
                         continue
-                    if vol_24h <= 50000 or liq <= 10000:
+                    if vol_24h <= min_vol or liq <= min_liq:
                         continue
 
                     # 4) Goldilocks YES price band, if prices are present
@@ -373,7 +398,7 @@ with col_load:
                                 yes_price = float(prices[0])
                             except Exception:
                                 yes_price = None
-                    if yes_price is not None and not (0.25 <= yes_price <= 0.75):
+                    if yes_price is not None and not (price_low <= yes_price <= price_high):
                         continue
 
                     screened.append(
