@@ -10,6 +10,21 @@ import requests
 # Set page config
 st.set_page_config(page_title="PolyMatrix Engine Dashboard", layout="wide", page_icon="📈")
 
+# Hide Streamlit's default deploy button / main menu which are not used in this app
+st.markdown(
+    """
+    <style>
+    /* Newer Streamlit versions */
+    .stAppDeployButton {visibility: hidden !important;}
+    /* Older Streamlit versions */
+    .stDeployButton {visibility: hidden !important;}
+    /* Hide the default hamburger main menu if present */
+    #MainMenu {visibility: hidden !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Environment variables
 # We replace asyncpg with psycopg2 because pandas read_sql uses sync sqlalchemy engine
 DB_URL_ASYNC = os.getenv(
@@ -45,6 +60,8 @@ if "pending_kill_action" not in st.session_state:
     st.session_state["pending_kill_action"] = None
 if "pending_kill_condition_id" not in st.session_state:
     st.session_state["pending_kill_condition_id"] = None
+if "screener_selected_idx" not in st.session_state:
+    st.session_state["screener_selected_idx"] = 0
 
 @st.cache_resource
 def get_engine():
@@ -347,20 +364,30 @@ st.header("🛡️ Inventory & Risk")
 inv_df = fetch_inventory()
 
 if not inv_df.empty:
-    # Display top-level metrics
-    total_pnl = inv_df['realized_pnl'].sum()
+    # Display top-level metrics in a compact card layout
+    total_pnl = inv_df["realized_pnl"].sum()
     total_markets = len(inv_df)
-    
-    col1, col2 = st.columns(2)
-    col1.metric("Active Markets", total_markets)
-    col2.metric("Total Realized PnL (USDC)", f"${total_pnl:.4f}")
-    
-    # Plot Exposure Chart
-    st.subheader("Market Exposures (USDC)")
-    plot_df = inv_df[['market_id', 'yes_exposure', 'no_exposure']].copy()
-    plot_df.set_index('market_id', inplace=True)
-    st.bar_chart(plot_df, height=300)
-    
+    gross_exposure = float(
+        inv_df["yes_exposure"].abs().sum() + inv_df["no_exposure"].abs().sum()
+    )
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    m_col1.metric("Active Markets", total_markets)
+    m_col2.metric("Total Realized PnL (USDC)", f"${total_pnl:.4f}")
+    m_col3.metric("Total Gross Exposure (YES+NO)", f"{gross_exposure:.4f}")
+
+    # Optional exposure chart in a collapsible panel to avoid large empty space
+    with st.expander("Market Exposures (USDC)", expanded=gross_exposure > 0):
+        if total_markets > 1 or gross_exposure > 0:
+            plot_df = inv_df[["market_id", "yes_exposure", "no_exposure"]].copy()
+            plot_df.set_index("market_id", inplace=True)
+            st.bar_chart(plot_df, height=220)
+        else:
+            st.caption(
+                "No meaningful exposure yet. Once the strategy has open positions, "
+                "this panel will visualize per-market YES/NO exposure."
+            )
+
     # Raw Data Table
     st.subheader("Inventory Ledger")
     # Enrich with external links for better drill-down
@@ -496,6 +523,33 @@ with col_load:
                     "election",
                     "culture",
                 }
+                # Additional semantic keywords to infer category when API tags are missing
+                politics_words = {
+                    "president",
+                    "presidential",
+                    "election",
+                    "primary",
+                    "senate",
+                    "governor",
+                    "mayor",
+                    "parliament",
+                    "referendum",
+                }
+                culture_words = {
+                    "oscars",
+                    "oscar",
+                    "grammy",
+                    "emmy",
+                    "box office",
+                    "movie",
+                    "film",
+                    "series",
+                    "season",
+                    "tv show",
+                    "album",
+                    "song",
+                    "music",
+                }
 
                 for m in raw_markets:
                     # ---------------------------
@@ -546,13 +600,28 @@ with col_load:
                     cat_match_text = (
                         (category_raw or "") + " " + tag_text
                     ).lower()
-                    is_premium = any(
-                        pk in cat_match_text for pk in premium_keywords
+                    is_premium_tag = any(pk in cat_match_text for pk in premium_keywords)
+                    # Fallback: detect premium purely from question / slug when tags are empty
+                    is_politics_semantic = any(w in question_lower for w in politics_words) or any(
+                        w in slug for w in politics_words
                     )
-                    display_category = cat_source
+                    is_culture_semantic = any(w in question_lower for w in culture_words) or any(
+                        w in slug for w in culture_words
+                    )
+                    is_premium = is_premium_tag or is_politics_semantic or is_culture_semantic
+
+                    # Choose a human-friendly category label
                     if is_premium:
-                        # Premium highlight for ideal maker tracks
-                        display_category = f"⭐ {cat_source or 'Premium'}"
+                        if is_politics_semantic or "politic" in cat_match_text:
+                            base_cat = "Politics"
+                        elif is_culture_semantic or "culture" in cat_match_text:
+                            base_cat = "Culture"
+                        else:
+                            base_cat = cat_source or "Premium"
+                        display_category = f"⭐ {base_cat}"
+                    else:
+                        # Non-premium: use API category/tag if present, otherwise a generic bucket
+                        display_category = cat_source or "General"
 
                     # ---------------------------
                     # 1) Binary ONLY: outcomes == ["Yes", "No"] (case-insensitive)
@@ -630,7 +699,10 @@ with col_load:
 
 screened_markets = st.session_state.get("screener_markets", [])
 if screened_markets:
-    # Structured table view
+    # Structured table view with interactive selection
+    current_idx = st.session_state.get("screener_selected_idx", 0)
+    current_idx = max(0, min(current_idx, len(screened_markets) - 1))
+
     df_screen = pd.DataFrame(
         [
             {
@@ -647,9 +719,15 @@ if screened_markets:
         ]
     )
 
-    st.dataframe(
+    # Add a selectable checkbox column synchronized with dropdown selection
+    df_screen["Selected"] = False
+    if 0 <= current_idx < len(df_screen):
+        df_screen.loc[current_idx, "Selected"] = True
+
+    edited_df = st.data_editor(
         df_screen[
             [
+                "Selected",
                 "Question",
                 "Category/Tag",
                 "YES Price",
@@ -661,88 +739,142 @@ if screened_markets:
         ],
         use_container_width=True,
         hide_index=True,
+        key="screener_table",
         column_config={
+            "Selected": st.column_config.CheckboxColumn(
+                "Select",
+                help="Click to select this market for quoting.",
+            ),
             "Category/Tag": st.column_config.TextColumn("Category/Tag"),
             "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
             "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
             "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
         },
+        disabled=[
+            "Question",
+            "Category/Tag",
+            "YES Price",
+            "Volume 24h",
+            "Liquidity",
+            "End Date",
+            "Condition ID",
+        ],
     )
+
+    # Derive selected index from the checkbox column (table → state)
+    selected_rows = edited_df.index[edited_df["Selected"]].tolist()
+    if selected_rows:
+        st.session_state["screener_selected_idx"] = selected_rows[0]
+    else:
+        # If user unselects all, fall back to previous selection
+        st.session_state["screener_selected_idx"] = current_idx
 
     st.markdown("#### Launch Quoting from Screener")
 
-    # Compact launcher: select a market from dropdown, then confirm.
-    indices = list(range(len(screened_markets)))
+    # Nicely formatted "card" preview for the currently selected market
+    sel_idx = st.session_state.get("screener_selected_idx", 0)
+    sel_idx = max(0, min(sel_idx, len(screened_markets) - 1))
+    selected_market = screened_markets[sel_idx]
+    yes_p = selected_market["yes_price"]
 
-    def _format_option(i: int) -> str:
-        m = screened_markets[i]
-        yes_p = m["yes_price"]
-        yes_str = f"{yes_p:.3f}" if yes_p is not None else "N/A"
-        return (
-            f"{m['question']} | YES {yes_str} | "
-            f"Vol {m['volume24hr']:.0f} | Liq {m['liquidity']:.0f}"
-        )
+    st.markdown("##### Selected market")
+    card_html = f"""
+    <div style="
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 8px;
+        background-color: #f5f5fb;
+        border: 1px solid #d0d0ea;
+    ">
+      <div style="font-weight: 600; margin-bottom: 4px;">
+        {selected_market['question']}
+      </div>
+      <div style="font-size: 12px; color: #444;">
+        <div>Condition ID: <code>{selected_market['condition_id']}</code></div>
+        <div style="margin-top: 2px;">
+          YES Price: <b>{yes_p if yes_p is not None else 'N/A'}</b>
+          &nbsp;&nbsp; 24h Volume: <b>${selected_market['volume24hr']:.0f}</b>
+          &nbsp;&nbsp; Liquidity: <b>${selected_market['liquidity']:.0f}</b>
+        </div>
+        <div style="margin-top: 2px;">
+          End Date: <b>{selected_market['end_date'].strftime('%Y-%m-%d')}</b>
+        </div>
+      </div>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
 
-    selected_idx = st.selectbox(
-        "Select a market to start quoting",
-        options=indices,
-        format_func=_format_option,
-    )
-
-    launch_col1, launch_col2 = st.columns(2)
-    with launch_col1:
+    col_start, col_info = st.columns([1, 3])
+    with col_start:
         if st.button(
-            "✅ Prepare Start from Screener",
-            key="prepare_screener_start",
-            help="Prepare to start quoting for the selected market (requires confirmation).",
+            "✅ Start from Screener",
+            key="start_from_screener",
+            help="Prepare to start quoting for the selected market (will show a confirmation box).",
         ):
-            m_sel = screened_markets[selected_idx]
-            cid = m_sel["condition_id"]
-            if not cid:
+            m_sel = screened_markets[sel_idx]
+            if not m_sel["condition_id"]:
                 st.error("Missing conditionId for this market.")
             else:
-                st.session_state["pending_screener_start_cid"] = cid
+                st.session_state["pending_screener_start_cid"] = m_sel["condition_id"]
                 st.session_state["pending_screener_question"] = m_sel["question"]
-    with launch_col2:
-        st.write("")  # spacer
+    with col_info:
         st.write(f"Total screened markets: **{len(screened_markets)}**")
 
-    # Global confirmation for screener-based starts
+    # Compact confirmation panel for screener-based starts
     pending_screener_cid = st.session_state.get("pending_screener_start_cid")
     if pending_screener_cid:
-        pending_question = st.session_state.get("pending_screener_question", "")
-        st.warning(
-            f"Confirm starting quoting strategy for screener-selected market "
-            f"{pending_screener_cid[:8]}:\n\n{pending_question}"
+        # Re-locate the selected market details from current screened_markets
+        m_confirm = next(
+            (m for m in screened_markets if m["condition_id"] == pending_screener_cid),
+            None,
         )
-        s_col1, s_col2 = st.columns(2)
-        with s_col1:
-            if st.button("✅ Confirm Screener Start", key="confirm_screener_start"):
-                try:
-                    with st.spinner("Starting quoting for selected market..."):
-                        res = requests.post(
-                            f"{API_URL}/markets/{pending_screener_cid}/start"
-                        )
-                    if res.status_code == 200:
-                        st.success(
-                            f"Started quoting for {pending_screener_cid[:8]}..."
-                        )
-                        st.json(res.json())
+        if not m_confirm:
+            st.warning(
+                "Selected market is no longer in the current screener results. Please select again."
+            )
+            st.session_state["pending_screener_start_cid"] = None
+            st.session_state["pending_screener_question"] = ""
+        else:
+            yes_p = m_confirm["yes_price"]
+            st.info("Please confirm starting the quoting strategy for the selected market:")
+            st.markdown(f"**{m_confirm['question']}**")
+            st.markdown(
+                f"- Condition ID: `{m_confirm['condition_id']}`  \n"
+                f"- YES Price: `{yes_p if yes_p is not None else 'N/A'}`  \n"
+                f"- 24h Volume: `${m_confirm['volume24hr']:.0f}`  \n"
+                f"- Liquidity: `${m_confirm['liquidity']:.0f}`  \n"
+                f"- End Date: `{m_confirm['end_date'].strftime('%Y-%m-%d')}`"
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "✅ Confirm Screener Start", key="confirm_screener_start_inline"
+                ):
+                    try:
+                        with st.spinner("Starting quoting for selected market..."):
+                            res = requests.post(
+                                f"{API_URL}/markets/{pending_screener_cid}/start"
+                            )
+                        if res.status_code == 200:
+                            st.success(
+                                f"Started quoting for {pending_screener_cid[:8]}..."
+                            )
+                            st.json(res.json())
+                            st.session_state["pending_screener_start_cid"] = None
+                            st.session_state["pending_screener_question"] = ""
+                            st.rerun()
+                        else:
+                            st.error(res.text)
+                            st.session_state["pending_screener_start_cid"] = None
+                            st.session_state["pending_screener_question"] = ""
+                    except Exception as e:
+                        st.error(f"API Error: {e}")
                         st.session_state["pending_screener_start_cid"] = None
                         st.session_state["pending_screener_question"] = ""
-                        st.rerun()
-                    else:
-                        st.error(res.text)
-                        st.session_state["pending_screener_start_cid"] = None
-                        st.session_state["pending_screener_question"] = ""
-                except Exception as e:
-                    st.error(f"API Error: {e}")
+            with c2:
+                if st.button("Cancel", key="cancel_screener_start_inline"):
                     st.session_state["pending_screener_start_cid"] = None
                     st.session_state["pending_screener_question"] = ""
-        with s_col2:
-            if st.button("Cancel", key="cancel_screener_start"):
-                st.session_state["pending_screener_start_cid"] = None
-                st.session_state["pending_screener_question"] = ""
 else:
     st.info("Click 'Load & Screen Markets' to fetch binary, liquid, medium-term markets from Gamma.")
 
