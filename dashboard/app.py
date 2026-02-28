@@ -713,19 +713,27 @@ if screened_markets:
             ]
         )
 
-        # Single selection: only one row can be selected. "Current" column shows which row is selected (▶).
+        # Single selection: dropdown chooses one market; table is read-only with ▶ indicating selection.
+        sel_idx = st.selectbox(
+            t("app.selected_market"),
+            options=range(len(display_markets)),
+            index=current_idx,
+            format_func=lambda i: (display_markets[i]["question"][:80] + "…") if len(display_markets[i]["question"]) > 80 else display_markets[i]["question"],
+            key="screener_market_select",
+            help=t("app.select_one_help"),
+        )
+        if sel_idx != current_idx:
+            st.session_state["screener_selected_idx"] = int(sel_idx)
+            st.rerun()
+
         df_screen["Current"] = ""
         if 0 <= current_idx < len(df_screen):
             df_screen.loc[current_idx, "Current"] = "▶"
-        df_screen["Select"] = False
-        if 0 <= current_idx < len(df_screen):
-            df_screen.loc[current_idx, "Select"] = True
 
-        edited_df = st.data_editor(
+        st.dataframe(
             df_screen[
                 [
                     "Current",
-                    "Select",
                     "Stars",
                     "Score",
                     "Question",
@@ -739,40 +747,8 @@ if screened_markets:
             ],
             use_container_width=True,
             hide_index=True,
-            key="screener_table",
-            column_config={
-                "Current": st.column_config.TextColumn("", width="small", help="Selected row"),
-                "Select": st.column_config.CheckboxColumn(
-                    t("app.select"),
-                    help=t("app.select_one_help"),
-                ),
-                "Stars": st.column_config.TextColumn("Stars", help=t("app.stars_help")),
-                "Score": st.column_config.NumberColumn("Score", format="%.1f", help=t("app.score_help")),
-                "Category/Tag": st.column_config.TextColumn("Category/Tag"),
-                "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
-                "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
-                "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
-            },
-            disabled=[
-                "Current",
-                "Stars",
-                "Score",
-                "Question",
-                "Category/Tag",
-                "YES Price",
-                "Volume 24h",
-                "Liquidity",
-                "End Date",
-                "Condition ID",
-            ],
         )
         st.caption(t("app.table_selection_hint"))
-
-        # Single selection: take only the first checked row so card and selection stay in sync
-        selected_rows = edited_df.index[edited_df["Select"]].tolist()
-        if selected_rows:
-            st.session_state["screener_selected_idx"] = int(selected_rows[0])
-        # if none checked, keep current_idx so we don't lose selection
 
         st.markdown(f"#### {t('app.launch_quoting')}")
 
