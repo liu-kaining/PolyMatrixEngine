@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     # Strategy: 少而精 — we only get filled when the market hits our price (below fair value). No chasing fills.
     QUOTE_BASE_SPREAD: float = 0.02       # Edge per fill: BUY at fair_value - spread/2 (wider = more edge, fewer fills)
-    QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.005  # Refresh grid when mid moves this much (keep quotes in line with fair value)
+    QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.01   # Refresh grid when mid moves this much; larger = orders sit longer, more chance to get filled
+    # When True, first bid is at most 1 tick below best_bid (more fills, still ~1¢ edge). When False, strictly at bid_1 only.
+    QUOTE_BID_ONE_TICK_BELOW_TOUCH: bool = True
 
     class Config:
         env_file = ".env"

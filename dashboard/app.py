@@ -1,11 +1,17 @@
 import os
 import json
+import time
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine
 import requests
+
+try:
+    from dashboard.i18n import t, TRANSLATIONS
+except ImportError:
+    from i18n import t, TRANSLATIONS
 
 # Set page config
 st.set_page_config(page_title="PolyMatrix Engine Dashboard", layout="wide", page_icon="📈")
@@ -62,6 +68,14 @@ if "pending_kill_condition_id" not in st.session_state:
     st.session_state["pending_kill_condition_id"] = None
 if "screener_selected_idx" not in st.session_state:
     st.session_state["screener_selected_idx"] = 0
+if "screener_loading" not in st.session_state:
+    st.session_state["screener_loading"] = False
+if "screener_load_page" not in st.session_state:
+    st.session_state["screener_load_page"] = 0
+if "screener_raw_markets" not in st.session_state:
+    st.session_state["screener_raw_markets"] = []
+if "screener_load_mode" not in st.session_state:
+    st.session_state["screener_load_mode"] = "Ultra"
 
 @st.cache_resource
 def get_engine():
@@ -219,28 +233,166 @@ def resolve_condition_id(market_input: str) -> str | None:
         return None
     return None
 
+
+def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
+    """Filter raw Gamma markets (binary, blacklist, DTE/vol/liq) and compute recommendation score. Returns list of screened dicts."""
+    now = datetime.now(timezone.utc)
+    if screener_mode == "Conservative":
+        min_dte = timedelta(days=7)
+        min_vol, min_liq = 50_000.0, 10_000.0
+        price_low, price_high = 0.25, 0.75
+    elif screener_mode == "Normal":
+        min_dte = timedelta(days=3)
+        min_vol, min_liq = 10_000.0, 3_000.0
+        price_low, price_high = 0.20, 0.80
+    elif screener_mode == "Aggressive":
+        min_dte = timedelta(days=1)
+        min_vol, min_liq = 1_000.0, 500.0
+        price_low, price_high = 0.10, 0.90
+    else:
+        min_dte = timedelta(days=0)
+        min_vol, min_liq = 0.0, 0.0
+        price_low, price_high = 0.0, 1.0
+
+    sports_blacklist = {"sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "premier-league", "premier league", "champions-league", "champions league"}
+    question_blacklist = {"win the match", "wins the match", "to win the match", "halftime", "half-time", "in-play", "in play", "live betting", "live market", "live odds"}
+    premium_keywords = {"politics", "elections", "election", "culture"}
+    politics_words = {"president", "presidential", "election", "primary", "senate", "governor", "mayor", "parliament", "referendum"}
+    culture_words = {"oscars", "oscar", "grammy", "emmy", "box office", "movie", "film", "series", "season", "tv show", "album", "song", "music"}
+
+    screened = []
+    for m in raw_markets:
+        tags_raw = m.get("tags")
+        tags_list = []
+        if tags_raw:
+            if isinstance(tags_raw, str):
+                try:
+                    parsed = json.loads(tags_raw)
+                    tags_list = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, str) else []
+                except Exception:
+                    tags_list = [t.strip() for t in tags_raw.replace(";", ",").split(",") if t.strip()]
+            elif isinstance(tags_raw, list):
+                tags_list = tags_raw
+        category_raw = m.get("category") or m.get("subCategory") or ""
+        slug = (m.get("slug") or "").lower()
+        question_text = m.get("question") or ""
+        question_lower = question_text.lower()
+        tag_text = " ".join(str(x) for x in tags_list)
+        category_haystack = " ".join([category_raw, tag_text, slug]).lower()
+        if any(kw in category_haystack for kw in sports_blacklist) or any(kw in question_lower for kw in question_blacklist):
+            continue
+        cat_source = category_raw.strip() or (tags_list[0].strip() if tags_list else "")
+        cat_match_text = (category_raw or "") + " " + tag_text
+        is_politics_semantic = any(w in question_lower for w in politics_words) or any(w in slug for w in politics_words)
+        is_culture_semantic = any(w in question_lower for w in culture_words) or any(w in slug for w in culture_words)
+        is_premium = any(pk in cat_match_text.lower() for pk in premium_keywords) or is_politics_semantic or is_culture_semantic
+        if is_premium:
+            base_cat = "Politics" if is_politics_semantic or "politic" in cat_match_text.lower() else "Culture" if is_culture_semantic else cat_source or "Premium"
+            display_category = f"⭐ {base_cat}"
+        else:
+            display_category = cat_source or "General"
+
+        outcomes_raw = m.get("outcomes")
+        outcomes = []
+        if outcomes_raw:
+            if isinstance(outcomes_raw, str):
+                try:
+                    outcomes = json.loads(outcomes_raw)
+                except Exception:
+                    outcomes = []
+            elif isinstance(outcomes_raw, list):
+                outcomes = outcomes_raw
+        if {str(o).strip().lower() for o in outcomes} != {"yes", "no"}:
+            continue
+        try:
+            end_dt = datetime.fromisoformat((m.get("endDate") or "").replace("Z", "+00:00"))
+        except Exception:
+            continue
+        try:
+            vol_24h = float(m.get("volume24hr") or 0.0)
+            liq = float(m.get("liquidityNum") or 0.0)
+        except Exception:
+            continue
+        yes_price = None
+        prices_raw = m.get("outcomePrices")
+        if prices_raw:
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw if isinstance(prices_raw, list) else []
+            if prices:
+                try:
+                    yes_price = float(prices[0])
+                except Exception:
+                    pass
+        if screener_mode != "Ultra":
+            if end_dt - now < min_dte or vol_24h <= min_vol or liq <= min_liq:
+                continue
+            if yes_price is not None and not (price_low <= yes_price <= price_high):
+                continue
+        screened.append({
+            "question": question_text,
+            "yes_price": yes_price,
+            "volume24hr": vol_24h,
+            "liquidity": liq,
+            "end_date": end_dt,
+            "condition_id": m.get("conditionId"),
+            "slug": m.get("slug"),
+            "category": display_category,
+        })
+
+    if screened:
+        max_vol_liq = max((x["volume24hr"] * x["liquidity"] for x in screened), default=1.0) or 1.0
+        for m in screened:
+            vol, liq = m["volume24hr"], m["liquidity"]
+            yp = m["yes_price"] if m["yes_price"] is not None else 0.5
+            dte_days = (m["end_date"] - now).total_seconds() / 86400.0
+            cat = m.get("category", "")
+            fill_score = 20.0 * min(1.0, vol / 50000.0) + 20.0 * min(1.0, liq / 15000.0)
+            dte_score = 12.0 * min(1.0, dte_days / 30.0)
+            price_score = 12.0 if 0.20 <= yp <= 0.80 else (6.0 if 0.10 <= yp <= 0.90 else 0.0)
+            premium_bonus = 11.0 if "⭐" in cat else 0.0
+            risk_score = dte_score + price_score + premium_bonus
+            opp_score = 25.0 * (vol * liq) / max_vol_liq if max_vol_liq else 0.0
+            total = fill_score + risk_score + opp_score
+            m["recommendation_score"] = round(total, 1)
+            m["stars"] = max(1, min(5, 1 + int(total / 20)))
+            m["fill_score"] = round(fill_score, 1)
+            m["risk_score"] = round(risk_score, 1)
+    screened.sort(key=lambda x: (x.get("recommendation_score", 0), x["volume24hr"]), reverse=True)
+    return screened
+
+
 # ----------------- SIDEBAR -----------------
-st.sidebar.title("PolyMatrix Engine")
-st.sidebar.markdown("### Control Panel")
+if "locale" not in st.session_state:
+    st.session_state["locale"] = "en"
+lang = st.sidebar.radio(
+    t("app.language"),
+    options=["en", "zh"],
+    format_func=lambda x: "English" if x == "en" else "中文",
+    key="locale_radio",
+    horizontal=True,
+)
+st.session_state["locale"] = lang
+
+st.sidebar.title(t("app.title"))
+st.sidebar.markdown(f"### {t('app.control_panel')}")
 
 with st.sidebar.form("start_market_form"):
-    st.markdown("**Start Market Making**")
+    st.markdown(f"**{t('app.start_market_making')}**")
     market_input = st.text_input(
-        "Condition ID or Polymarket URL",
-        placeholder="0x... or https://polymarket.com/event/...",
+        t("app.condition_id_input"),
+        placeholder=t("app.condition_id_placeholder"),
     )
-    confirm_live = st.checkbox("I understand this may place real orders with current config")
-    submitted = st.form_submit_button("Start Quoting")
+    confirm_live = st.checkbox(t("app.confirm_live"))
+    submitted = st.form_submit_button(t("app.start_quoting"))
     
     if submitted:
         if not market_input:
-            st.warning("Please enter a Condition ID or Polymarket URL.")
+            st.warning(t("app.please_enter_id"))
         elif not confirm_live:
-            st.warning("Please check the confirmation box before starting market making.")
+            st.warning(t("app.please_confirm_box"))
         else:
             condition_id = resolve_condition_id(market_input)
             if not condition_id:
-                st.error("Could not resolve a valid condition_id from the input. Please check the URL or ID.")
+                st.error(t("app.could_not_resolve"))
             else:
                 # Defer actual API call to a second explicit confirmation step
                 st.session_state["pending_start_condition_id"] = condition_id
@@ -248,71 +400,67 @@ with st.sidebar.form("start_market_form"):
 # Sidebar confirmation for starting market making
 pending_cid = st.session_state.get("pending_start_condition_id")
 if pending_cid:
-    st.sidebar.warning(
-        f"Confirm starting quoting strategy for market {pending_cid[:8]}... "
-        "This may place real orders with current config."
-    )
+    st.sidebar.warning(t("app.confirm_start_message").format(cid=pending_cid[:8]))
     c_col1, c_col2 = st.sidebar.columns(2)
     with c_col1:
-        if st.button("✅ Confirm Start", key="confirm_start_sidebar"):
+        if st.button(f"✅ {t('app.confirm_start')}", key="confirm_start_sidebar"):
             try:
-                with st.spinner("Initializing Quoting Engine..."):
+                with st.spinner(t("app.initializing")):
                     response = requests.post(f"{API_URL}/markets/{pending_cid}/start")
                 if response.status_code == 200:
                     data = response.json()
-                    st.success(f"Started quoting for {pending_cid[:8]}...")
+                    st.success(t("app.started_quoting").format(cid=pending_cid[:8]))
                     st.json(data)
                     st.session_state["pending_start_condition_id"] = None
                     st.rerun()
                 else:
-                    st.error(f"Failed: {response.text}")
+                    st.error(t("app.failed").format(text=response.text))
             except Exception as e:
-                st.error(f"API Connection Error: {e}")
+                st.error(t("app.api_connection_error").format(e=e))
                 st.session_state["pending_start_condition_id"] = None
     with c_col2:
-        if st.button("Cancel", key="cancel_start_sidebar"):
+        if st.button(t("app.cancel"), key="cancel_start_sidebar"):
             st.session_state["pending_start_condition_id"] = None
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Emergency Controls")
+st.sidebar.markdown(f"### {t('app.emergency_controls')}")
 
-kill_condition_id = st.sidebar.text_input("Target Condition ID", placeholder="0x...", key="kill_input")
+kill_condition_id = st.sidebar.text_input(t("app.target_condition_id"), placeholder="0x...", key="kill_input")
 
 col_stop, col_liq = st.sidebar.columns(2)
+_label_stop = t("app.stop")
+_label_liq = t("app.liquidate_all")
 
 with col_stop:
-    if st.button("🛑 Stop", help="Soft Cancel all orders and suspend engine for this market"):
+    if st.button(f"🛑 {_label_stop}", help=t("app.stop_help")):
         if kill_condition_id:
             st.session_state["pending_kill_action"] = "stop"
             st.session_state["pending_kill_condition_id"] = kill_condition_id
         else:
-            st.warning("Enter ID")
+            st.warning(t("app.enter_id"))
 
 with col_liq:
-    if st.button("☢️ Liquidate All", help="Cancel orders and Market Dump to clear exposure"):
+    if st.button(f"☢️ {_label_liq}", help=t("app.liquidate_help")):
         if kill_condition_id:
             st.session_state["pending_kill_action"] = "liquidate"
             st.session_state["pending_kill_condition_id"] = kill_condition_id
         else:
-            st.warning("Enter ID")
+            st.warning(t("app.enter_id"))
 
 # Sidebar confirmation for Stop / Liquidate
 pending_kill_action = st.session_state.get("pending_kill_action")
 pending_kill_cid = st.session_state.get("pending_kill_condition_id")
 if pending_kill_action and pending_kill_cid:
-    label = "Stop" if pending_kill_action == "stop" else "Liquidate All"
-    st.sidebar.warning(
-        f"Confirm {label} for market {pending_kill_cid[:8]}... "
-        "This will affect live strategy state."
-    )
+    label = _label_stop if pending_kill_action == "stop" else _label_liq
+    st.sidebar.warning(t("app.confirm_action_message").format(label=label, cid=pending_kill_cid[:8]))
     k_col1, k_col2 = st.sidebar.columns(2)
     with k_col1:
-        if st.button(f"✅ Confirm {label}", key="confirm_kill_action"):
+        if st.button(f"✅ {t('app.confirm_stop') if pending_kill_action == 'stop' else t('app.confirm_liquidate')}", key="confirm_kill_action"):
             endpoint = "stop" if pending_kill_action == "stop" else "liquidate"
             try:
                 res = requests.post(f"{API_URL}/markets/{pending_kill_cid}/{endpoint}")
                 if res.status_code == 200:
-                    st.success(f"{label} executed")
+                    st.success(t("app.label_executed").format(label=label))
                     st.session_state["pending_kill_action"] = None
                     st.session_state["pending_kill_condition_id"] = None
                     st.rerun()
@@ -321,46 +469,44 @@ if pending_kill_action and pending_kill_cid:
                     st.session_state["pending_kill_action"] = None
                     st.session_state["pending_kill_condition_id"] = None
             except Exception as e:
-                st.error(f"API Error: {e}")
+                st.error(t("app.api_error").format(e=e))
                 st.session_state["pending_kill_action"] = None
                 st.session_state["pending_kill_condition_id"] = None
     with k_col2:
-        if st.button("Cancel", key="cancel_kill_action"):
+        if st.button(t("app.cancel"), key="cancel_kill_action"):
             st.session_state["pending_kill_action"] = None
             st.session_state["pending_kill_condition_id"] = None
 
 st.sidebar.markdown("---")
-
-# Danger Zone: Wipe all local data
-st.sidebar.markdown("### Danger Zone")
+st.sidebar.markdown(f"### {t('app.danger_zone')}")
 with st.sidebar.form("wipe_form"):
-    st.markdown("**Wipe ALL local data (DB + Redis)**")
-    wipe_confirm = st.text_input("Type `WIPE` to confirm", value="")
-    wipe_submitted = st.form_submit_button("🔥 Wipe All Data")
+    st.markdown(f"**{t('app.wipe_all_data')}**")
+    wipe_confirm = st.text_input(t("app.type_wipe_confirm"), value="")
+    wipe_submitted = st.form_submit_button(f"🔥 {t('app.wipe_all_btn')}")
 
     if wipe_submitted:
         if wipe_confirm.strip() != "WIPE":
-            st.warning("Please type `WIPE` exactly to confirm.")
+            st.warning(t("app.please_type_wipe"))
         else:
             try:
                 res = requests.post(f"{API_URL}/admin/wipe")
                 if res.status_code == 200:
-                    st.success("All local data wiped. Please restart any running strategies if needed.")
+                    st.success(t("app.wipe_success"))
                     st.rerun()
                 else:
                     st.error(res.text)
             except Exception as e:
-                st.error(f"API Error: {e}")
+                st.error(t("app.api_error").format(e=e))
 
 st.sidebar.markdown("---")
-if st.sidebar.button("Refresh Data", use_container_width=True):
+if st.sidebar.button(t("app.refresh_data"), use_container_width=True):
     st.rerun()
 
 # ----------------- MAIN PAGE -----------------
-st.title("📈 PolyMatrix Engine Dashboard")
+st.title(f"📈 {t('app.dashboard_title')}")
 
 # 1. Inventory & Risk Panel
-st.header("🛡️ Inventory & Risk")
+st.header(f"🛡️ {t('app.inventory_risk')}")
 inv_df = fetch_inventory()
 
 if not inv_df.empty:
@@ -377,7 +523,7 @@ if not inv_df.empty:
     m_col3.metric("Total Gross Exposure (YES+NO)", f"{gross_exposure:.4f}")
 
     # Optional exposure chart in a collapsible panel to avoid large empty space
-    with st.expander("Market Exposures (USDC)", expanded=gross_exposure > 0):
+    with st.expander(t("app.market_exposures"), expanded=gross_exposure > 0):
         if total_markets > 1 or gross_exposure > 0:
             plot_df = inv_df[["market_id", "yes_exposure", "no_exposure"]].copy()
             plot_df.set_index("market_id", inplace=True)
@@ -424,310 +570,193 @@ if not inv_df.empty:
         hide_index=True,
     )
 else:
-    st.info("No inventory data found. Add a market condition ID in the sidebar to start.")
+    st.info(t("app.no_inventory"))
 
 st.markdown("---")
 
 # 2. Market Screener (Gamma)
-st.header("🧭 Market Screener (Gamma)")
+st.header(f"🧭 {t('app.screener_title')}")
+with st.expander(f"📌 {t('app.screener_expander')}", expanded=False):
+    st.markdown(
+        f"{t('app.screener_score_intro')}\n"
+        f"- {t('app.screener_fill')}\n"
+        f"- {t('app.screener_profit')}\n"
+        f"- {t('app.screener_risk')}\n\n"
+        f"{t('app.screener_sort')}\n\n"
+        f"{t('app.screener_data_source')}"
+    )
 
 mode_col, _ = st.columns([1, 3])
 with mode_col:
     screener_mode = st.selectbox(
-        "Screener mode",
+        t("app.screener_mode"),
         options=["Conservative", "Normal", "Aggressive", "Ultra"],
         index=0,
-        help="Conservative = strict filters; Aggressive = looser filters showing more markets.",
+        help=t("app.screener_mode_help"),
     )
+
+st.caption(t("app.loading_markets_hint"))
 
 col_load, _ = st.columns([1, 3])
 with col_load:
-    if st.button("Load & Screen Markets", use_container_width=True):
-        try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    # Try to approximate full universe rather than a tiny top slice
-                    "limit": 500,
-                },
-                timeout=5,
-            )
-            if resp.status_code != 200:
-                st.error(f"Failed to load markets from Gamma: {resp.text}")
+    loading = st.session_state.get("screener_loading", False)
+    if loading:
+        load_page = st.session_state.get("screener_load_page", 0)
+        total_pages = 10
+        if load_page < total_pages:
+            progress = (load_page + 1) / total_pages
+            st.caption(t("app.loading_progress").format(current=load_page + 1, total=total_pages))
+            progress_bar = st.progress(progress)
+            raw_markets = list(st.session_state.get("screener_raw_markets", []))
+            offset = load_page * 500
+            try:
+                resp = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"active": "true", "closed": "false", "limit": 500, "offset": offset},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    st.warning(f"Gamma API returned {resp.status_code} at offset {offset}")
+                    st.session_state["screener_loading"] = False
+                    st.session_state["screener_load_page"] = 0
+                    st.session_state["screener_raw_markets"] = []
+                    st.rerun()
+                else:
+                    page = resp.json()
+                    seen = {m.get("conditionId") for m in raw_markets}
+                    for m in page or []:
+                        cid = m.get("conditionId")
+                        if cid and cid not in seen:
+                            seen.add(cid)
+                            raw_markets.append(m)
+                    st.session_state["screener_raw_markets"] = raw_markets
+                    st.session_state["screener_load_page"] = load_page + 1
+                    if len(page or []) < 500:
+                        st.session_state["screener_load_page"] = total_pages
+                time.sleep(0.25)
+            except Exception as e:
+                st.error(t("app.gamma_error").format(e=e))
+                st.session_state["screener_loading"] = False
+                st.session_state["screener_load_page"] = 0
+                st.session_state["screener_raw_markets"] = []
+                st.rerun()
             else:
-                raw_markets = resp.json()
-                screened = []
-                now = datetime.now(timezone.utc)
-
-                # Configure thresholds based on screener mode.
-                # Conservative: original strict filters for high-quality liquidity.
-                # Normal: relaxed, good daily MM candidates.
-                # Aggressive: very loose filters.
-                # Ultra: almost full universe (only binary + category filters),
-                #        no DTE/volume/liquidity/odds band constraints.
-                if screener_mode == "Conservative":
-                    min_dte = timedelta(days=7)
-                    min_vol = 50_000.0
-                    min_liq = 10_000.0
-                    price_low, price_high = 0.25, 0.75
-                elif screener_mode == "Normal":
-                    min_dte = timedelta(days=3)
-                    min_vol = 10_000.0
-                    min_liq = 3_000.0
-                    price_low, price_high = 0.20, 0.80
-                elif screener_mode == "Aggressive":
-                    min_dte = timedelta(days=1)
-                    min_vol = 1_000.0
-                    min_liq = 500.0
-                    price_low, price_high = 0.10, 0.90
-                else:  # Ultra
-                    # Placeholders; we will skip these checks entirely for Ultra.
-                    min_dte = timedelta(days=0)
-                    min_vol = 0.0
-                    min_liq = 0.0
-                    price_low, price_high = 0.0, 1.0
-
-                # V1.1 Category & Semantic Filtering
-                # Hard blacklist for Sports / live event markets
-                sports_blacklist = {
-                    "sports",
-                    "sport",
-                    "nfl",
-                    "nba",
-                    "mlb",
-                    "nhl",
-                    "soccer",
-                    "football",
-                    "premier-league",
-                    "premier league",
-                    "champions-league",
-                    "champions league",
-                }
-                question_blacklist = {
-                    "win the match",
-                    "wins the match",
-                    "to win the match",
-                    "halftime",
-                    "half-time",
-                    "in-play",
-                    "in play",
-                    "live betting",
-                    "live market",
-                    "live odds",
-                }
-                premium_keywords = {
-                    "politics",
-                    "elections",
-                    "election",
-                    "culture",
-                }
-                # Additional semantic keywords to infer category when API tags are missing
-                politics_words = {
-                    "president",
-                    "presidential",
-                    "election",
-                    "primary",
-                    "senate",
-                    "governor",
-                    "mayor",
-                    "parliament",
-                    "referendum",
-                }
-                culture_words = {
-                    "oscars",
-                    "oscar",
-                    "grammy",
-                    "emmy",
-                    "box office",
-                    "movie",
-                    "film",
-                    "series",
-                    "season",
-                    "tv show",
-                    "album",
-                    "song",
-                    "music",
-                }
-
-                for m in raw_markets:
-                    # ---------------------------
-                    # 0) Category & semantic pre-filter (hard ban toxic flow)
-                    # ---------------------------
-                    tags_raw = m.get("tags")
-                    tags_list = []
-                    if tags_raw:
-                        if isinstance(tags_raw, str):
-                            # Try JSON first, otherwise treat as comma-separated
-                            try:
-                                parsed = json.loads(tags_raw)
-                                if isinstance(parsed, list):
-                                    tags_list = parsed
-                                elif isinstance(parsed, str):
-                                    tags_list = [parsed]
-                            except Exception:
-                                tags_list = [
-                                    t.strip()
-                                    for t in tags_raw.replace(";", ",").split(",")
-                                    if t.strip()
-                                ]
-                        elif isinstance(tags_raw, list):
-                            tags_list = tags_raw
-
-                    category_raw = m.get("category") or m.get("subCategory") or ""
-                    slug = (m.get("slug") or "").lower()
-                    question_text = m.get("question") or ""
-                    question_lower = question_text.lower()
-
-                    # Build a text bag for sports blacklist matching
-                    tag_text = " ".join(str(t) for t in tags_list)
-                    category_haystack = " ".join(
-                        [category_raw, tag_text, slug]
-                    ).lower()
-
-                    if any(kw in category_haystack for kw in sports_blacklist):
-                        # Hard drop sports / leagues / obvious sports categories
-                        continue
-                    if any(kw in question_lower for kw in question_blacklist):
-                        # Hard drop live / in-play style questions
-                        continue
-
-                    # Derive a display category and premium flag (Politics / Elections / Culture)
-                    cat_source = category_raw.strip() or (
-                        tags_list[0].strip() if tags_list else ""
-                    )
-                    cat_match_text = (
-                        (category_raw or "") + " " + tag_text
-                    ).lower()
-                    is_premium_tag = any(pk in cat_match_text for pk in premium_keywords)
-                    # Fallback: detect premium purely from question / slug when tags are empty
-                    is_politics_semantic = any(w in question_lower for w in politics_words) or any(
-                        w in slug for w in politics_words
-                    )
-                    is_culture_semantic = any(w in question_lower for w in culture_words) or any(
-                        w in slug for w in culture_words
-                    )
-                    is_premium = is_premium_tag or is_politics_semantic or is_culture_semantic
-
-                    # Choose a human-friendly category label
-                    if is_premium:
-                        if is_politics_semantic or "politic" in cat_match_text:
-                            base_cat = "Politics"
-                        elif is_culture_semantic or "culture" in cat_match_text:
-                            base_cat = "Culture"
-                        else:
-                            base_cat = cat_source or "Premium"
-                        display_category = f"⭐ {base_cat}"
-                    else:
-                        # Non-premium: use API category/tag if present, otherwise a generic bucket
-                        display_category = cat_source or "General"
-
-                    # ---------------------------
-                    # 1) Binary ONLY: outcomes == ["Yes", "No"] (case-insensitive)
-                    # ---------------------------
-                    outcomes_raw = m.get("outcomes")
-                    outcomes = []
-                    if outcomes_raw:
-                        if isinstance(outcomes_raw, str):
-                            try:
-                                outcomes = json.loads(outcomes_raw)
-                            except Exception:
-                                outcomes = []
-                        elif isinstance(outcomes_raw, list):
-                            outcomes = outcomes_raw
-                    outcomes_lower = {str(o).strip().lower() for o in outcomes}
-                    if outcomes_lower != {"yes", "no"}:
-                        continue
-
-                    # 2) DTE, volume, liquidity & odds filters (skipped in Ultra mode)
-                    end_raw = m.get("endDate")
-                    try:
-                        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-                    try:
-                        vol_24h = float(m.get("volume24hr") or 0.0)
-                        liq = float(m.get("liquidityNum") or 0.0)
-                    except Exception:
-                        continue
-
-                    yes_price = None
-                    prices_raw = m.get("outcomePrices")
-                    if prices_raw:
-                        if isinstance(prices_raw, str):
-                            try:
-                                prices = json.loads(prices_raw)
-                            except Exception:
-                                prices = []
-                        elif isinstance(prices_raw, list):
-                            prices = prices_raw
-                        else:
-                            prices = []
-                        if prices:
-                            try:
-                                yes_price = float(prices[0])
-                            except Exception:
-                                yes_price = None
-
-                    if screener_mode != "Ultra":
-                        if end_dt - now < min_dte:
-                            continue
-                        if vol_24h <= min_vol or liq <= min_liq:
-                            continue
-                        if yes_price is not None and not (price_low <= yes_price <= price_high):
-                            continue
-
-                    screened.append(
-                        {
-                            "question": question_text,
-                            "yes_price": yes_price,
-                            "volume24hr": vol_24h,
-                            "liquidity": liq,
-                            "end_date": end_dt,
-                            "condition_id": m.get("conditionId"),
-                            "slug": m.get("slug"),
-                            "category": display_category,
-                        }
-                    )
-
-                # Sort by 24h volume descending
-                screened.sort(key=lambda x: x["volume24hr"], reverse=True)
-                st.session_state["screener_markets"] = screened
-        except Exception as e:
-            st.error(f"Gamma API error: {e}")
+                st.rerun()
+        else:
+            st.caption(t("app.loading_filtering"))
+            progress_bar = st.progress(1.0)
+            raw_markets = st.session_state.get("screener_raw_markets", [])
+            load_mode = st.session_state.get("screener_load_mode", "Ultra")
+            try:
+                screened = _filter_and_score_screener(raw_markets, load_mode)
+                if not screened:
+                    st.error(t("app.no_markets_loaded"))
+                else:
+                    st.session_state["screener_markets"] = screened
+            except Exception as e:
+                st.error(t("app.gamma_error").format(e=e))
+            st.session_state["screener_loading"] = False
+            st.session_state["screener_load_page"] = 0
+            st.session_state["screener_raw_markets"] = []
+            st.session_state["screener_load_mode"] = "Ultra"
+            st.rerun()
+    else:
+        if st.button(t("app.load_screen_markets"), use_container_width=True):
+            st.session_state["screener_loading"] = True
+            st.session_state["screener_load_page"] = 0
+            st.session_state["screener_raw_markets"] = []
+            st.session_state["screener_load_mode"] = screener_mode
+            st.rerun()
 
 screened_markets = st.session_state.get("screener_markets", [])
 if screened_markets:
-    # Structured table view with interactive selection
-    current_idx = st.session_state.get("screener_selected_idx", 0)
-    current_idx = max(0, min(current_idx, len(screened_markets) - 1))
-
-    df_screen = pd.DataFrame(
-        [
-            {
-                "Question": m["question"],
-                "Category/Tag": m.get("category", ""),
-                "YES Price": m["yes_price"],
-                "Volume 24h": m["volume24hr"],
-                "Liquidity": m["liquidity"],
-                "End Date": m["end_date"].strftime("%Y-%m-%d"),
-                "Condition ID": m["condition_id"],
-                "Slug": m["slug"],
-            }
-            for m in screened_markets
-        ]
+    # Filter: 只显示 4 星及以上（默认开启）
+    filter_4star = st.checkbox(
+        t("app.filter_4star"),
+        value=True,
+        key="screener_filter_4star_cb",
+        help=t("app.filter_4star_help"),
     )
 
-    # Add a selectable checkbox column synchronized with dropdown selection
-    df_screen["Selected"] = False
-    if 0 <= current_idx < len(df_screen):
-        df_screen.loc[current_idx, "Selected"] = True
+    display_markets = [m for m in screened_markets if m.get("stars", 0) >= 4] if filter_4star else screened_markets
+    if not display_markets:
+        st.info(t("app.no_4star"))
+    else:
+        filter_label = t("app.filter_label_4star") if filter_4star else t("app.filter_label_all")
+        st.caption(
+            t("app.caption_display").format(
+                n=len(display_markets),
+                filter_label=filter_label,
+                total=len(screened_markets),
+            )
+        )
 
-    edited_df = st.data_editor(
-        df_screen[
+        # Structured table view with interactive selection (based on display_markets)
+        current_idx = st.session_state.get("screener_selected_idx", 0)
+        current_idx = max(0, min(current_idx, len(display_markets) - 1))
+
+        df_screen = pd.DataFrame(
             [
-                "Selected",
+                {
+                    "Stars": "★" * m.get("stars", 0) + "☆" * (5 - m.get("stars", 0)),
+                    "Score": m.get("recommendation_score", 0),
+                    "Question": m["question"],
+                    "Category/Tag": m.get("category", ""),
+                    "YES Price": m["yes_price"],
+                    "Volume 24h": m["volume24hr"],
+                    "Liquidity": m["liquidity"],
+                    "End Date": m["end_date"].strftime("%Y-%m-%d"),
+                    "Condition ID": m["condition_id"],
+                    "Slug": m["slug"],
+                }
+                for m in display_markets
+            ]
+        )
+
+        # Single selection: only one row can be selected. "Current" column shows which row is selected (▶).
+        df_screen["Current"] = ""
+        if 0 <= current_idx < len(df_screen):
+            df_screen.loc[current_idx, "Current"] = "▶"
+        df_screen["Select"] = False
+        if 0 <= current_idx < len(df_screen):
+            df_screen.loc[current_idx, "Select"] = True
+
+        edited_df = st.data_editor(
+            df_screen[
+                [
+                    "Current",
+                    "Select",
+                    "Stars",
+                    "Score",
+                    "Question",
+                    "Category/Tag",
+                    "YES Price",
+                    "Volume 24h",
+                    "Liquidity",
+                    "End Date",
+                    "Condition ID",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            key="screener_table",
+            column_config={
+                "Current": st.column_config.TextColumn("", width="small", help="Selected row"),
+                "Select": st.column_config.CheckboxColumn(
+                    t("app.select"),
+                    help=t("app.select_one_help"),
+                ),
+                "Stars": st.column_config.TextColumn("Stars", help=t("app.stars_help")),
+                "Score": st.column_config.NumberColumn("Score", format="%.1f", help=t("app.score_help")),
+                "Category/Tag": st.column_config.TextColumn("Category/Tag"),
+                "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
+                "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
+                "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
+            },
+            disabled=[
+                "Current",
+                "Stars",
+                "Score",
                 "Question",
                 "Category/Tag",
                 "YES Price",
@@ -735,160 +764,134 @@ if screened_markets:
                 "Liquidity",
                 "End Date",
                 "Condition ID",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-        key="screener_table",
-        column_config={
-            "Selected": st.column_config.CheckboxColumn(
-                "Select",
-                help="Click to select this market for quoting.",
-            ),
-            "Category/Tag": st.column_config.TextColumn("Category/Tag"),
-            "YES Price": st.column_config.NumberColumn("YES Price", format="%.3f"),
-            "Volume 24h": st.column_config.NumberColumn("Volume 24h", format="%.0f"),
-            "Liquidity": st.column_config.NumberColumn("Liquidity", format="%.0f"),
-        },
-        disabled=[
-            "Question",
-            "Category/Tag",
-            "YES Price",
-            "Volume 24h",
-            "Liquidity",
-            "End Date",
-            "Condition ID",
-        ],
-    )
-
-    # Derive selected index from the checkbox column (table → state)
-    selected_rows = edited_df.index[edited_df["Selected"]].tolist()
-    if selected_rows:
-        st.session_state["screener_selected_idx"] = selected_rows[0]
-    else:
-        # If user unselects all, fall back to previous selection
-        st.session_state["screener_selected_idx"] = current_idx
-
-    st.markdown("#### Launch Quoting from Screener")
-
-    # Nicely formatted "card" preview for the currently selected market
-    sel_idx = st.session_state.get("screener_selected_idx", 0)
-    sel_idx = max(0, min(sel_idx, len(screened_markets) - 1))
-    selected_market = screened_markets[sel_idx]
-    yes_p = selected_market["yes_price"]
-
-    st.markdown("##### Selected market")
-    card_html = f"""
-    <div style="
-        border-radius: 8px;
-        padding: 12px 16px;
-        margin-bottom: 8px;
-        background-color: #f5f5fb;
-        border: 1px solid #d0d0ea;
-    ">
-      <div style="font-weight: 600; margin-bottom: 4px;">
-        {selected_market['question']}
-      </div>
-      <div style="font-size: 12px; color: #444;">
-        <div>Condition ID: <code>{selected_market['condition_id']}</code></div>
-        <div style="margin-top: 2px;">
-          YES Price: <b>{yes_p if yes_p is not None else 'N/A'}</b>
-          &nbsp;&nbsp; 24h Volume: <b>${selected_market['volume24hr']:.0f}</b>
-          &nbsp;&nbsp; Liquidity: <b>${selected_market['liquidity']:.0f}</b>
-        </div>
-        <div style="margin-top: 2px;">
-          End Date: <b>{selected_market['end_date'].strftime('%Y-%m-%d')}</b>
-        </div>
-      </div>
-    </div>
-    """
-    st.markdown(card_html, unsafe_allow_html=True)
-
-    col_start, col_info = st.columns([1, 3])
-    with col_start:
-        if st.button(
-            "✅ Start from Screener",
-            key="start_from_screener",
-            help="Prepare to start quoting for the selected market (will show a confirmation box).",
-        ):
-            m_sel = screened_markets[sel_idx]
-            if not m_sel["condition_id"]:
-                st.error("Missing conditionId for this market.")
-            else:
-                st.session_state["pending_screener_start_cid"] = m_sel["condition_id"]
-                st.session_state["pending_screener_question"] = m_sel["question"]
-    with col_info:
-        st.write(f"Total screened markets: **{len(screened_markets)}**")
-
-    # Compact confirmation panel for screener-based starts
-    pending_screener_cid = st.session_state.get("pending_screener_start_cid")
-    if pending_screener_cid:
-        # Re-locate the selected market details from current screened_markets
-        m_confirm = next(
-            (m for m in screened_markets if m["condition_id"] == pending_screener_cid),
-            None,
+            ],
         )
-        if not m_confirm:
-            st.warning(
-                "Selected market is no longer in the current screener results. Please select again."
+        st.caption(t("app.table_selection_hint"))
+
+        # Single selection: take only the first checked row so card and selection stay in sync
+        selected_rows = edited_df.index[edited_df["Select"]].tolist()
+        if selected_rows:
+            st.session_state["screener_selected_idx"] = int(selected_rows[0])
+        # if none checked, keep current_idx so we don't lose selection
+
+        st.markdown(f"#### {t('app.launch_quoting')}")
+
+        # Nicely formatted "card" preview for the currently selected market (from display_markets)
+        sel_idx = st.session_state.get("screener_selected_idx", 0)
+        sel_idx = max(0, min(sel_idx, len(display_markets) - 1))
+        selected_market = display_markets[sel_idx]
+        yes_p = selected_market["yes_price"]
+
+        st.markdown(f"##### {t('app.selected_market')}")
+        # Prominent card: larger padding, bigger question font, left accent, shadow
+        card_html = f"""
+        <div style="
+            border-radius: 12px;
+            padding: 20px 24px;
+            margin: 12px 0 16px 0;
+            background: linear-gradient(to right, #e8eaf6 0%, #f5f5fb 12px);
+            border: 1px solid #9fa8da;
+            border-left: 5px solid #3f51b5;
+            box-shadow: 0 2px 8px rgba(63,81,181,0.15);
+        ">
+          <div style="font-weight: 700; font-size: 1.1rem; margin-bottom: 12px; line-height: 1.4;">
+            {selected_market['question']}
+          </div>
+          <div style="font-size: 14px; color: #333;">
+            <div style="margin-bottom: 6px;">Condition ID: <code style="background:#fff; padding:2px 6px; border-radius:4px;">{selected_market['condition_id']}</code></div>
+            <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 16px;">
+              <span>YES Price: <b>{yes_p if yes_p is not None else 'N/A'}</b></span>
+              <span>24h Volume: <b>${selected_market['volume24hr']:.0f}</b></span>
+              <span>Liquidity: <b>${selected_market['liquidity']:.0f}</b></span>
+              <span>End Date: <b>{selected_market['end_date'].strftime('%Y-%m-%d')}</b></span>
+            </div>
+          </div>
+        </div>
+        """
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        col_start, col_info = st.columns([1, 3])
+        with col_start:
+            if st.button(
+                f"✅ {t('app.start_from_screener')}",
+                key="start_from_screener",
+                help=t("app.start_from_screener_help"),
+            ):
+                m_sel = display_markets[sel_idx]
+                if not m_sel["condition_id"]:
+                    st.error(t("app.missing_condition_id"))
+                else:
+                    st.session_state["pending_screener_start_cid"] = m_sel["condition_id"]
+                    st.session_state["pending_screener_question"] = m_sel["question"]
+        with col_info:
+            st.write(t("app.displaying_markets").format(n=len(display_markets), total=len(screened_markets)))
+
+        # Compact confirmation panel for screener-based starts
+        pending_screener_cid = st.session_state.get("pending_screener_start_cid")
+        if pending_screener_cid:
+            m_confirm = next(
+                (m for m in screened_markets if m["condition_id"] == pending_screener_cid),
+                None,
             )
-            st.session_state["pending_screener_start_cid"] = None
-            st.session_state["pending_screener_question"] = ""
-        else:
-            yes_p = m_confirm["yes_price"]
-            st.info("Please confirm starting the quoting strategy for the selected market:")
-            st.markdown(f"**{m_confirm['question']}**")
-            st.markdown(
-                f"- Condition ID: `{m_confirm['condition_id']}`  \n"
-                f"- YES Price: `{yes_p if yes_p is not None else 'N/A'}`  \n"
-                f"- 24h Volume: `${m_confirm['volume24hr']:.0f}`  \n"
-                f"- Liquidity: `${m_confirm['liquidity']:.0f}`  \n"
-                f"- End Date: `{m_confirm['end_date'].strftime('%Y-%m-%d')}`"
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button(
-                    "✅ Confirm Screener Start", key="confirm_screener_start_inline"
-                ):
-                    try:
-                        with st.spinner("Starting quoting for selected market..."):
-                            res = requests.post(
-                                f"{API_URL}/markets/{pending_screener_cid}/start"
-                            )
-                        if res.status_code == 200:
-                            st.success(
-                                f"Started quoting for {pending_screener_cid[:8]}..."
-                            )
-                            st.json(res.json())
+            if not m_confirm:
+                st.warning(t("app.market_no_longer"))
+                st.session_state["pending_screener_start_cid"] = None
+                st.session_state["pending_screener_question"] = ""
+            else:
+                yes_p = m_confirm["yes_price"]
+                st.info(t("app.confirm_screener_start"))
+                st.markdown(f"**{m_confirm['question']}**")
+                st.markdown(
+                    f"- Condition ID: `{m_confirm['condition_id']}`  \n"
+                    f"- YES Price: `{yes_p if yes_p is not None else 'N/A'}`  \n"
+                    f"- 24h Volume: `${m_confirm['volume24hr']:.0f}`  \n"
+                    f"- Liquidity: `${m_confirm['liquidity']:.0f}`  \n"
+                    f"- End Date: `{m_confirm['end_date'].strftime('%Y-%m-%d')}`"
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button(
+                        f"✅ {t('app.confirm_screener_btn')}", key="confirm_screener_start_inline"
+                    ):
+                        try:
+                            with st.spinner(t("app.starting_quoting_screener")):
+                                res = requests.post(
+                                    f"{API_URL}/markets/{pending_screener_cid}/start"
+                                )
+                            if res.status_code == 200:
+                                st.success(
+                                    f"Started quoting for {pending_screener_cid[:8]}..."
+                                )
+                                st.json(res.json())
+                                st.session_state["pending_screener_start_cid"] = None
+                                st.session_state["pending_screener_question"] = ""
+                                st.rerun()
+                            else:
+                                st.error(res.text)
+                                st.session_state["pending_screener_start_cid"] = None
+                                st.session_state["pending_screener_question"] = ""
+                        except Exception as e:
+                            st.error(f"API Error: {e}")
                             st.session_state["pending_screener_start_cid"] = None
                             st.session_state["pending_screener_question"] = ""
-                            st.rerun()
-                        else:
-                            st.error(res.text)
-                            st.session_state["pending_screener_start_cid"] = None
-                            st.session_state["pending_screener_question"] = ""
-                    except Exception as e:
-                        st.error(f"API Error: {e}")
+                with c2:
+                    if st.button(t("app.cancel"), key="cancel_screener_start_inline"):
                         st.session_state["pending_screener_start_cid"] = None
                         st.session_state["pending_screener_question"] = ""
-            with c2:
-                if st.button("Cancel", key="cancel_screener_start_inline"):
-                    st.session_state["pending_screener_start_cid"] = None
-                    st.session_state["pending_screener_question"] = ""
 else:
-    st.info("Click 'Load & Screen Markets' to fetch binary, liquid, medium-term markets from Gamma.")
+    st.info(t("app.load_markets_hint"))
 
 st.markdown("---")
 
 # 2.5 System Logs (Tail & Search)
-st.header("📝 System Logs (Tail & Search)")
-with st.expander("View trading engine logs", expanded=False):
+st.header(f"📝 {t('app.system_logs')}")
+with st.expander(t("app.view_logs"), expanded=False):
     col_search, col_level, col_refresh = st.columns([3, 1, 1])
     with col_search:
         log_filter = st.text_input(
             "Search Filter (substring match)",
             value="",
-            placeholder="keyword, condition_id, token_id, etc.",
+            placeholder=t("app.log_search_placeholder"),
         )
     with col_level:
         level_filter = st.selectbox(
@@ -897,7 +900,7 @@ with st.expander("View trading engine logs", expanded=False):
             index=0,
         )
     with col_refresh:
-        refresh = st.button("🔄 Refresh Logs", use_container_width=True)
+        refresh = st.button(f"🔄 {t('app.refresh_logs')}", use_container_width=True)
 
     # Always render current tail of the log; pressing the button simply triggers a rerun
     raw_logs = tail_logs(LOG_FILE_PATH, lines=500)
@@ -929,15 +932,15 @@ with st.expander("View trading engine logs", expanded=False):
 
             filtered_lines.append(line_strip)
 
-        display_text = "\n".join(filtered_lines) if filtered_lines else "No logs matched the current filters."
+        display_text = "\n".join(filtered_lines) if filtered_lines else t("app.no_logs_matched")
         st.code(display_text, language="log")
 
 # 3. Active Orders Panel
-st.header("📋 Active Orders")
+st.header(f"📋 {t('app.active_orders')}")
 orders_df = fetch_active_orders()
 
 if not orders_df.empty:
-    st.metric("Total Active Orders", len(orders_df))
+    st.metric(t("app.total_active_orders"), len(orders_df))
     # Nicer display: select and format key columns
     orders_display = orders_df[
         ["order_id", "market_id", "side", "price", "size", "status", "created_at_local"]
@@ -952,22 +955,22 @@ if not orders_df.empty:
         hide_index=True
     )
 else:
-    st.info("No active orders found (No OPEN or PENDING orders currently resting on the CLOB).")
+    st.info(t("app.no_active_orders"))
 
 st.markdown("---")
 
 # 4. System Status
-st.header("⚙️ System Status")
-st.markdown("API & Watchdog Health")
+st.header(f"⚙️ {t('app.system_status')}")
+st.markdown(t("app.api_health"))
 
 try:
     health = requests.get(f"{API_URL}/health", timeout=2)
     if health.status_code == 200:
-        st.success("FastAPI Backend: **ONLINE**")
+        st.success(t("app.backend_online"))
         st.json(health.json())
     else:
-        st.warning("FastAPI Backend: **UNKNOWN STATUS**")
+        st.warning(t("app.backend_unknown"))
 except Exception as e:
-    st.error("FastAPI Backend: **OFFLINE** (Is the API container running?)")
+    st.error(t("app.backend_offline"))
     
-st.caption("Tip: Use `docker compose logs -f api` to view real-time tick execution and QuotingEngine algorithmic logs.")
+st.caption(t("app.log_tip"))

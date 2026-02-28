@@ -228,20 +228,32 @@ class QuotingEngine:
                 # State A: neutral / light exposure — 少而精，高概率赚钱。
                 # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
                 # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
+                # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
+                best_bid = float(bids[0]["price"])
+                one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
+                # Clamp to Polymarket bounds so we still place at 0.01 (or 0.99) when fair value is at the floor/ceiling.
+                seen_bid_prices: set = set()
                 for i in range(self.grid_levels):
-                    bid_price = round(bid_1 - (i * self.tick_size), 2)
+                    raw = round(bid_1 - (i * self.tick_size), 2)
+                    bid_price = max(0.01, min(0.99, raw))
+                    if one_tick_below and i == 0 and bid_price < best_bid - 0.01:
+                        # Lift first level to best_bid - 0.01 so we're at most 1 tick below touch (more chance to get filled).
+                        bid_price = round(max(bid_price, best_bid - 0.01), 2)
+                        bid_price = max(0.01, min(0.99, bid_price))
 
-                    # Only place BUY orders to accumulate inventory at our target price.
-                    if 0.01 <= bid_price <= 0.99:
-                        orders_payload.append(
-                            {
-                                "condition_id": self.condition_id,
-                                "token_id": self.token_id,
-                                "side": OrderSide.BUY,
-                                "price": bid_price,
-                                "size": self.base_size,
-                            }
-                        )
+                    # One order per price level; skip if we already have this price (e.g. multiple levels clamped to 0.01).
+                    if bid_price in seen_bid_prices:
+                        continue
+                    seen_bid_prices.add(bid_price)
+                    orders_payload.append(
+                        {
+                            "condition_id": self.condition_id,
+                            "token_id": self.token_id,
+                            "side": OrderSide.BUY,
+                            "price": bid_price,
+                            "size": self.base_size,
+                        }
+                    )
 
                     # SELL side is intentionally skipped in neutral state to avoid inefficient capital lockup
                     # when we have very limited test capital and no shorting/minting capacity.
