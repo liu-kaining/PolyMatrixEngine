@@ -38,6 +38,7 @@ services:
       - API_URL=http://api:8000
       - TRADING_LOG_PATH=/app/data/logs/trading.log
     volumes:
+      - ./.env:/app/.env
       # Mount the same logs volume used by the API so we can read trading.log
       - logs_data:/app/data/logs
     depends_on:

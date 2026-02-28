@@ -104,6 +104,7 @@ async def health_check():
 @app.post("/markets/{condition_id}/start")
 async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
     """Add market to engine and start quoting"""
+    logger.info(f"POST /markets/{condition_id[:12]}.../start received")
     
     # Check if market exists in DB
     result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))

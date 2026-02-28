@@ -1,9 +1,26 @@
+import asyncio
+import math
 import os
 import json
+import logging
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
+import httpx
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
+
+# Dashboard debug logging (visible in docker logs)
+_log = logging.getLogger("dashboard")
+if not _log.handlers:
+    _log.setLevel(logging.INFO)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    _log.addHandler(_h)
 import pandas as pd
 from sqlalchemy import create_engine
 import requests
@@ -55,6 +72,12 @@ LOG_FILE_PATH = os.getenv(
     ),
 )
 
+# Gamma API fetch: concurrency & cap
+GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_PAGE_LIMIT = 1000
+MAX_MARKETS = int(os.getenv("GAMMA_MAX_MARKETS", "50000"))
+GAMMA_SEMAPHORE = 5
+
 # Session state for two-step confirmations
 if "pending_start_condition_id" not in st.session_state:
     st.session_state["pending_start_condition_id"] = None
@@ -75,7 +98,7 @@ if "screener_load_page" not in st.session_state:
 if "screener_raw_markets" not in st.session_state:
     st.session_state["screener_raw_markets"] = []
 if "screener_load_mode" not in st.session_state:
-    st.session_state["screener_load_mode"] = "Ultra"
+    st.session_state["screener_load_mode"] = "Normal"
 
 @st.cache_resource
 def get_engine():
@@ -105,6 +128,57 @@ def resolve_polymarket_link(condition_id: str) -> str:
         # Best-effort enrichment only; dashboard should not crash on failures.
         return ""
     return ""
+
+
+async def _fetch_gamma_page(client: httpx.AsyncClient, sem: asyncio.Semaphore, offset: int) -> tuple[int, list]:
+    """Fetch one page of Gamma markets; on failure return (offset, [])."""
+    async with sem:
+        try:
+            r = await client.get(
+                GAMMA_API_URL,
+                params={"active": "true", "closed": "false", "limit": GAMMA_PAGE_LIMIT, "offset": offset},
+                timeout=30.0,
+            )
+            r.raise_for_status()
+            return (offset, r.json() or [])
+        except Exception as e:
+            _log.warning("Gamma API offset %s failed: %s", offset, e)
+            return (offset, [])
+
+
+async def _fetch_gamma_markets_async() -> list:
+    """Paginate Gamma API with concurrency limit (semaphore 5), dedupe by conditionId, cap at MAX_MARKETS."""
+    sem = asyncio.Semaphore(GAMMA_SEMAPHORE)
+    all_markets: list = []
+    seen: set = set()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        offset = 0
+        while True:
+            if len(all_markets) >= MAX_MARKETS:
+                break
+            offsets = [offset + i * GAMMA_PAGE_LIMIT for i in range(GAMMA_SEMAPHORE)]
+            tasks = [_fetch_gamma_page(client, sem, o) for o in offsets]
+            results = await asyncio.gather(*tasks)
+            done = False
+            for _off, page in results:
+                if len(page) < GAMMA_PAGE_LIMIT:
+                    done = True
+                for m in page or []:
+                    cid = m.get("conditionId")
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        all_markets.append(m)
+            if done or len(all_markets) >= MAX_MARKETS:
+                break
+            offset += GAMMA_SEMAPHORE * GAMMA_PAGE_LIMIT
+    return all_markets
+
+
+@st.cache_data(ttl=300, show_spinner="Scanning global markets...")
+def fetch_gamma_markets_cached() -> list:
+    """Sync wrapper for Streamlit: run async Gamma fetch, cache 5 min. Returns list of raw market dicts."""
+    return asyncio.run(_fetch_gamma_markets_async())
+
 
 def fetch_inventory():
     engine = get_engine()
@@ -234,8 +308,35 @@ def resolve_condition_id(market_input: str) -> str | None:
     return None
 
 
+def calculate_opportunity_score(market: dict) -> float:
+    """Multi-factor opportunity score for market-making: log-scaled liquidity/volume, price skew penalty, category premium.
+    Higher = better. Used for sorting filtered markets (no external deps)."""
+    vol = max(1.0, float(market.get("volume24hr") or 0))
+    liq = max(1.0, float(market.get("liquidity") or 0))
+    yp = market.get("yes_price")
+    yp = 0.5 if yp is None else float(yp)
+    cat = market.get("category") or ""
+
+    # Liquidity & volume: log scale to avoid single huge market dominance
+    liq_vol = math.log10(vol) * 0.4 + math.log10(liq) * 0.4
+    # Scale to ~0–40 range for typical markets (log10 1e3–1e5)
+    liq_vol_scaled = liq_vol * 15.0
+
+    # Price skew penalty: prefer YES near 0.5; subtract penalty for deviation
+    price_penalty = abs(yp - 0.5) * 20.0  # 0 at 0.5, up to 10 at 0 or 1
+
+    # Category premium: small bonus for ⭐ Politics/Culture (avoid dominating entire list)
+    category_bonus = 5.0 if "⭐" in cat else 0.0
+
+    score = liq_vol_scaled - price_penalty + category_bonus
+    # Floor risk: extreme skew = no market-making space, sink to bottom
+    if yp < 0.15 or yp > 0.85:
+        score -= 50.0
+    return score
+
+
 def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
-    """Filter raw Gamma markets (binary, blacklist, DTE/vol/liq) and compute recommendation score. Returns list of screened dicts."""
+    """Filter raw Gamma markets (binary, blacklist, DTE/vol/liq) and compute opportunity score. Returns list of screened dicts."""
     now = datetime.now(timezone.utc)
     if screener_mode == "Conservative":
         min_dte = timedelta(days=7)
@@ -250,12 +351,16 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         min_vol, min_liq = 1_000.0, 500.0
         price_low, price_high = 0.10, 0.90
     else:
-        min_dte = timedelta(days=0)
+        min_dte = timedelta(days=1)  # Ultra: at least 1 day to avoid ultra-short event markets
         min_vol, min_liq = 0.0, 0.0
         price_low, price_high = 0.0, 1.0
 
     sports_blacklist = {"sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "premier-league", "premier league", "champions-league", "champions league"}
-    question_blacklist = {"win the match", "wins the match", "to win the match", "halftime", "half-time", "in-play", "in play", "live betting", "live market", "live odds"}
+    question_blacklist = {
+        "win the match", "wins the match", "to win the match", "halftime", "half-time",
+        "in-play", "in play", "live betting", "live market", "live odds",
+        "up or down", "strikes by", "one day after launch", "one week after",
+    }
     premium_keywords = {"politics", "elections", "election", "culture"}
     politics_words = {"president", "presidential", "election", "primary", "senate", "governor", "mayor", "parliament", "referendum"}
     culture_words = {"oscars", "oscar", "grammy", "emmy", "box office", "movie", "film", "series", "season", "tv show", "album", "song", "music"}
@@ -339,23 +444,11 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         })
 
     if screened:
-        max_vol_liq = max((x["volume24hr"] * x["liquidity"] for x in screened), default=1.0) or 1.0
         for m in screened:
-            vol, liq = m["volume24hr"], m["liquidity"]
-            yp = m["yes_price"] if m["yes_price"] is not None else 0.5
-            dte_days = (m["end_date"] - now).total_seconds() / 86400.0
-            cat = m.get("category", "")
-            fill_score = 20.0 * min(1.0, vol / 50000.0) + 20.0 * min(1.0, liq / 15000.0)
-            dte_score = 12.0 * min(1.0, dte_days / 30.0)
-            price_score = 12.0 if 0.20 <= yp <= 0.80 else (6.0 if 0.10 <= yp <= 0.90 else 0.0)
-            premium_bonus = 11.0 if "⭐" in cat else 0.0
-            risk_score = dte_score + price_score + premium_bonus
-            opp_score = 25.0 * (vol * liq) / max_vol_liq if max_vol_liq else 0.0
-            total = fill_score + risk_score + opp_score
-            m["recommendation_score"] = round(total, 1)
-            m["stars"] = max(1, min(5, 1 + int(total / 20)))
-            m["fill_score"] = round(fill_score, 1)
-            m["risk_score"] = round(risk_score, 1)
+            score = calculate_opportunity_score(m)
+            m["recommendation_score"] = round(score, 1)
+            m["stars"] = max(1, min(5, 1 + int(score / 20)))
+    # Sort: by opportunity score (recommendation_score) descending, then volume24hr tiebreaker
     screened.sort(key=lambda x: (x.get("recommendation_score", 0), x["volume24hr"]), reverse=True)
     return screened
 
@@ -591,7 +684,7 @@ with mode_col:
     screener_mode = st.selectbox(
         t("app.screener_mode"),
         options=["Conservative", "Normal", "Aggressive", "Ultra"],
-        index=0,
+        index=1,  # Default: Normal (min_dte=3d, safer than Ultra)
         help=t("app.screener_mode_help"),
     )
 
@@ -599,74 +692,19 @@ st.caption(t("app.loading_markets_hint"))
 
 col_load, _ = st.columns([1, 3])
 with col_load:
-    loading = st.session_state.get("screener_loading", False)
-    if loading:
-        load_page = st.session_state.get("screener_load_page", 0)
-        total_pages = 10
-        if load_page < total_pages:
-            progress = (load_page + 1) / total_pages
-            st.caption(t("app.loading_progress").format(current=load_page + 1, total=total_pages))
-            progress_bar = st.progress(progress)
-            raw_markets = list(st.session_state.get("screener_raw_markets", []))
-            offset = load_page * 500
-            try:
-                resp = requests.get(
-                    "https://gamma-api.polymarket.com/markets",
-                    params={"active": "true", "closed": "false", "limit": 500, "offset": offset},
-                    timeout=15,
-                )
-                if resp.status_code != 200:
-                    st.warning(f"Gamma API returned {resp.status_code} at offset {offset}")
-                    st.session_state["screener_loading"] = False
-                    st.session_state["screener_load_page"] = 0
-                    st.session_state["screener_raw_markets"] = []
-                    st.rerun()
-                else:
-                    page = resp.json()
-                    seen = {m.get("conditionId") for m in raw_markets}
-                    for m in page or []:
-                        cid = m.get("conditionId")
-                        if cid and cid not in seen:
-                            seen.add(cid)
-                            raw_markets.append(m)
-                    st.session_state["screener_raw_markets"] = raw_markets
-                    st.session_state["screener_load_page"] = load_page + 1
-                    if len(page or []) < 500:
-                        st.session_state["screener_load_page"] = total_pages
-                time.sleep(0.25)
-            except Exception as e:
-                st.error(t("app.gamma_error").format(e=e))
-                st.session_state["screener_loading"] = False
-                st.session_state["screener_load_page"] = 0
-                st.session_state["screener_raw_markets"] = []
-                st.rerun()
+    if st.button(t("app.load_screen_markets"), use_container_width=True):
+        try:
+            raw_markets = fetch_gamma_markets_cached()
+            with st.spinner(t("app.loading_filtering")):
+                screened = _filter_and_score_screener(raw_markets, screener_mode)
+            if not screened:
+                st.error(t("app.no_markets_loaded"))
             else:
-                st.rerun()
-        else:
-            st.caption(t("app.loading_filtering"))
-            progress_bar = st.progress(1.0)
-            raw_markets = st.session_state.get("screener_raw_markets", [])
-            load_mode = st.session_state.get("screener_load_mode", "Ultra")
-            try:
-                screened = _filter_and_score_screener(raw_markets, load_mode)
-                if not screened:
-                    st.error(t("app.no_markets_loaded"))
-                else:
-                    st.session_state["screener_markets"] = screened
-            except Exception as e:
-                st.error(t("app.gamma_error").format(e=e))
-            st.session_state["screener_loading"] = False
-            st.session_state["screener_load_page"] = 0
-            st.session_state["screener_raw_markets"] = []
-            st.session_state["screener_load_mode"] = "Ultra"
-            st.rerun()
-    else:
-        if st.button(t("app.load_screen_markets"), use_container_width=True):
-            st.session_state["screener_loading"] = True
-            st.session_state["screener_load_page"] = 0
-            st.session_state["screener_raw_markets"] = []
-            st.session_state["screener_load_mode"] = screener_mode
-            st.rerun()
+                st.session_state["screener_markets"] = screened
+                st.session_state["screener_load_mode"] = screener_mode
+        except Exception as e:
+            st.error(t("app.gamma_error").format(e=e))
+        st.rerun()
 
 screened_markets = st.session_state.get("screener_markets", [])
 if screened_markets:
@@ -691,63 +729,41 @@ if screened_markets:
             )
         )
 
-        # Structured table view with interactive selection (based on display_markets)
+        # Table with click-to-select: each row has a Select button; click it to select that market.
         current_idx = st.session_state.get("screener_selected_idx", 0)
         current_idx = max(0, min(current_idx, len(display_markets) - 1))
 
-        df_screen = pd.DataFrame(
-            [
-                {
-                    "Stars": "★" * m.get("stars", 0) + "☆" * (5 - m.get("stars", 0)),
-                    "Score": m.get("recommendation_score", 0),
-                    "Question": m["question"],
-                    "Category/Tag": m.get("category", ""),
-                    "YES Price": m["yes_price"],
-                    "Volume 24h": m["volume24hr"],
-                    "Liquidity": m["liquidity"],
-                    "End Date": m["end_date"].strftime("%Y-%m-%d"),
-                    "Condition ID": m["condition_id"],
-                    "Slug": m["slug"],
-                }
-                for m in display_markets
-            ]
-        )
+        # Table header
+        col_w = [0.4, 0.6, 0.6, 3.5, 0.9, 0.6, 0.6, 0.6, 0.7]
+        hc = st.columns(col_w)
+        for col, label in zip(hc, ["", "Stars", "Score", "Question", "Category", "YES", "Vol 24h", "Liq", t("app.select")]):
+            col.markdown(f"**{label}**" if label else "")
 
-        # Single selection: dropdown chooses one market; table is read-only with ▶ indicating selection.
-        sel_idx = st.selectbox(
-            t("app.selected_market"),
-            options=range(len(display_markets)),
-            index=current_idx,
-            format_func=lambda i: (display_markets[i]["question"][:80] + "…") if len(display_markets[i]["question"]) > 80 else display_markets[i]["question"],
-            key="screener_market_select",
-            help=t("app.select_one_help"),
-        )
-        if sel_idx != current_idx:
-            st.session_state["screener_selected_idx"] = int(sel_idx)
-            st.rerun()
+        # Rows: click Select to choose that market
+        for i, m in enumerate(display_markets):
+            cols = st.columns(col_w)
+            stars = "★" * m.get("stars", 0) + "☆" * (5 - m.get("stars", 0))
+            with cols[0]:
+                st.write("▶" if i == current_idx else "")
+            with cols[1]:
+                st.write(stars)
+            with cols[2]:
+                st.write(f"{m.get('recommendation_score', 0):.1f}")
+            with cols[3]:
+                st.write(m["question"])
+            with cols[4]:
+                st.write(m.get("category", ""))
+            with cols[5]:
+                st.write(f"{m['yes_price']:.3f}" if m.get("yes_price") is not None else "—")
+            with cols[6]:
+                st.write(f"{m.get('volume24hr', 0):.0f}")
+            with cols[7]:
+                st.write(f"{m.get('liquidity', 0):.0f}")
+            with cols[8]:
+                if st.button("✓", key=f"screener_sel_{i}", help=t("app.click_to_select")):
+                    st.session_state["screener_selected_idx"] = i
+                    st.rerun()
 
-        df_screen["Current"] = ""
-        if 0 <= current_idx < len(df_screen):
-            df_screen.loc[current_idx, "Current"] = "▶"
-
-        st.dataframe(
-            df_screen[
-                [
-                    "Current",
-                    "Stars",
-                    "Score",
-                    "Question",
-                    "Category/Tag",
-                    "YES Price",
-                    "Volume 24h",
-                    "Liquidity",
-                    "End Date",
-                    "Condition ID",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
         st.caption(t("app.table_selection_hint"))
 
         st.markdown(f"#### {t('app.launch_quoting')}")
@@ -830,11 +846,12 @@ if screened_markets:
                         f"✅ {t('app.confirm_screener_btn')}", key="confirm_screener_start_inline"
                     ):
                         try:
+                            url = f"{API_URL}/markets/{pending_screener_cid}/start"
+                            _log.info("[Screener] POST %s", url)
                             with st.spinner(t("app.starting_quoting_screener")):
-                                res = requests.post(
-                                    f"{API_URL}/markets/{pending_screener_cid}/start"
-                                )
+                                res = requests.post(url, timeout=30)
                             if res.status_code == 200:
+                                _log.info("[Screener] Start OK: %s", res.json())
                                 st.success(
                                     f"Started quoting for {pending_screener_cid[:8]}..."
                                 )
@@ -843,10 +860,12 @@ if screened_markets:
                                 st.session_state["pending_screener_question"] = ""
                                 st.rerun()
                             else:
+                                _log.warning("[Screener] Start failed: %s %s", res.status_code, res.text[:200])
                                 st.error(res.text)
                                 st.session_state["pending_screener_start_cid"] = None
                                 st.session_state["pending_screener_question"] = ""
                         except Exception as e:
+                            _log.exception("[Screener] Start request failed: %s", e)
                             st.error(f"API Error: {e}")
                             st.session_state["pending_screener_start_cid"] = None
                             st.session_state["pending_screener_question"] = ""

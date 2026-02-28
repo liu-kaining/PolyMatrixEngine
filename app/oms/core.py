@@ -13,6 +13,17 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+def _is_non_transient_error(e: Exception) -> bool:
+    """403 geoblock / 400 balance: retrying won't help; don't count toward circuit breaker."""
+    sc = getattr(e, "status_code", None)
+    if sc in (403, 400):
+        return True
+    s = str(e).lower()
+    if "status_code=403" in s or "status_code=400" in s:
+        return True
+    return False
+
+
 class CircuitBreaker:
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.failure_threshold = failure_threshold
@@ -36,7 +47,10 @@ class CircuitBreaker:
                 self.reset()
             return result
         except Exception as e:
-            self.record_failure()
+            if not _is_non_transient_error(e):
+                self.record_failure()
+            else:
+                logger.debug(f"CircuitBreaker: skipping failure count for non-transient error: {e}")
             raise e
 
     def record_failure(self):
