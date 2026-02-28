@@ -53,7 +53,7 @@ services:
       POSTGRES_PASSWORD: postgres_password
       POSTGRES_DB: polymatrix
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -67,7 +67,7 @@ services:
     container_name: polymatrix_redis
     restart: always
     ports:
-      - "6379:6379"
+      - "6380:6379"   # host 6380 so 6379 is free for e.g. ThetaMind (override with REDIS_PORT in .env if needed)
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes

@@ -15,11 +15,13 @@ class Settings(BaseSettings):
     PK: str = ""
     FUNDER_ADDRESS: str = ""
     
-    # Database
+    # Database (DB_PORT is for docker-compose host mapping only; app uses DATABASE_URL)
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres_password@localhost:5432/polymatrix"
-    
-    # Redis
+    DB_PORT: str = "5433"
+
+    # Redis (REDIS_PORT is for docker-compose host mapping only; app uses REDIS_URL)
     REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_PORT: str = "6380"
     
     # Alchemy RPC (Kill Switch)
     ALCHEMY_RPC_URL: str = ""
