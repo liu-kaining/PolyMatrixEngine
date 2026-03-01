@@ -309,57 +309,70 @@ def resolve_condition_id(market_input: str) -> str | None:
 
 
 def calculate_opportunity_score(market: dict) -> float:
-    """Multi-factor opportunity score for market-making: log-scaled liquidity/volume, price skew penalty, category premium.
-    Higher = better. Used for sorting filtered markets (no external deps)."""
+    """Multi-factor opportunity score optimized for High-Frequency Grid Trading.
+    Favors absolute volume and extreme turnover (Volume/Liquidity) for maximum fill rate.
+    """
     vol = max(1.0, float(market.get("volume24hr") or 0))
     liq = max(1.0, float(market.get("liquidity") or 0))
     yp = market.get("yes_price")
     yp = 0.5 if yp is None else float(yp)
-    cat = market.get("category") or ""
 
-    # Liquidity & volume: log scale to avoid single huge market dominance
-    liq_vol = math.log10(vol) * 0.4 + math.log10(liq) * 0.4
-    # Scale to ~0–40 range for typical markets (log10 1e3–1e5)
-    liq_vol_scaled = liq_vol * 15.0
+    # 1. Volume Score: Heavily favor markets with high absolute 24h volume
+    # log10(100k) = 5. Scale it up.
+    vol_score = math.log10(vol) * 12.0
 
-    # Price skew penalty: prefer YES near 0.5; subtract penalty for deviation
-    price_penalty = abs(yp - 0.5) * 20.0  # 0 at 0.5, up to 10 at 0 or 1
+    # 2. Turnover Score: (Volume / Liquidity)
+    # High turnover means the market is trading rapidly compared to its order book depth.
+    # This is the "Engine Room" for grid trading fills.
+    # Increase weight for turnover to prioritize active small-cap pools.
+    turnover = (vol / liq) if liq > 0 else 0
+    turnover_score = min(50.0, turnover * 3.0) 
 
-    # Category premium: small bonus for ⭐ Politics/Culture (avoid dominating entire list)
-    category_bonus = 5.0 if "⭐" in cat else 0.0
+    # 3. Price Skew Penalty: prefer YES near 0.5
+    # Increased penalty to keep grid trading in the 'safe' 0.3-0.7 zone
+    price_penalty = abs(yp - 0.5) * 40.0
 
-    score = liq_vol_scaled - price_penalty + category_bonus
-    # Floor risk: extreme skew = no market-making space, sink to bottom
+    score = vol_score + turnover_score - price_penalty
+    
+    # 4. Floor Risk: extreme skew = resolution imminent or no movement
+    # Re-tightened to 0.15/0.85 to avoid 'one-way trip' resolution markets
     if yp < 0.15 or yp > 0.85:
-        score -= 50.0
+        score -= 80.0
     return score
 
 
 def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
     """Filter raw Gamma markets (binary, blacklist, DTE/vol/liq) and compute opportunity score. Returns list of screened dicts."""
     now = datetime.now(timezone.utc)
+    # Adjusted thresholds to favor high-frequency turnover
     if screener_mode == "Conservative":
-        min_dte = timedelta(days=7)
-        min_vol, min_liq = 50_000.0, 10_000.0
-        price_low, price_high = 0.25, 0.75
-    elif screener_mode == "Normal":
         min_dte = timedelta(days=3)
-        min_vol, min_liq = 10_000.0, 3_000.0
+        min_vol, min_liq = 10_000.0, 2_000.0
         price_low, price_high = 0.20, 0.80
-    elif screener_mode == "Aggressive":
+    elif screener_mode == "Normal":
         min_dte = timedelta(days=1)
-        min_vol, min_liq = 1_000.0, 500.0
-        price_low, price_high = 0.10, 0.90
+        min_vol, min_liq = 2_000.0, 400.0
+        price_low, price_high = 0.15, 0.85
+    elif screener_mode == "Aggressive":
+        min_dte = timedelta(hours=6)
+        min_vol, min_liq = 500.0, 50.0
+        price_low, price_high = 0.05, 0.95
     else:
-        min_dte = timedelta(days=1)  # Ultra: at least 1 day to avoid ultra-short event markets
+        min_dte = timedelta(hours=1)  # Ultra: basically everything active
         min_vol, min_liq = 0.0, 0.0
         price_low, price_high = 0.0, 1.0
 
-    sports_blacklist = {"sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "premier-league", "premier league", "champions-league", "champions league"}
+    sports_blacklist = {
+        "sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "tennis",
+        "hockey", "baseball", "basketball", "premier-league", "premier league",
+        "champions-league", "champions league", "division", "win the cup", "stanley cup",
+        "super bowl", "world series", "playoffs", "play-offs", "ucl", "uefa"
+    }
     question_blacklist = {
         "win the match", "wins the match", "to win the match", "halftime", "half-time",
         "in-play", "in play", "live betting", "live market", "live odds",
         "up or down", "strikes by", "one day after launch", "one week after",
+        "points", "score", "goals", "touchdown", "points by", "home team", "away team",
     }
     premium_keywords = {"politics", "elections", "election", "culture"}
     politics_words = {"president", "presidential", "election", "primary", "senate", "governor", "mayor", "parliament", "referendum"}
@@ -422,16 +435,30 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         prices_raw = m.get("outcomePrices")
         if prices_raw:
             prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw if isinstance(prices_raw, list) else []
-            if prices:
-                try:
-                    yes_price = float(prices[0])
-                except Exception:
-                    pass
+            if prices and outcomes:
+                yes_idx = next((i for i, o in enumerate(outcomes) if str(o).strip().lower() == "yes"), None)
+                if yes_idx is not None and yes_idx < len(prices):
+                    try:
+                        yes_price = float(prices[yes_idx])
+                    except Exception:
+                        pass
+                elif prices:
+                    try:
+                        yes_price = float(prices[0])
+                    except Exception:
+                        pass
+        # No valid YES price → can't evaluate, skip
+        if yes_price is None:
+            continue
         if screener_mode != "Ultra":
             if end_dt - now < min_dte or vol_24h <= min_vol or liq <= min_liq:
                 continue
-            if yes_price is not None and not (price_low <= yes_price <= price_high):
+            if not (price_low <= yes_price <= price_high):
                 continue
+        # Even in Ultra mode, reject absolute dead-ends (price < 0.15 or > 0.85)
+        # 0.15-0.85 is the minimum 'oscillation room' needed for grid strategy
+        if yes_price < 0.15 or yes_price > 0.85:
+            continue
         screened.append({
             "question": question_text,
             "yes_price": yes_price,
@@ -447,9 +474,12 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         for m in screened:
             score = calculate_opportunity_score(m)
             m["recommendation_score"] = round(score, 1)
-            m["stars"] = max(1, min(5, 1 + int(score / 20)))
-    # Sort: by opportunity score (recommendation_score) descending, then volume24hr tiebreaker
+            # Star bands: 2* ≥15, 3* ≥30, 4* ≥45, 5* ≥60 (so "4+ stars" shows more results)
+            m["stars"] = max(1, min(5, 1 + int(score / 15)))
     screened.sort(key=lambda x: (x.get("recommendation_score", 0), x["volume24hr"]), reverse=True)
+
+    # Category diversity cap removed for high-frequency trading focus
+    # We want the absolute most active markets regardless of category
     return screened
 
 

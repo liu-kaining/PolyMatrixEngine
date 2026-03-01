@@ -133,7 +133,8 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
         await db.commit()
         
     # Pre-flight Check: USDC Balance (best-effort, only when LIVE_TRADING_ENABLED=True and SDK exposes it)
-    MIN_REQUIRED_USDC = 50.0
+    # Minimum for 1 market: 2 sides × 2 grid levels × 5 USDC ≈ 20
+    MIN_REQUIRED_USDC = 20.0
     from app.oms.core import oms
     if oms.client and settings.LIVE_TRADING_ENABLED:
         try:
