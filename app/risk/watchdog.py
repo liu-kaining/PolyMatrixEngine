@@ -15,7 +15,7 @@ class RiskMonitor:
     def __init__(self):
         self.max_exposure = settings.MAX_EXPOSURE_PER_MARKET
         self.reconciliation_interval = 300 # 5 minutes
-        self.exposure_tolerance = 1.0 # 1 USDC tolerance for sync discrepancy
+        self.exposure_tolerance = settings.EXPOSURE_TOLERANCE
 
     async def run(self):
         """Background daemon polling risk metrics and reconciling"""
@@ -111,23 +111,33 @@ class RiskMonitor:
             logger.error(f"Unexpected positions format: {type(positions)}")
             return
             
+        # Normalize conditionId for lookup (API may return different casing than DB)
+        def _norm_cid(cid: str | None) -> str | None:
+            if not cid or not isinstance(cid, str):
+                return None
+            s = cid.strip()
+            if s.startswith("0x"):
+                return s.lower()
+            return s
+
         # Group actual positions by conditionId
         actual_inventory = {}
         for p in positions:
             cid = p.get("conditionId")
             if not cid:
                 continue
-            if cid not in actual_inventory:
-                actual_inventory[cid] = {"yes": 0.0, "no": 0.0}
-                
+            key = _norm_cid(cid)
+            if key is None:
+                continue
+            if key not in actual_inventory:
+                actual_inventory[key] = {"yes": 0.0, "no": 0.0}
             # Usually outcomeIndex 0 is YES, 1 is NO for binary
             outcome_idx = p.get("outcomeIndex")
             size = float(p.get("size", 0.0))
-            
             if outcome_idx == 0 or str(p.get("outcome")).upper() == "YES":
-                actual_inventory[cid]["yes"] += size
+                actual_inventory[key]["yes"] += size
             else:
-                actual_inventory[cid]["no"] += size
+                actual_inventory[key]["no"] += size
 
         # 2. Compare with DB Ledger (row-level lock to prevent dirty writes from concurrent handle_fill)
         async with AsyncSessionLocal() as session:
@@ -137,7 +147,8 @@ class RiskMonitor:
             
             for db_inv in db_inventories:
                 cid = db_inv.market_id
-                actual = actual_inventory.get(cid, {"yes": 0.0, "no": 0.0})
+                key = _norm_cid(cid)
+                actual = actual_inventory.get(key, {"yes": 0.0, "no": 0.0}) if key else {"yes": 0.0, "no": 0.0}
                 
                 db_yes = float(db_inv.yes_exposure)
                 db_no = float(db_inv.no_exposure)

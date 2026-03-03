@@ -15,6 +15,7 @@ services:
       - FUNDER_ADDRESS=${FUNDER_ADDRESS}
       - LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-False}
       - MAX_EXPOSURE_PER_MARKET=${MAX_EXPOSURE_PER_MARKET:-50.0}
+      - EXPOSURE_TOLERANCE=${EXPOSURE_TOLERANCE:-0.01}
       - TRADING_LOG_PATH=/app/data/logs/trading.log
     depends_on:
       postgres:

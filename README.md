@@ -198,8 +198,8 @@ cd PolyMatrixEngine
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少配置：
-# PK, FUNDER_ADDRESS, LIVE_TRADING_ENABLED, BASE_ORDER_SIZE, GRID_LEVELS, MAX_EXPOSURE_PER_MARKET
+# 编辑 .env，至少配置：PK、FUNDER_ADDRESS、LIVE_TRADING_ENABLED、
+# BASE_ORDER_SIZE、GRID_LEVELS、MAX_EXPOSURE_PER_MARKET 等，详见下方「环境变量说明（.env）」。
 ```
 
 3. **启动服务**
@@ -262,16 +262,68 @@ curl http://localhost:8000/markets/{condition_id}/risk
 curl http://localhost:8000/orders/active
 ```
 
-## 关键配置项（.env）
+## 环境变量说明（.env）
 
-- `LIVE_TRADING_ENABLED`：`True` 实盘 / `False` Dry-Run。
-- `MAX_EXPOSURE_PER_MARKET`：单市场最大敞口上限（USDC 名义）。
-- `BASE_ORDER_SIZE`：每笔限价单的下单 size（需 ≥ Polymarket `orderMinSize`）。
-- `GRID_LEVELS`：每一侧（买/卖）的网格层数。
-- 其他基础设施和网络配置：
-  - `PM_WS_URL` / `PM_API_URL` / `PM_CHAIN_ID`
-  - `DATABASE_URL` / `REDIS_URL`
-  - `ALCHEMY_RPC_URL`（当前版本仅预留）
+所有配置通过项目根目录的 `.env` 加载，应用启动时由 `app/core/config.py` 的 Pydantic Settings 读取。以下按功能分组说明含义与建议取值。
+
+### 应用与运行模式
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `PROJECT_NAME` | 应用显示名称 | `PolyMatrix Engine` | 仅用于日志与 API 标题，可随意修改。 |
+| `DEBUG` | 调试模式 | `False` | 设为 `True` 时输出更详细调试信息，生产建议保持 `False`。 |
+| `LIVE_TRADING_ENABLED` | 是否实盘下单 | `True` / `False` | **关键**：`True` 时 OMS 会向 Polymarket CLOB 真实下单/撤单；`False` 时为 Dry-Run，仅在本地 DB 模拟状态，不发起真实请求。 |
+
+### Polymarket 网络
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `PM_WS_URL` | 行情 WebSocket 地址 | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | 用于订阅订单簿与 tick，一般无需修改。 |
+| `PM_API_URL` | CLOB REST API 根地址 | `https://clob.polymarket.com` | 下单、撤单、订单簿快照等均请求此域名。 |
+| `PM_CHAIN_ID` | 链 ID | `137` | Polymarket 使用 Polygon 主网，137 即 Polygon Mainnet。 |
+
+### 交易凭证（切勿提交到版本库）
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `PK` | 钱包私钥（Hex 字符串） | 64 位十六进制 | 用于对 CLOB 订单签名，必须与 `FUNDER_ADDRESS` 对应。仅限本地或安全环境使用。 |
+| `FUNDER_ADDRESS` | 出资/交易钱包地址 | `0x...`（EIP-55 格式） | Polymarket 账户对应的以太坊地址，用于下单、对账与 Data API 查询持仓。 |
+
+### 持久化（Postgres & Redis）
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `DATABASE_URL` | 异步 Postgres 连接串 | `postgresql+asyncpg://user:pass@host:port/dbname` | 本地开发常用 `localhost:5433`；Docker 内用服务名 `postgres:5432`。 |
+| `REDIS_URL` | Redis 连接串 | `redis://localhost:6380/0` | 用于 tick/control 发布订阅与状态缓存；Docker 内可用 `redis://redis:6379/0`。 |
+
+### 风控
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `MAX_EXPOSURE_PER_MARKET` | 单市场最大敞口（USDC 名义） | `10` | 任一市场 Yes+No 敞口绝对值超过此值时，Watchdog 触发 Kill Switch：发布 suspend、撤光该市场挂单。 |
+| `EXPOSURE_TOLERANCE` | 对账触发覆盖的敞口差阈值 | `0.01` | Watchdog 每 5 分钟用 Polymarket Data API 持仓与本地 `InventoryLedger` 对账；若某市场 Yes 或 No 敞口差 **大于** 此值，则用 API 数据覆盖 DB。例如 0.01 可修正「本地记 5.0、链上 4.3」这类偏差；调大则只修正更大偏差，小偏差不再覆盖。 |
+| `ALCHEMY_RPC_URL` | Polygon RPC（Kill Switch 等） | Alchemy/Infura URL | 当前版本预留，用于链上校验或紧急操作；可为空。 |
+
+### 做市与报价参数
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `BASE_ORDER_SIZE` | 每笔订单名义 size（USDC） | `5.0` | 单层网格下单量；引擎内部会 `max(5.0, BASE_ORDER_SIZE)` 以满足 Polymarket 最小下单 size。 |
+| `GRID_LEVELS` | 每侧网格层数 | `2` | 买/卖各几档限价单；层数越多挂单越多，资金占用与改价频率都会增加。 |
+| `QUOTE_BASE_SPREAD` | 报价相对 Fair Value 的边距 | `0.02` | 买价约在 fair_value - spread/2，卖价约 fair_value + spread/2；越大单笔利润越高、成交概率越低。 |
+| `QUOTE_PRICE_OFFSET_THRESHOLD` | 触发网格刷新的价格移动阈值 | `0.01` | 当中间价相对上次锚定移动超过此值时才重新计算网格并 cancel/post；越大则订单挂得更久、减少频繁改单。 |
+| `QUOTE_BID_ONE_TICK_BELOW_TOUCH` | 首档买价是否允许在 best_bid 下一档 | `true` / `false` | `true` 时首档买价可设在 best_bid 下一 tick，提高成交率仍保留约 1¢ 边距；`false` 则严格挂在 best_bid。 |
+
+### Docker 主机端口（仅 docker-compose 映射用）
+
+| 变量 | 含义 | 示例/默认 | 说明 |
+|------|------|-----------|------|
+| `DB_PORT` | 宿主机映射 Postgres 端口 | `5433` | 仅用于 `docker-compose.yml` 的 `ports`，应用内部只认 `DATABASE_URL`。 |
+| `REDIS_PORT` | 宿主机映射 Redis 端口 | `6380` | 同上，避免与宿主机其它服务占用的 6379 冲突。 |
+
+---
+
+**快速上手**：复制 `.env.example` 为 `.env` 后，至少配置 `PK`、`FUNDER_ADDRESS`、`LIVE_TRADING_ENABLED`、`BASE_ORDER_SIZE`、`GRID_LEVELS`、`MAX_EXPOSURE_PER_MARKET`；若使用 Docker，再根据 `docker-compose.yml` 中的 `environment` 与 `volumes` 确认 `.env` 被挂载进容器。
 
 ## Disclaimer
 
