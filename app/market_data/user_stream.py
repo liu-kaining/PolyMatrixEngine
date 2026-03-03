@@ -198,20 +198,20 @@ class UserStreamGateway:
                 inv = inv_res.scalar_one_or_none()
                 
                 if inv:
-                    # Update exposure
-                    # Buying increases exposure, selling decreases it
+                    # Update exposure and realized PnL (net cash flow: BUY = outflow, SELL = inflow)
                     if side == "BUY":
                         if is_yes:
                             inv.yes_exposure = float(inv.yes_exposure) + filled_size
                         else:
                             inv.no_exposure = float(inv.no_exposure) + filled_size
+                        # Cost of buy: subtract from realized PnL so total = net profit
+                        inv.realized_pnl = float(inv.realized_pnl) - (fill_price * filled_size)
                     elif side == "SELL":
                         if is_yes:
                             inv.yes_exposure = float(inv.yes_exposure) - filled_size
                         else:
                             inv.no_exposure = float(inv.no_exposure) - filled_size
-                            
-                        # Basic PnL calculation (Mock logic: Sell Price * Size)
+                        # Proceeds from sell: add to realized PnL
                         inv.realized_pnl = float(inv.realized_pnl) + (fill_price * filled_size)
                         
                     logger.info(f"Inventory Updated for {market_id}: YES={inv.yes_exposure}, NO={inv.no_exposure}")

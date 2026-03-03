@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -286,6 +287,85 @@ async def get_market_risk(condition_id: str, db: AsyncSession = Depends(get_db))
         "yes_exposure": float(inventory.yes_exposure),
         "no_exposure": float(inventory.no_exposure),
         "realized_pnl": float(inventory.realized_pnl)
+    }
+
+@app.get("/markets/status")
+async def get_markets_status(
+    condition_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lightweight observability endpoint for Dashboard:
+    - Unified fair values (FV_yes / FV_no) from Redis anchor
+    - Per-side engine mode from Redis runtime keys
+    - Fallback derived mode from DB exposures if runtime key is absent
+    """
+    stmt = (
+        select(InventoryLedger, MarketMeta)
+        .outerjoin(MarketMeta, InventoryLedger.market_id == MarketMeta.condition_id)
+    )
+    if condition_id:
+        stmt = stmt.filter(InventoryLedger.market_id == condition_id)
+
+    rows = (await db.execute(stmt)).all()
+
+    base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
+    liquidate_threshold = max(5.0, base_size)
+
+    def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
+        if market_status == "suspended":
+            return "SUSPENDED"
+        if own_exp >= liquidate_threshold:
+            return "LIQUIDATING"
+        if opp_exp >= base_size:
+            return "LOCKED_BY_OPPOSITE"
+        return "QUOTING"
+
+    markets = []
+    for inv, market in rows:
+        cid = inv.market_id
+        market_status = ((market.status if market else None) or "unknown").lower()
+
+        yes_exposure = float(inv.yes_exposure or 0.0)
+        no_exposure = float(inv.no_exposure or 0.0)
+
+        anchor = await redis_client.get_state(f"fv_anchor:{cid}") or {}
+        fv_yes = None
+        fv_no = None
+        if "fv_yes" in anchor:
+            try:
+                fv_yes = max(0.01, min(0.99, float(anchor["fv_yes"])))
+                fv_no = max(0.01, min(0.99, 1.0 - fv_yes))
+            except Exception:
+                fv_yes = None
+                fv_no = None
+
+        yes_runtime = await redis_client.get_state(f"engine_state:{cid}:YES") or {}
+        no_runtime = await redis_client.get_state(f"engine_state:{cid}:NO") or {}
+
+        yes_mode = yes_runtime.get("mode") or derive_mode(yes_exposure, no_exposure, market_status)
+        no_mode = no_runtime.get("mode") or derive_mode(no_exposure, yes_exposure, market_status)
+
+        markets.append(
+            {
+                "condition_id": cid,
+                "market_status": market_status,
+                "fv_yes": fv_yes,
+                "fv_no": fv_no,
+                "fv_sum": (fv_yes + fv_no) if (fv_yes is not None and fv_no is not None) else None,
+                "yes_exposure": yes_exposure,
+                "no_exposure": no_exposure,
+                "yes_mode": yes_mode,
+                "no_mode": no_mode,
+                "yes_runtime": yes_runtime,
+                "no_runtime": no_runtime,
+            }
+        )
+
+    return {
+        "markets": markets,
+        "base_order_size": base_size,
+        "liquidate_threshold": liquidate_threshold,
     }
 
 @app.get("/orders/active")

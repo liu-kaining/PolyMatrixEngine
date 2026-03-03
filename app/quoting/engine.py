@@ -1,7 +1,8 @@
 import asyncio
 import json
 import logging
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.redis import redis_client
 from app.oms.core import oms
@@ -19,50 +20,27 @@ class AlphaPricingModel:
         return 0.50
 
 class AlphaModel:
-    """Calculates baseline probability and spread adjustments based on orderbook imbalance and inventory."""
+    """Unified pricing oracle anchored by YES orderbook."""
     def __init__(self):
         self.base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
-        self.inventory_skew_factor = 0.0005  # Lower/raise price by $0.0005 per $1 of exposure (Example parameter)
 
-    async def calculate_alpha(self, bids: list, asks: list, current_exposure: float) -> Tuple[float, float]:
+    def calculate_yes_anchor(self, bids: list, asks: list) -> Tuple[float, float, float]:
         """
-        Returns (fair_value, dynamic_spread_margin)
-        Uses orderbook imbalance to skew the mid-price and widen/tighten the spread.
-        Uses inventory exposure to skew prices down if long, up if short.
+        Unified pricing anchor from YES orderbook.
+        FV_yes = clamp(mid_yes + OBI_yes * 0.015, 0.01, 0.99)
+        Returns (fv_yes, dynamic_spread, obi_yes)
         """
         best_bid_price = float(bids[0]["price"])
         best_ask_price = float(asks[0]["price"])
-        
         best_bid_size = float(bids[0]["size"])
         best_ask_size = float(asks[0]["size"])
-        
-        # 1. Base Mid-Price
-        mid_price = (best_bid_price + best_ask_price) / 2.0
-        
-        # 2. Orderbook Imbalance (OBI)
-        # Ranges from -1 (all asks) to +1 (all bids)
+
+        mid_yes = (best_bid_price + best_ask_price) / 2.0
         total_size = best_bid_size + best_ask_size
-        obi = (best_bid_size - best_ask_size) / total_size if total_size > 0 else 0.0
-        
-        # 3. Dynamic Skew (OBI + Inventory)
-        # Toxic Flow / OBI: If buyers are aggressive (+OBI), skew fair value up.
-        max_obi_skew = 0.015
-        obi_skew = obi * max_obi_skew
-        
-        # Inventory Skew:
-        # If we hold YES (current_exposure > 0), we want to lower bid/ask to encourage selling and discourage buying.
-        inv_skew = -1.0 * current_exposure * self.inventory_skew_factor
-        
-        skewed_fair_value = mid_price + obi_skew + inv_skew
-        
-        # Clamp skewed fair value to Polymarket ticks [0.01, 0.99]
-        skewed_fair_value = max(0.01, min(0.99, skewed_fair_value))
-        
-        # 4. Dynamic Spread (Widening defense)
-        # Widen spread when highly imbalanced (directional flow defense)
-        dynamic_spread = self.base_spread * (1.0 + abs(obi))
-        
-        return skewed_fair_value, dynamic_spread
+        obi_yes = (best_bid_size - best_ask_size) / total_size if total_size > 0 else 0.0
+        fv_yes = max(0.01, min(0.99, mid_yes + (obi_yes * 0.015)))
+        dynamic_spread = self.base_spread * (1.0 + abs(obi_yes))
+        return fv_yes, dynamic_spread, obi_yes
 
 
 class QuotingEngine:
@@ -79,12 +57,16 @@ class QuotingEngine:
         # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
         # Polymarket requires minimum order size 5, enforce that here.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
+        # Dynamic mode switch threshold: use BASE_ORDER_SIZE-aware cutoff.
+        self.liquidate_threshold = max(5.0, self.base_size)
         
         # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
         self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
         self.last_anchor_mid_price = None   # Base anchor price
         
         self.is_yes_token = None # Resolved dynamically
+        self.yes_token_id = None
+        self.no_token_id = None
         
         self._trade_lock = asyncio.Lock()   # Lock for atomic order updates
         self.active_orders: Dict[str, str] = {}
@@ -126,15 +108,120 @@ class QuotingEngine:
                 logger.critical(f"[{self.token_id[:6]}] QuotingEngine SUSPENDED by Control Signal. Executing TRUE KILL SWITCH.")
                 # True Kill Switch: Must synchronously wait for all orphans to cancel
                 await self.cancel_all_orders()
+                await self._publish_engine_mode("SUSPENDED")
         elif action == "resume":
             async with self._trade_lock:
                 self.suspended = False
                 logger.info(f"[{self.token_id[:6]}] QuotingEngine RESUMED by Control Signal.")
+
+    async def _resolve_market_context(self, session) -> bool:
+        """Resolve YES/NO token mapping once for unified pricing + cross-token lock."""
+        from app.models.db_models import MarketMeta
+        from sqlalchemy.future import select
+
+        if self.is_yes_token is not None and self.yes_token_id and self.no_token_id:
+            return True
+
+        meta_res = await session.execute(select(MarketMeta).filter(MarketMeta.condition_id == self.condition_id))
+        meta = meta_res.scalar_one_or_none()
+        if not meta or not meta.yes_token_id or not meta.no_token_id:
+            return False
+
+        self.yes_token_id = meta.yes_token_id
+        self.no_token_id = meta.no_token_id
+        self.is_yes_token = (self.token_id == self.yes_token_id)
+        return True
+
+    async def _publish_engine_mode(
+        self,
+        mode: str,
+        fair_value: Optional[float] = None,
+        fv_yes: Optional[float] = None,
+        current_exposure: Optional[float] = None,
+        opposite_exposure: Optional[float] = None,
+    ) -> None:
+        """Publish runtime engine mode for Dashboard observability."""
+        if self.is_yes_token is None:
+            return
+        side = "YES" if self.is_yes_token else "NO"
+        payload = {
+            "mode": mode,
+            "side": side,
+            "token_id": self.token_id,
+            "updated_at": time.time(),
+        }
+        if fair_value is not None:
+            payload["fair_value"] = float(fair_value)
+        if fv_yes is not None:
+            payload["fv_yes"] = float(fv_yes)
+            payload["fv_no"] = float(max(0.01, min(0.99, 1.0 - fv_yes)))
+        if current_exposure is not None:
+            payload["own_exposure"] = float(current_exposure)
+        if opposite_exposure is not None:
+            payload["opposite_exposure"] = float(opposite_exposure)
+
+        await redis_client.set_state(f"engine_state:{self.condition_id}:{side}", payload, ex=30)
+
+    async def _get_unified_fair_value(self, bids: list, asks: list) -> Optional[Tuple[float, float, float]]:
+        """
+        Unified Pricing Oracle:
+        - YES engine computes anchor FV_yes and publishes it.
+        - NO engine consumes anchor and derives FV_no = 1 - FV_yes.
+        Returns: (fv_current_token, dynamic_spread, fv_yes)
+        """
+        if self.is_yes_token is None:
+            return None
+
+        anchor_key = f"fv_anchor:{self.condition_id}"
+
+        if self.is_yes_token:
+            fv_yes, dynamic_spread, obi_yes = self.alpha_model.calculate_yes_anchor(bids, asks)
+            await redis_client.set_state(
+                anchor_key,
+                {
+                    "fv_yes": fv_yes,
+                    "dynamic_spread": dynamic_spread,
+                    "obi_yes": obi_yes,
+                    "updated_at": time.time(),
+                },
+                ex=30,
+            )
+        else:
+            anchor = await redis_client.get_state(anchor_key)
+            if anchor and "fv_yes" in anchor:
+                fv_yes = max(0.01, min(0.99, float(anchor["fv_yes"])))
+                dynamic_spread = float(anchor.get("dynamic_spread", self.alpha_model.base_spread))
+            else:
+                # Fallback: derive from latest YES orderbook snapshot if anchor not ready yet.
+                if not self.yes_token_id:
+                    return None
+                yes_snap = await redis_client.get_state(f"ob:{self.yes_token_id}")
+                if not yes_snap:
+                    logger.debug(f"[{self.token_id[:6]}] Unified anchor missing; waiting for YES snapshot.")
+                    return None
+                yes_bids = yes_snap.get("bids", [])
+                yes_asks = yes_snap.get("asks", [])
+                if not yes_bids or not yes_asks:
+                    return None
+                fv_yes, dynamic_spread, obi_yes = self.alpha_model.calculate_yes_anchor(yes_bids, yes_asks)
+                await redis_client.set_state(
+                    anchor_key,
+                    {
+                        "fv_yes": fv_yes,
+                        "dynamic_spread": dynamic_spread,
+                        "obi_yes": obi_yes,
+                        "updated_at": time.time(),
+                    },
+                    ex=30,
+                )
+
+        fv_current = fv_yes if self.is_yes_token else max(0.01, min(0.99, 1.0 - fv_yes))
+        return fv_current, dynamic_spread, fv_yes
                 
     async def on_tick(self, tick_data: dict):
-        """Evaluate orderbook, calculate Fair Value + Inventory Skew, and execute dynamic spread."""
+        """Evaluate orderbook, apply unified FV + inventory state machine, execute dynamic spread."""
         from app.db.session import AsyncSessionLocal
-        from app.models.db_models import InventoryLedger, MarketMeta
+        from app.models.db_models import InventoryLedger
         from sqlalchemy.future import select
 
         bids = tick_data.get("bids", [])
@@ -145,24 +232,30 @@ class QuotingEngine:
             return
             
         async with self._trade_lock:
-            # 1. Fetch current Inventory Exposure for Skew
+            # 1. Resolve token context and fetch BOTH-side exposure for cross-token lock
             current_exposure = 0.0
+            opposite_exposure = 0.0
+            yes_exposure = 0.0
+            no_exposure = 0.0
             async with AsyncSessionLocal() as session:
-                # Resolve token polarity if unknown
-                if self.is_yes_token is None:
-                    meta = await session.execute(select(MarketMeta).filter(MarketMeta.condition_id == self.condition_id))
-                    meta = meta.scalar_one_or_none()
-                    if meta:
-                        self.is_yes_token = (self.token_id == meta.yes_token_id)
+                if not await self._resolve_market_context(session):
+                    logger.warning(f"[{self.token_id[:6]}] Market context unavailable; skip tick.")
+                    return
                 
                 # Fetch live inventory
                 inv = await session.execute(select(InventoryLedger).filter(InventoryLedger.market_id == self.condition_id))
                 inv = inv.scalar_one_or_none()
-                if inv and self.is_yes_token is not None:
-                    current_exposure = float(inv.yes_exposure) if self.is_yes_token else float(inv.no_exposure)
-                    
-            # 2. Calculate Alpha (Fair Value & Dynamic Spread) incorporating OBI and Inventory
-            fair_value, dynamic_spread = await self.alpha_model.calculate_alpha(bids, asks, current_exposure)
+                if inv:
+                    yes_exposure = float(inv.yes_exposure or 0.0)
+                    no_exposure = float(inv.no_exposure or 0.0)
+                    current_exposure = yes_exposure if self.is_yes_token else no_exposure
+                    opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
+
+            # 2. Unified pricing (YES anchor + NO derived from 1-FV_yes)
+            unified = await self._get_unified_fair_value(bids, asks)
+            if unified is None:
+                return
+            fair_value, dynamic_spread, fv_yes = unified
             
             # 3. Debounce / Throttle Mechanism Check
             if self.last_anchor_mid_price is not None:
@@ -185,15 +278,18 @@ class QuotingEngine:
             # Construct grid orders JSON
             orders_payload: List[dict] = []
 
-            # V1.1 Inventory-Aware Asymmetric Quoting
-            # State A: Neutral / light position (current_exposure < 5.0) → hungry maker, focus on BUY
-            # State B: Long (current_exposure >= 5.0) → liquidation mode, only aggressive SELL
-            is_long = current_exposure >= 5.0
+            # V2 State Machine for tiny capital:
+            # - LIQUIDATE_LONG threshold is dynamic: max(5.0, BASE_ORDER_SIZE)
+            # - Cross-token lock: if opposite exposure >= BASE_ORDER_SIZE, suspend BUY on this token.
+            is_long = current_exposure >= self.liquidate_threshold
+            cross_token_locked = opposite_exposure >= self.base_size
+            own_side = "YES" if self.is_yes_token else "NO"
+            opposite_side = "NO" if self.is_yes_token else "YES"
 
             if is_long:
                 # State B: Long inventory → aggressive sell to unwind
                 logger.warning(
-                    f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
+                    f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= {self.liquidate_threshold:.2f}). "
                     "Entering AGGRESSIVE SELL MODE."
                 )
 
@@ -225,39 +321,56 @@ class QuotingEngine:
                 )
 
             else:
-                # State A: neutral / light exposure — 少而精，高概率赚钱。
-                # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
-                # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
-                # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
-                best_bid = float(bids[0]["price"])
-                one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
-                # Clamp to Polymarket bounds so we still place at 0.01 (or 0.99) when fair value is at the floor/ceiling.
-                seen_bid_prices: set = set()
-                for i in range(self.grid_levels):
-                    raw = round(bid_1 - (i * self.tick_size), 2)
-                    bid_price = max(0.01, min(0.99, raw))
-                    if one_tick_below and i == 0 and bid_price < best_bid - 0.01:
-                        # Lift first level to best_bid - 0.01 so we're at most 1 tick below touch (more chance to get filled).
-                        bid_price = round(max(bid_price, best_bid - 0.01), 2)
-                        bid_price = max(0.01, min(0.99, bid_price))
-
-                    # One order per price level; skip if we already have this price (e.g. multiple levels clamped to 0.01).
-                    if bid_price in seen_bid_prices:
-                        continue
-                    seen_bid_prices.add(bid_price)
-                    orders_payload.append(
-                        {
-                            "condition_id": self.condition_id,
-                            "token_id": self.token_id,
-                            "side": OrderSide.BUY,
-                            "price": bid_price,
-                            "size": self.base_size,
-                        }
+                if cross_token_locked:
+                    logger.warning(
+                        f"[{self.token_id[:6]}] CROSS-TOKEN LOCK: opposite {opposite_side} exposure "
+                        f"{opposite_exposure:.2f} >= BASE_ORDER_SIZE({self.base_size:.2f}). "
+                        f"Suspend BUY on {own_side}, keep cash for {opposite_side} liquidation."
                     )
+                else:
+                    # State A: neutral / light exposure — 少而精，高概率赚钱。
+                    # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
+                    # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
+                    # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
+                    best_bid = float(bids[0]["price"])
+                    one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
+                    # Clamp to Polymarket bounds so we still place at 0.01 (or 0.99) when fair value is at the floor/ceiling.
+                    seen_bid_prices: set = set()
+                    for i in range(self.grid_levels):
+                        raw = round(bid_1 - (i * self.tick_size), 2)
+                        bid_price = max(0.01, min(0.99, raw))
+                        if one_tick_below and i == 0 and bid_price < best_bid - 0.01:
+                            # Lift first level to best_bid - 0.01 so we're at most 1 tick below touch (more chance to get filled).
+                            bid_price = round(max(bid_price, best_bid - 0.01), 2)
+                            bid_price = max(0.01, min(0.99, bid_price))
 
-                    # SELL side is intentionally skipped in neutral state to avoid inefficient capital lockup
-                    # when we have very limited test capital and no shorting/minting capacity.
-                    # Once inventory >= 5.0, the engine automatically switches to the aggressive SELL mode above.
+                        # One order per price level; skip if we already have this price (e.g. multiple levels clamped to 0.01).
+                        if bid_price in seen_bid_prices:
+                            continue
+                        seen_bid_prices.add(bid_price)
+                        orders_payload.append(
+                            {
+                                "condition_id": self.condition_id,
+                                "token_id": self.token_id,
+                                "side": OrderSide.BUY,
+                                "price": bid_price,
+                                "size": self.base_size,
+                            }
+                        )
+
+                        # SELL side is intentionally skipped in neutral state to avoid inefficient capital lockup
+                        # when we have very limited test capital and no shorting/minting capacity.
+                        # Once inventory >= LIQUIDATE_THRESHOLD, the engine automatically switches
+                        # to aggressive SELL mode above.
+
+            mode = "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
+            await self._publish_engine_mode(
+                mode=mode,
+                fair_value=fair_value,
+                fv_yes=fv_yes,
+                current_exposure=current_exposure,
+                opposite_exposure=opposite_exposure,
+            )
 
             # 5. Log Execution output
             logger.info(
@@ -268,10 +381,12 @@ class QuotingEngine:
                 f"Ask: {asks[0]['price']} ({asks[0]['size']})"
             )
             logger.info(
-                "Alpha -> Fair Value: "
-                f"{fair_value:.4f} | Dynamic Spread: {dynamic_spread:.4f} | "
-                f"Inventory Skew Exp: {current_exposure:.2f} | Mode: "
-                f"{'LIQUIDATE_LONG' if is_long else 'NEUTRAL_ACCUMULATE'}"
+                "Unified Pricing -> "
+                f"FV_yes: {fv_yes:.4f} | FV_{own_side}: {fair_value:.4f} | "
+                f"Dynamic Spread: {dynamic_spread:.4f} | "
+                f"Own Exp: {current_exposure:.2f} | Opp Exp: {opposite_exposure:.2f} | "
+                f"Mode: "
+                f"{mode}"
             )
             logger.info("Order Instructions Payload:")
             # Enum serialization requires .value if doing standard json.dumps, but we'll format it simply:

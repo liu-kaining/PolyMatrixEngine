@@ -224,6 +224,32 @@ def fetch_active_orders():
         st.error(f"Error fetching active orders: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_engine_status_snapshot(condition_id=None) -> dict:
+    """Best-effort API call for real-time engine observability."""
+    try:
+        params = {"condition_id": condition_id} if condition_id else None
+        res = requests.get(f"{API_URL}/markets/status", params=params, timeout=3)
+        if res.status_code == 200:
+            return res.json()
+        _log.warning("Engine status API failed: %s %s", res.status_code, res.text[:200])
+    except Exception as e:
+        _log.warning("Engine status API exception: %s", e)
+    return {"markets": []}
+
+
+def format_engine_mode(mode: str) -> str:
+    mode = (mode or "").upper()
+    if mode == "LOCKED_BY_OPPOSITE":
+        return "🔴 LOCKED (Opposite Inventory)"
+    if mode == "LIQUIDATING":
+        return "🟡 LIQUIDATING"
+    if mode == "QUOTING":
+        return "🟢 QUOTING"
+    if mode == "SUSPENDED":
+        return "⚫ SUSPENDED"
+    return f"⚪ {mode or 'UNKNOWN'}"
+
 
 def tail_logs(filepath: str, lines: int = 500) -> str:
     """
@@ -694,6 +720,42 @@ if not inv_df.empty:
     )
 else:
     st.info(t("app.no_inventory"))
+
+st.subheader("Real-time Engine Status")
+engine_status = fetch_engine_status_snapshot()
+status_rows = engine_status.get("markets", []) if isinstance(engine_status, dict) else []
+
+if status_rows:
+    for i, row in enumerate(status_rows):
+        cid = row.get("condition_id", "")
+        st.markdown(f"**Market:** `{cid}`")
+
+        fv_yes = row.get("fv_yes")
+        fv_no = row.get("fv_no")
+        fv_sum = row.get("fv_sum")
+
+        c1, c2, c3 = st.columns(3)
+        if fv_yes is None or fv_no is None:
+            c1.metric("FV_yes", "—")
+            c2.metric("FV_no", "—")
+            c3.metric("FV_yes + FV_no", "—")
+        else:
+            c1.metric("FV_yes", f"{float(fv_yes):.4f}")
+            c2.metric("FV_no", f"{float(fv_no):.4f}")
+            c3.metric("FV_yes + FV_no", f"{float(fv_sum):.4f}" if fv_sum is not None else "—")
+
+        s1, s2 = st.columns(2)
+        s1.markdown(f"**YES Engine:** {format_engine_mode(row.get('yes_mode'))}")
+        s2.markdown(f"**NO Engine:** {format_engine_mode(row.get('no_mode'))}")
+
+        st.caption(
+            f"YES exposure={float(row.get('yes_exposure', 0.0)):.4f} | "
+            f"NO exposure={float(row.get('no_exposure', 0.0)):.4f}"
+        )
+        if i < len(status_rows) - 1:
+            st.markdown("")
+else:
+    st.caption("No engine status yet. Start a market and wait for first ticks.")
 
 st.markdown("---")
 

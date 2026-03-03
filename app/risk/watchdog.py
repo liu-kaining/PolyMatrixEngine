@@ -36,19 +36,28 @@ class RiskMonitor:
 
     async def check_exposure(self):
         async with AsyncSessionLocal() as session:
-            # Get all active inventories
-            stmt = select(InventoryLedger)
+            # Load inventory + market status so we don't re-trigger kill switch every second for same market
+            stmt = select(InventoryLedger, MarketMeta).outerjoin(
+                MarketMeta, InventoryLedger.market_id == MarketMeta.condition_id
+            )
             result = await session.execute(stmt)
-            inventories = result.scalars().all()
+            rows = result.all()
 
-            for inv in inventories:
-                if abs(float(inv.yes_exposure)) > self.max_exposure or \
-                   abs(float(inv.no_exposure)) > self.max_exposure:
-                    
-                    logger.critical(f"RISK BREACH: Market {inv.market_id} exceeded limit ({self.max_exposure})!")
-                    logger.critical(f"Exposure YES: {inv.yes_exposure}, NO: {inv.no_exposure}")
-                    
-                    await self.trigger_kill_switch(inv.market_id, session)
+            for inv, market in rows:
+                if abs(float(inv.yes_exposure)) <= self.max_exposure and \
+                   abs(float(inv.no_exposure)) <= self.max_exposure:
+                    continue
+                # Already suspended: only log once per cycle at DEBUG to avoid log spam
+                if market and (market.status or "").lower() == "suspended":
+                    logger.debug(
+                        f"Market {inv.market_id[:12]}... already suspended (YES: {inv.yes_exposure}, NO: {inv.no_exposure}). Skip re-trigger."
+                    )
+                    continue
+
+                logger.critical(f"RISK BREACH: Market {inv.market_id} exceeded limit ({self.max_exposure})!")
+                logger.critical(f"Exposure YES: {inv.yes_exposure}, NO: {inv.no_exposure}")
+
+                await self.trigger_kill_switch(inv.market_id, session)
                     
     async def trigger_kill_switch(self, condition_id: str, session):
         """Emergency procedure: cancel all orders, suspend quoting"""
