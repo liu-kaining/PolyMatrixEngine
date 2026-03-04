@@ -485,6 +485,21 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         # 0.15-0.85 is the minimum 'oscillation room' needed for grid strategy
         if yes_price < 0.15 or yes_price > 0.85:
             continue
+        r_min_s = None
+        r_max_sp = None
+        try:
+            raw_rms = m.get("rewardsMinSize")
+            if raw_rms is not None:
+                r_min_s = float(raw_rms)
+        except (ValueError, TypeError):
+            pass
+        try:
+            raw_rmsp = m.get("rewardsMaxSpread")
+            if raw_rmsp is not None:
+                r_max_sp = float(raw_rmsp) / 100.0
+        except (ValueError, TypeError):
+            pass
+
         screened.append({
             "question": question_text,
             "yes_price": yes_price,
@@ -494,6 +509,8 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             "condition_id": m.get("conditionId"),
             "slug": m.get("slug"),
             "category": display_category,
+            "rewards_min_size": r_min_s,
+            "rewards_max_spread": r_max_sp,
         })
 
     if screened:
@@ -752,6 +769,29 @@ if status_rows:
             f"YES exposure={float(row.get('yes_exposure', 0.0)):.4f} | "
             f"NO exposure={float(row.get('no_exposure', 0.0)):.4f}"
         )
+
+        # Rewards Eligibility
+        r_min_size = row.get("rewards_min_size")
+        r_max_spread = row.get("rewards_max_spread")
+        has_rewards = (r_min_size is not None and float(r_min_size) > 0) or (
+            r_max_spread is not None and float(r_max_spread) > 0
+        )
+        if has_rewards:
+            yes_rt = row.get("yes_runtime") or {}
+            no_rt = row.get("no_runtime") or {}
+            yes_elig = yes_rt.get("rewards_eligible", False)
+            no_elig = no_rt.get("rewards_eligible", False)
+            farming = yes_elig or no_elig
+            status_icon = "🟢 FARMING" if farming else "⚪ INELIGIBLE"
+            min_s = f"{float(r_min_size):.0f}" if r_min_size else "—"
+            max_sp = f"{float(r_max_spread) * 100:.1f}¢" if r_max_spread else "—"
+            st.markdown(
+                f"**Rewards Eligibility:** {status_icon} &nbsp;|&nbsp; "
+                f"Min Size: **{min_s}** &nbsp;|&nbsp; Max Spread: **{max_sp}**"
+            )
+        else:
+            st.caption("Rewards: No liquidity rewards program for this market.")
+
         if i < len(status_rows) - 1:
             st.markdown("")
 else:

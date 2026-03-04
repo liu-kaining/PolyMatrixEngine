@@ -57,8 +57,9 @@ class QuotingEngine:
         # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
         # Polymarket requires minimum order size 5, enforce that here.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-        # Dynamic mode switch threshold: use BASE_ORDER_SIZE-aware cutoff.
-        self.liquidate_threshold = max(5.0, self.base_size)
+        # Partial-fill safety: any fragment > 20% of base_size triggers de-inventory.
+        # This prevents exposure stacking from partial fills (e.g. 4.7 out of 5.0).
+        self.liquidate_threshold = self.base_size * 0.2
         
         # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
         self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
@@ -72,6 +73,11 @@ class QuotingEngine:
         self.active_orders: Dict[str, str] = {}
         
         self.suspended = False # Internal flag for Kill Switch
+
+        # Rewards Farming: loaded once from Redis on first tick
+        self._rewards_loaded = False
+        self.rewards_min_size: float = 0.0
+        self.rewards_max_spread: float = 0.0
 
     async def run(self):
         """Main loop for the quoting engine"""
@@ -139,6 +145,7 @@ class QuotingEngine:
         fv_yes: Optional[float] = None,
         current_exposure: Optional[float] = None,
         opposite_exposure: Optional[float] = None,
+        rewards_eligible: Optional[bool] = None,
     ) -> None:
         """Publish runtime engine mode for Dashboard observability."""
         if self.is_yes_token is None:
@@ -159,8 +166,72 @@ class QuotingEngine:
             payload["own_exposure"] = float(current_exposure)
         if opposite_exposure is not None:
             payload["opposite_exposure"] = float(opposite_exposure)
+        if rewards_eligible is not None:
+            payload["rewards_eligible"] = rewards_eligible
 
         await redis_client.set_state(f"engine_state:{self.condition_id}:{side}", payload, ex=30)
+
+    async def _load_rewards_config(self) -> None:
+        """Load rewards params from Redis once. Safe for markets with no rewards (defaults to 0)."""
+        if self._rewards_loaded:
+            return
+        rewards = await redis_client.get_state(f"rewards:{self.condition_id}")
+        if rewards:
+            try:
+                self.rewards_min_size = float(rewards.get("rewards_min_size") or 0)
+            except (ValueError, TypeError):
+                self.rewards_min_size = 0.0
+            try:
+                self.rewards_max_spread = float(rewards.get("rewards_max_spread") or 0)
+            except (ValueError, TypeError):
+                self.rewards_max_spread = 0.0
+            if self.rewards_min_size > 0 or self.rewards_max_spread > 0:
+                logger.info(
+                    f"[{self.token_id[:6]}] Rewards config loaded: "
+                    f"min_size={self.rewards_min_size}, max_spread={self.rewards_max_spread:.4f}"
+                )
+        self._rewards_loaded = True
+
+    def _compute_effective_size(self, price: float) -> float:
+        """
+        Grid-budget-aware size calculation.
+
+        total_slots = grid_levels * 2  (YES engine + NO engine each post grid_levels orders)
+        budget_per_order = MAX_EXPOSURE_PER_MARKET / total_slots
+
+        If the rewards-target notional exceeds budget_per_order, we fall back to
+        base_size to avoid blowing through the wallet balance across all grid slots.
+        """
+        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        total_slots = max(1, self.grid_levels * 2)
+        budget_per_order = max_exposure / total_slots
+
+        if self.rewards_min_size <= 0:
+            fallback_notional = self.base_size * price
+            if fallback_notional > budget_per_order:
+                safe_size = max(5.0, budget_per_order / price if price > 0 else self.base_size)
+                logger.warning(
+                    f"[{self.token_id[:6]}] 基础单量超预算 "
+                    f"(base={self.base_size}×{price:.2f}=${fallback_notional:.2f} > "
+                    f"budget_per_order=${budget_per_order:.2f}), 缩小至 {safe_size:.1f}"
+                )
+                return round(safe_size, 1)
+            return self.base_size
+
+        target = max(self.base_size, self.rewards_min_size)
+        notional = target * price
+
+        if notional > budget_per_order:
+            logger.warning(
+                f"[{self.token_id[:6]}] 单笔预算不足 "
+                f"(target={target}×{price:.2f}=${notional:.2f} > "
+                f"budget_per_order=${budget_per_order:.2f}, "
+                f"slots={total_slots}), "
+                f"为保证多档网格安全，放弃追求官方奖励，回退至基础单量 ({self.base_size})"
+            )
+            return self.base_size
+
+        return target
 
     async def _get_unified_fair_value(self, bids: list, asks: list) -> Optional[Tuple[float, float, float]]:
         """
@@ -231,6 +302,8 @@ class QuotingEngine:
             logger.debug(f"[{self.token_id[:6]}] Orderbook missing bids or asks. Skipping calculation.")
             return
             
+        await self._load_rewards_config()
+
         async with self._trade_lock:
             # 1. Resolve token context and fetch BOTH-side exposure for cross-token lock
             current_exposure = 0.0
@@ -278,11 +351,11 @@ class QuotingEngine:
             # Construct grid orders JSON
             orders_payload: List[dict] = []
 
-            # V2 State Machine for tiny capital:
-            # - LIQUIDATE_LONG threshold is dynamic: max(5.0, BASE_ORDER_SIZE)
-            # - Cross-token lock: if opposite exposure >= BASE_ORDER_SIZE, suspend BUY on this token.
+            # V3 State Machine: partial-fill aware.
+            # Any fragment > 20% of base_size triggers liquidation / cross-lock,
+            # preventing exposure stacking from partial fills (e.g. 4.7 / 5.0).
             is_long = current_exposure >= self.liquidate_threshold
-            cross_token_locked = opposite_exposure >= self.base_size
+            cross_token_locked = opposite_exposure >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
 
@@ -340,21 +413,21 @@ class QuotingEngine:
                         raw = round(bid_1 - (i * self.tick_size), 2)
                         bid_price = max(0.01, min(0.99, raw))
                         if one_tick_below and i == 0 and bid_price < best_bid - 0.01:
-                            # Lift first level to best_bid - 0.01 so we're at most 1 tick below touch (more chance to get filled).
                             bid_price = round(max(bid_price, best_bid - 0.01), 2)
                             bid_price = max(0.01, min(0.99, bid_price))
 
-                        # One order per price level; skip if we already have this price (e.g. multiple levels clamped to 0.01).
                         if bid_price in seen_bid_prices:
                             continue
                         seen_bid_prices.add(bid_price)
+
+                        effective_size = self._compute_effective_size(bid_price)
                         orders_payload.append(
                             {
                                 "condition_id": self.condition_id,
                                 "token_id": self.token_id,
                                 "side": OrderSide.BUY,
                                 "price": bid_price,
-                                "size": self.base_size,
+                                "size": effective_size,
                             }
                         )
 
@@ -364,12 +437,28 @@ class QuotingEngine:
                         # to aggressive SELL mode above.
 
             mode = "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
+
+            # Rewards eligibility: check size and spread vs official requirements
+            rewards_size_ok = True
+            rewards_spread_ok = True
+            if self.rewards_min_size > 0:
+                actual_sizes = [o["size"] for o in orders_payload] if orders_payload else [self.base_size]
+                rewards_size_ok = all(s >= self.rewards_min_size for s in actual_sizes)
+            if self.rewards_max_spread > 0 and dynamic_spread > self.rewards_max_spread:
+                rewards_spread_ok = False
+                logger.info(
+                    f"[{self.token_id[:6]}] Spread too wide for rewards: "
+                    f"dynamic_spread={dynamic_spread:.4f} > max_spread={self.rewards_max_spread:.4f}. "
+                    f"Current orders will NOT earn liquidity rewards."
+                )
+
             await self._publish_engine_mode(
                 mode=mode,
                 fair_value=fair_value,
                 fv_yes=fv_yes,
                 current_exposure=current_exposure,
                 opposite_exposure=opposite_exposure,
+                rewards_eligible=rewards_size_ok and rewards_spread_ok,
             )
 
             # 5. Log Execution output

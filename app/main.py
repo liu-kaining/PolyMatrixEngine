@@ -111,27 +111,37 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
     result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
     market = result.scalar_one_or_none()
     
-    # Always refresh token IDs from Gamma to ensure we use current CLOB tokens.
-    tokens = await gamma_client.get_market_tokens_by_condition_id(condition_id)
-    if not tokens and (not market or not market.yes_token_id or not market.no_token_id):
+    # Always refresh token IDs + rewards params from Gamma to ensure we use current CLOB tokens.
+    gamma_info = await gamma_client.get_market_info(condition_id)
+    if not gamma_info and (not market or not market.yes_token_id or not market.no_token_id):
         raise HTTPException(status_code=404, detail="Market tokens not found in Polymarket Gamma API")
     
-    if tokens:
-        yes_token_id, no_token_id = tokens
+    if gamma_info:
         if not market:
             market = MarketMeta(
                 condition_id=condition_id,
                 status="active",
-                yes_token_id=yes_token_id,
-                no_token_id=no_token_id,
+                yes_token_id=gamma_info.yes_token_id,
+                no_token_id=gamma_info.no_token_id,
+                rewards_min_size=gamma_info.rewards_min_size,
+                rewards_max_spread=gamma_info.rewards_max_spread,
             )
             new_inventory = InventoryLedger(market_id=condition_id)
             db.add(market)
             db.add(new_inventory)
         else:
-            market.yes_token_id = yes_token_id
-            market.no_token_id = no_token_id
+            market.yes_token_id = gamma_info.yes_token_id
+            market.no_token_id = gamma_info.no_token_id
+            market.rewards_min_size = gamma_info.rewards_min_size
+            market.rewards_max_spread = gamma_info.rewards_max_spread
         await db.commit()
+
+        # Publish rewards config to Redis so QuotingEngine can read it without DB query per tick
+        rewards_payload = {
+            "rewards_min_size": gamma_info.rewards_min_size,
+            "rewards_max_spread": gamma_info.rewards_max_spread,
+        }
+        await redis_client.set_state(f"rewards:{condition_id}", rewards_payload)
         
     # Pre-flight Check: USDC Balance (best-effort, only when LIVE_TRADING_ENABLED=True and SDK exposes it)
     # Minimum for 1 market: 2 sides × 2 grid levels × 5 USDC ≈ 20
@@ -310,14 +320,14 @@ async def get_markets_status(
     rows = (await db.execute(stmt)).all()
 
     base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-    liquidate_threshold = max(5.0, base_size)
+    liquidate_threshold = base_size * 0.2
 
     def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
         if market_status == "suspended":
             return "SUSPENDED"
         if own_exp >= liquidate_threshold:
             return "LIQUIDATING"
-        if opp_exp >= base_size:
+        if opp_exp >= liquidate_threshold:
             return "LOCKED_BY_OPPOSITE"
         return "QUOTING"
 
@@ -346,6 +356,10 @@ async def get_markets_status(
         yes_mode = yes_runtime.get("mode") or derive_mode(yes_exposure, no_exposure, market_status)
         no_mode = no_runtime.get("mode") or derive_mode(no_exposure, yes_exposure, market_status)
 
+        rewards_data = await redis_client.get_state(f"rewards:{cid}") or {}
+        r_min_size = rewards_data.get("rewards_min_size")
+        r_max_spread = rewards_data.get("rewards_max_spread")
+
         markets.append(
             {
                 "condition_id": cid,
@@ -359,6 +373,8 @@ async def get_markets_status(
                 "no_mode": no_mode,
                 "yes_runtime": yes_runtime,
                 "no_runtime": no_runtime,
+                "rewards_min_size": r_min_size,
+                "rewards_max_spread": r_max_spread,
             }
         )
 
