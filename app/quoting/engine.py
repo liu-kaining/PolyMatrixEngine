@@ -436,8 +436,9 @@ class QuotingEngine:
                 aggressive_ask = min(fair_value + 0.01, best_ask_price - 0.01)
                 ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
 
-                # Crosses-the-book guard: SELL price must be >= best_bid + tick
-                min_sell = round(best_bid_price + self.tick_size, 2)
+                # Crosses-the-book guard: SELL price must be >= best_bid + tick,
+                # and never exceed the protocol's 0.99 ceiling.
+                min_sell = min(0.99, round(best_bid_price + self.tick_size, 2))
                 if ask_price < min_sell:
                     logger.warning(
                         f"[{self.token_id[:6]}] 触发价格极值保护: SELL {ask_price} < best_bid+tick {min_sell}, "
@@ -484,8 +485,9 @@ class QuotingEngine:
                             bid_price = round(max(bid_price, best_bid_price - 0.01), 2)
                             bid_price = max(0.01, min(0.99, bid_price))
 
-                        # Crosses-the-book guard: BUY price must be <= best_ask - tick
-                        max_buy = round(best_ask_price - self.tick_size, 2)
+                        # Crosses-the-book guard: BUY price must be <= best_ask - tick,
+                        # and never go below the protocol's 0.01 floor.
+                        max_buy = max(0.01, round(best_ask_price - self.tick_size, 2))
                         if bid_price > max_buy:
                             logger.warning(
                                 f"[{self.token_id[:6]}] 触发价格极值保护: BUY {bid_price} > best_ask-tick {max_buy}, "

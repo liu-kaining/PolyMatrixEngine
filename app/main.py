@@ -11,7 +11,7 @@ from sqlalchemy.future import select
 from sqlalchemy import delete
 
 from app.core.config import settings
-from app.db.session import init_db, get_db
+from app.db.session import init_db, get_db, AsyncSessionLocal
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
 from app.market_data.gateway import md_gateway
@@ -19,7 +19,7 @@ from app.market_data.user_stream import user_stream
 from app.market_data.gamma_client import gamma_client
 from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
-from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide
+from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide, OrderStatus
 from logging.handlers import RotatingFileHandler
 
 # Force application timezone to Beijing (UTC+8) for consistent logging timestamps.
@@ -79,7 +79,26 @@ async def lifespan(app: FastAPI):
 
     # 2.5 In-memory inventory state manager
     await inventory_state.start()
-    
+
+    # 2.6 Sweep historical PENDING ghost orders before starting background services.
+    from app.oms.core import oms
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(OrderJournal).filter(OrderJournal.status == OrderStatus.PENDING)
+        )
+        pending_orders = result.scalars().all()
+        if pending_orders:
+            logger.warning(f"扫地僧启动，准备清理 {len(pending_orders)} 条历史遗留的 PENDING 幽灵订单...")
+        for order in pending_orders:
+            try:
+                await oms.cancel_order(order.order_id)
+            except Exception as e:
+                logger.warning(f"扫地僧在尝试撤销历史 PENDING 订单 {order.order_id} 时出错: {e}")
+            order.status = OrderStatus.FAILED
+            logger.warning(f"扫地僧已清理历史遗留的 PENDING 幽灵订单: {order.order_id}")
+        if pending_orders:
+            await session.commit()
+
     # 3. Background Services
     task_md = asyncio.create_task(md_gateway.connect())
     task_user = asyncio.create_task(user_stream.connect())
