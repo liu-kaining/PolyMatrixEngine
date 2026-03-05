@@ -32,7 +32,10 @@ class InventoryStateManager:
         self._initialized = True
         self._state: Dict[str, Dict[str, float]] = {}
         self._lock = asyncio.Lock()
-        self._persist_queue: asyncio.Queue[Tuple[str, float, float, float, float]] = asyncio.Queue()
+        # Bounded queue to avoid unbounded memory growth under persistent DB failures.
+        self._persist_queue: asyncio.Queue[Tuple[str, float, float, float, float]] = asyncio.Queue(
+            maxsize=1000
+        )
         self._persist_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
@@ -44,6 +47,10 @@ class InventoryStateManager:
     async def stop(self) -> None:
         if not self._persist_task:
             return
+        logger.info("Waiting for inventory persist queue to drain...")
+        # Ensure all queued inventory updates are flushed to DB before shutdown.
+        await self._persist_queue.join()
+
         self._persist_task.cancel()
         try:
             await self._persist_task
