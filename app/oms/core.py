@@ -223,11 +223,16 @@ class OrderManagementSystem:
                 # we consider this a successful cancel.
                 if order_id in canceled_list or (canceled_list and not not_canceled):
                     cancel_success = True
-                # If the API says "already canceled or matched", then from our perspective
-                # the order is no longer active and we should mark it as canceled locally.
+                # If the API says "already canceled", "already matched", or "matched orders
+                # can't be canceled", the order is no longer active — treat as success.
                 elif isinstance(not_canceled, dict) and order_id in not_canceled:
                     reason = str(not_canceled.get(order_id, "")).lower()
-                    if "already canceled" in reason or "already matched" in reason:
+                    if any(kw in reason for kw in (
+                        "already canceled",
+                        "already matched",
+                        "matched orders can't be canceled",
+                        "matched orders",
+                    )):
                         cancel_success = True
                         already_closed = True
                 # Legacy success flag

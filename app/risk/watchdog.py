@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import httpx
 from sqlalchemy.future import select
 
@@ -8,6 +9,7 @@ from app.models.db_models import InventoryLedger, MarketMeta
 from app.core.config import settings
 from app.oms.core import oms
 from app.core.redis import redis_client
+from app.core.inventory_state import inventory_state
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,9 @@ class RiskMonitor:
         self.max_exposure = settings.MAX_EXPOSURE_PER_MARKET
         self.reconciliation_interval = 300 # 5 minutes
         self.exposure_tolerance = settings.EXPOSURE_TOLERANCE
+        self.reconciliation_buffer_seconds = float(
+            getattr(settings, "RECONCILIATION_BUFFER_SECONDS", 8.0)
+        )
 
     async def run(self):
         """Background daemon polling risk metrics and reconciling"""
@@ -157,6 +162,21 @@ class RiskMonitor:
                 diff_no = abs(db_no - actual["no"])
                 
                 if diff_yes > self.exposure_tolerance or diff_no > self.exposure_tolerance:
+                    last_local_fill_ts = await inventory_state.get_last_local_fill_timestamp(cid)
+                    if (
+                        last_local_fill_ts > 0
+                        and (time.time() - last_local_fill_ts) < self.reconciliation_buffer_seconds
+                    ):
+                        logger.info(
+                            "本地刚刚发生真实成交，暂不信任远端 REST API 延迟数据，跳过本次对账"
+                        )
+                        logger.info(
+                            f"Skipped reconcile overwrite for {cid[:8]} "
+                            f"(age={time.time() - last_local_fill_ts:.2f}s < "
+                            f"buffer={self.reconciliation_buffer_seconds:.2f}s)"
+                        )
+                        continue
+
                     logger.error(f"RECONCILIATION MISMATCH for {cid[:8]}!")
                     logger.error(f"DB -> YES: {db_yes:.2f}, NO: {db_no:.2f}")
                     logger.error(f"API -> YES: {actual['yes']:.2f}, NO: {actual['no']:.2f}")
@@ -164,6 +184,13 @@ class RiskMonitor:
                     db_inv.yes_exposure = actual["yes"]
                     db_inv.no_exposure = actual["no"]
                     logger.info(f"Local ledger overwritten with on-chain data for {cid[:8]}")
+
+                    # Keep in-memory state aligned with DB overwrite.
+                    await inventory_state.apply_reconciliation_snapshot(
+                        market_id=cid,
+                        yes_exposure=actual["yes"],
+                        no_exposure=actual["no"],
+                    )
             
             await session.commit()
 

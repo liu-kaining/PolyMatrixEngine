@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 import websockets
-from typing import Set
+from typing import Dict, Set
 
-from app.core.config import settings
+from app.core.redis import redis_client
+from app.core.inventory_state import inventory_state
 from app.oms.core import oms
 from app.db.session import AsyncSessionLocal
-from app.models.db_models import OrderJournal, OrderStatus, InventoryLedger
+from app.models.db_models import OrderJournal, OrderStatus
 from sqlalchemy.future import select
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,7 @@ class UserStreamGateway:
     def __init__(self):
         self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         self.subscribed_markets: Set[str] = set() # Condition IDs
+        self.market_tokens: Dict[str, Dict[str, str]] = {}
         self.ws = None
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
@@ -141,86 +143,96 @@ class UserStreamGateway:
                 if order_id:
                     asyncio.create_task(self.handle_cancellation(order_id))
 
+    async def _resolve_market_tokens(self, session, market_id: str) -> Dict[str, str] | None:
+        cached = self.market_tokens.get(market_id)
+        if cached and cached.get("yes_token_id") and cached.get("no_token_id"):
+            return cached
+
+        from app.models.db_models import MarketMeta
+
+        meta_stmt = select(MarketMeta).filter(MarketMeta.condition_id == market_id)
+        meta_res = await session.execute(meta_stmt)
+        meta = meta_res.scalar_one_or_none()
+        if not meta or not meta.yes_token_id or not meta.no_token_id:
+            return None
+        tokens = {"yes_token_id": meta.yes_token_id, "no_token_id": meta.no_token_id}
+        self.market_tokens[market_id] = tokens
+        return tokens
+
+    async def _publish_order_status_event(self, market_id: str, token_id: str | None, order_id: str, status: str):
+        if not token_id:
+            return
+        await redis_client.publish(
+            f"order_status:{market_id}:{token_id}",
+            {
+                "order_id": order_id,
+                "status": status,
+            },
+        )
+
     async def handle_fill(self, order_id: str, filled_size: float, fill_price: float):
-        """Process an order fill and update inventory atomically"""
+        """
+        Process fill:
+        1) update order journal row (locked)
+        2) update in-memory inventory immediately
+        3) persist inventory via async background queue (fire-and-forget)
+        """
+        market_id = None
+        token_id = None
+        side = None
+        status_for_event = None
+
         async with AsyncSessionLocal() as session:
-            # 1. Get the order with FOR UPDATE lock to prevent race conditions on inventory
-            # We must link back to inventory ledger to update it atomically
             stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id).with_for_update()
             result = await session.execute(stmt)
             order = result.scalar_one_or_none()
-            
+
             if not order:
-                # Could be an order from another session or before tracking
                 return
-                
-            # Track cumulative fills to support partial fills and dust handling
-            # We initialize a "filled_size" counter in payload if not exists
+
             payload = dict(order.payload) if order.payload else {}
             current_filled = float(payload.get("filled_size", 0.0))
             new_total_filled = current_filled + filled_size
-            
             payload["filled_size"] = new_total_filled
             order.payload = payload
-            
+
             original_size = float(order.size)
-            
-            # Determine if fully filled or partially filled
-            if new_total_filled >= original_size - 1e-6: # Dust tolerance
+            if new_total_filled >= original_size - 1e-6:
                 order.status = OrderStatus.FILLED
+                status_for_event = "FILLED"
             else:
-                # Mark as partially filled (using a string or creating a new enum, 
-                # but if enum is strictly FILLED, we might just leave it OPEN but with accumulated fill payload)
-                # To stick to existing enum, we keep it OPEN, but the payload tracks filled size.
                 order.status = OrderStatus.OPEN
-            
-            # 2. Update Inventory Ledger atomically
+
             market_id = order.market_id
-            side = order.side.value # "BUY" or "SELL"
-            
-            # We need to know if this was a YES or NO token.
-            # We stored the token_id in the payload during create_order
-            payload = order.payload or {}
+            side = order.side.value
             token_id = payload.get("token_id")
-            
-            # Fetch MarketMeta to determine token orientation
-            from app.models.db_models import MarketMeta
-            meta_stmt = select(MarketMeta).filter(MarketMeta.condition_id == market_id)
-            meta_res = await session.execute(meta_stmt)
-            meta = meta_res.scalar_one_or_none()
-            
-            if meta:
-                is_yes = (token_id == meta.yes_token_id)
-                
-                # Lock inventory ledger
-                inv_stmt = select(InventoryLedger).filter(InventoryLedger.market_id == market_id).with_for_update()
-                inv_res = await session.execute(inv_stmt)
-                inv = inv_res.scalar_one_or_none()
-                
-                if inv:
-                    # Update exposure and realized PnL (net cash flow: BUY = outflow, SELL = inflow)
-                    if side == "BUY":
-                        if is_yes:
-                            inv.yes_exposure = float(inv.yes_exposure) + filled_size
-                        else:
-                            inv.no_exposure = float(inv.no_exposure) + filled_size
-                        # Cost of buy: subtract from realized PnL so total = net profit
-                        inv.realized_pnl = float(inv.realized_pnl) - (fill_price * filled_size)
-                    elif side == "SELL":
-                        if is_yes:
-                            inv.yes_exposure = float(inv.yes_exposure) - filled_size
-                        else:
-                            inv.no_exposure = float(inv.no_exposure) - filled_size
-                        # Proceeds from sell: add to realized PnL
-                        inv.realized_pnl = float(inv.realized_pnl) + (fill_price * filled_size)
-                        
-                    logger.info(f"Inventory Updated for {market_id}: YES={inv.yes_exposure}, NO={inv.no_exposure}")
-            
+
             await session.commit()
-            logger.info(f"Order {order_id} marked as FILLED. Size: {filled_size} @ {fill_price}")
+
+            # Update memory-first inventory state (DB persistence is queued inside manager).
+            tokens = await self._resolve_market_tokens(session, market_id)
+            if tokens and token_id:
+                is_yes = token_id == tokens["yes_token_id"]
+                updated = await inventory_state.apply_fill(
+                    market_id=market_id,
+                    is_yes=is_yes,
+                    side=side,
+                    filled_size=filled_size,
+                    fill_price=fill_price,
+                )
+                logger.info(
+                    f"Inventory Updated for {market_id}: "
+                    f"YES={updated['yes_exposure']:.4f}, NO={updated['no_exposure']:.4f}"
+                )
+
+        logger.info(f"Order {order_id} fill processed. Size: {filled_size} @ {fill_price}")
+        if status_for_event and market_id and token_id:
+            await self._publish_order_status_event(market_id, token_id, order_id, status_for_event)
 
     async def handle_cancellation(self, order_id: str):
         """Handle order cancellation, including dust/partial fill cleanup."""
+        market_id = None
+        token_id = None
         async with AsyncSessionLocal() as session:
             stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id).with_for_update()
             result = await session.execute(stmt)
@@ -230,6 +242,8 @@ class UserStreamGateway:
                 payload = dict(order.payload) if order.payload else {}
                 filled_size = float(payload.get("filled_size", 0.0))
                 original_size = float(order.size)
+                market_id = order.market_id
+                token_id = payload.get("token_id")
                 
                 # Check for partial fill vs complete cancellation
                 if filled_size > 0:
@@ -241,5 +255,7 @@ class UserStreamGateway:
                 order.payload = payload
                 order.status = OrderStatus.CANCELED
                 await session.commit()
+        if market_id and token_id:
+            await self._publish_order_status_event(market_id, token_id, order_id, "CANCELED")
 
 user_stream = UserStreamGateway()

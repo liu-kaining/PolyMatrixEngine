@@ -13,6 +13,7 @@ from sqlalchemy import delete
 from app.core.config import settings
 from app.db.session import init_db, get_db
 from app.core.redis import redis_client
+from app.core.inventory_state import inventory_state
 from app.market_data.gateway import md_gateway
 from app.market_data.user_stream import user_stream
 from app.market_data.gamma_client import gamma_client
@@ -75,6 +76,9 @@ async def lifespan(app: FastAPI):
     
     # 2. Redis Connection
     await redis_client.connect()
+
+    # 2.5 In-memory inventory state manager
+    await inventory_state.start()
     
     # 3. Background Services
     task_md = asyncio.create_task(md_gateway.connect())
@@ -89,6 +93,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown Events
     logger.info("Shutting down...")
+    await inventory_state.stop()
     await redis_client.disconnect()
     
     for task in background_tasks:
@@ -413,6 +418,7 @@ async def wipe_all_data(db: AsyncSession = Depends(get_db)):
     await db.execute(delete(InventoryLedger))
     await db.execute(delete(MarketMeta))
     await db.commit()
+    await inventory_state.clear()
 
     # 2. Wipe Redis database (orderbooks, ticks, pubsub state cache).
     try:

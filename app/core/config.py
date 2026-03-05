@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # Trading params
     MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
+    RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills
     BASE_ORDER_SIZE: float = 10.0         # Default $ size per order (can be overridden via .env)
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     # Strategy: 少而精 — we only get filled when the market hits our price (below fair value). No chasing fills.

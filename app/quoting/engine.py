@@ -2,11 +2,13 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.redis import redis_client
+from app.core.inventory_state import inventory_state
 from app.oms.core import oms
-from app.models.db_models import OrderSide
+from app.models.db_models import OrderSide, OrderStatus, OrderJournal
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,9 @@ class QuotingEngine:
         self.no_token_id = None
         
         self._trade_lock = asyncio.Lock()   # Lock for atomic order updates
-        self.active_orders: Dict[str, str] = {}
+        self.active_orders: Dict[str, Dict[str, Any]] = {}
+        self.local_yes_exposure: float = 0.0
+        self.local_no_exposure: float = 0.0
         
         self.suspended = False # Internal flag for Kill Switch
 
@@ -81,10 +85,23 @@ class QuotingEngine:
 
     async def run(self):
         """Main loop for the quoting engine"""
+        if not await self._bootstrap_context_and_inventory():
+            logger.error(
+                f"[{self.token_id[:6]}] Failed to bootstrap market context/inventory; engine exiting."
+            )
+            return
+
         pubsub = redis_client.client.pubsub()
-        # Subscribe to market ticks and control signals for this specific market
-        await pubsub.subscribe(f"tick:{self.token_id}", f"control:{self.condition_id}")
-        logger.info(f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. Listening to tick & control.")
+        order_status_channel = f"order_status:{self.condition_id}:{self.token_id}"
+        await pubsub.subscribe(
+            f"tick:{self.token_id}",
+            f"control:{self.condition_id}",
+            order_status_channel,
+        )
+        logger.info(
+            f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. "
+            "Listening to tick/control/order status."
+        )
         
         try:
             async for message in pubsub.listen():
@@ -97,13 +114,67 @@ class QuotingEngine:
                     elif channel == f"tick:{self.token_id}":
                         if not self.suspended:
                             await self.on_tick(data)
+                    elif channel == order_status_channel:
+                        await self.on_order_status_message(data)
         except asyncio.CancelledError:
             logger.info(f"QuotingEngine shutting down for Token {self.token_id}")
         finally:
             # Ensure Redis resources are released
-            await pubsub.unsubscribe(f"tick:{self.token_id}", f"control:{self.condition_id}")
+            await pubsub.unsubscribe(
+                f"tick:{self.token_id}",
+                f"control:{self.condition_id}",
+                order_status_channel,
+            )
             await pubsub.close()
             logger.info(f"Redis PubSub closed for Token {self.token_id}")
+
+    async def _bootstrap_context_and_inventory(self) -> bool:
+        from app.db.session import AsyncSessionLocal
+        from sqlalchemy.future import select
+
+        async with AsyncSessionLocal() as session:
+            ok = await self._resolve_market_context(session)
+            if ok:
+                # Rehydrate active order cache from local journal (helps diff quoting
+                # keep/replace decisions after process restarts).
+                res = await session.execute(
+                    select(OrderJournal).filter(
+                        OrderJournal.market_id == self.condition_id,
+                        OrderJournal.status.in_([OrderStatus.OPEN, OrderStatus.PENDING]),
+                    )
+                )
+                rows = res.scalars().all()
+                for o in rows:
+                    payload = o.payload or {}
+                    if payload.get("token_id") != self.token_id:
+                        continue
+                    self.active_orders[o.order_id] = {
+                        "side": o.side.value,
+                        "price": float(o.price),
+                        "size": float(o.size),
+                    }
+        if not ok:
+            return False
+
+        snap = await inventory_state.ensure_loaded(self.condition_id)
+        self.local_yes_exposure = float(snap.get("yes_exposure", 0.0))
+        self.local_no_exposure = float(snap.get("no_exposure", 0.0))
+        logger.info(
+            f"[{self.token_id[:6]}] Bootstrap complete: inventory YES={self.local_yes_exposure:.4f}, "
+            f"NO={self.local_no_exposure:.4f}, active_orders={len(self.active_orders)}"
+        )
+        return True
+
+    async def on_order_status_message(self, data: dict):
+        order_id = data.get("order_id")
+        status = str(data.get("status", "")).upper()
+        if not order_id:
+            return
+        if status in {"FILLED", "CANCELED", "CLOSED", "FAILED"} and order_id in self.active_orders:
+            del self.active_orders[order_id]
+            logger.info(
+                f"[{self.token_id[:6]}] Active order removed by status event: {order_id[:10]}... ({status})"
+            )
 
     async def on_control_message(self, data: dict):
         """Handle incoming signals from the Watchdog or API"""
@@ -291,10 +362,6 @@ class QuotingEngine:
                 
     async def on_tick(self, tick_data: dict):
         """Evaluate orderbook, apply unified FV + inventory state machine, execute dynamic spread."""
-        from app.db.session import AsyncSessionLocal
-        from app.models.db_models import InventoryLedger
-        from sqlalchemy.future import select
-
         bids = tick_data.get("bids", [])
         asks = tick_data.get("asks", [])
         
@@ -305,24 +372,21 @@ class QuotingEngine:
         await self._load_rewards_config()
 
         async with self._trade_lock:
-            # 1. Resolve token context and fetch BOTH-side exposure for cross-token lock
+            # 1. Memory-only inventory read path (no DB I/O in on_tick).
+            if self.is_yes_token is None:
+                logger.warning(f"[{self.token_id[:6]}] Market context unavailable; skip tick.")
+                return
+
+            snap = await inventory_state.get_snapshot(self.condition_id)
+            yes_exposure = float(snap.get("yes_exposure", 0.0))
+            no_exposure = float(snap.get("no_exposure", 0.0))
+            self.local_yes_exposure = yes_exposure
+            self.local_no_exposure = no_exposure
+
             current_exposure = 0.0
             opposite_exposure = 0.0
-            yes_exposure = 0.0
-            no_exposure = 0.0
-            async with AsyncSessionLocal() as session:
-                if not await self._resolve_market_context(session):
-                    logger.warning(f"[{self.token_id[:6]}] Market context unavailable; skip tick.")
-                    return
-                
-                # Fetch live inventory
-                inv = await session.execute(select(InventoryLedger).filter(InventoryLedger.market_id == self.condition_id))
-                inv = inv.scalar_one_or_none()
-                if inv:
-                    yes_exposure = float(inv.yes_exposure or 0.0)
-                    no_exposure = float(inv.no_exposure or 0.0)
-                    current_exposure = yes_exposure if self.is_yes_token else no_exposure
-                    opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
+            current_exposure = yes_exposure if self.is_yes_token else no_exposure
+            opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
 
             # 2. Unified pricing (YES anchor + NO derived from 1-FV_yes)
             unified = await self._get_unified_fair_value(bids, asks)
@@ -359,6 +423,9 @@ class QuotingEngine:
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
 
+            best_bid_price = float(bids[0]["price"])
+            best_ask_price = float(asks[0]["price"])
+
             if is_long:
                 # State B: Long inventory → aggressive sell to unwind
                 logger.warning(
@@ -366,15 +433,18 @@ class QuotingEngine:
                     "Entering AGGRESSIVE SELL MODE."
                 )
 
-                # No new BUYs in this mode – protect cash.
-                # Aggressive ask: try to be at or inside best ask while keeping at least +0.01 edge over fair value.
-                best_ask = float(asks[0]["price"])
-                aggressive_ask = min(fair_value + 0.01, best_ask - 0.01)
-
-                # Pricing Formula: Ask_Price = min(Fair Value + 0.01, Best_Ask - 0.01), clamped to [0.01, 0.99].
+                aggressive_ask = min(fair_value + 0.01, best_ask_price - 0.01)
                 ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
 
-                # Respect Polymarket minimum size 5 and never oversell inventory.
+                # Crosses-the-book guard: SELL price must be >= best_bid + tick
+                min_sell = round(best_bid_price + self.tick_size, 2)
+                if ask_price < min_sell:
+                    logger.warning(
+                        f"[{self.token_id[:6]}] 触发价格极值保护: SELL {ask_price} < best_bid+tick {min_sell}, "
+                        f"已强制修正价格以避免 crosses the book"
+                    )
+                    ask_price = min_sell
+
                 target_size = max(self.base_size, 5.0)
                 sell_size = min(current_exposure, target_size)
 
@@ -405,16 +475,23 @@ class QuotingEngine:
                     # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
                     # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
                     # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
-                    best_bid = float(bids[0]["price"])
                     one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
-                    # Clamp to Polymarket bounds so we still place at 0.01 (or 0.99) when fair value is at the floor/ceiling.
                     seen_bid_prices: set = set()
                     for i in range(self.grid_levels):
                         raw = round(bid_1 - (i * self.tick_size), 2)
                         bid_price = max(0.01, min(0.99, raw))
-                        if one_tick_below and i == 0 and bid_price < best_bid - 0.01:
-                            bid_price = round(max(bid_price, best_bid - 0.01), 2)
+                        if one_tick_below and i == 0 and bid_price < best_bid_price - 0.01:
+                            bid_price = round(max(bid_price, best_bid_price - 0.01), 2)
                             bid_price = max(0.01, min(0.99, bid_price))
+
+                        # Crosses-the-book guard: BUY price must be <= best_ask - tick
+                        max_buy = round(best_ask_price - self.tick_size, 2)
+                        if bid_price > max_buy:
+                            logger.warning(
+                                f"[{self.token_id[:6]}] 触发价格极值保护: BUY {bid_price} > best_ask-tick {max_buy}, "
+                                f"已强制修正价格以避免 crosses the book"
+                            )
+                            bid_price = max_buy
 
                         if bid_price in seen_bid_prices:
                             continue
@@ -477,8 +554,14 @@ class QuotingEngine:
                 f"Mode: "
                 f"{mode}"
             )
+            # 5b. Local balance pre-check: trim orders if total notional exceeds budget
+            orders_payload = self._apply_balance_precheck(
+                orders_payload,
+                current_exposure=current_exposure,
+                opposite_exposure=opposite_exposure,
+            )
+
             logger.info("Order Instructions Payload:")
-            # Enum serialization requires .value if doing standard json.dumps, but we'll format it simply:
             log_payload = [
                 {
                     "condition_id": o["condition_id"],
@@ -492,10 +575,131 @@ class QuotingEngine:
             logger.info(json.dumps(log_payload, indent=2))
             logger.info("=========================================================================")
             
-            # 6. Strict HFT Update Loop
-            # A true kill switch or strict grid update requires synchronous cancellation of orphans
-            await self.cancel_all_orders()
-            await self.place_orders(orders_payload)
+            # 6. Diff Quoting: keep unchanged orders, cancel stale, create missing
+            await self.sync_orders_diff(orders_payload)
+
+    def _apply_balance_precheck(
+        self,
+        orders_payload: List[dict],
+        current_exposure: float,
+        opposite_exposure: float,
+    ) -> List[dict]:
+        """
+        Estimate total USDC commitment for this batch and trim if it would exceed
+        available budget.  Budget = MAX_EXPOSURE_PER_MARKET minus notional already
+        locked by existing positions on BOTH sides of this market.
+
+        BUY orders lock price*size USDC.  SELL orders only need shares already held
+        (no incremental USDC).
+        """
+        if not orders_payload:
+            return orders_payload
+
+        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        # Conservative: existing exposure on both sides counts against the budget.
+        used_notional = current_exposure + opposite_exposure
+        available = max(0.0, max_exposure - used_notional)
+
+        buy_orders = [o for o in orders_payload if o["side"] == OrderSide.BUY]
+        sell_orders = [o for o in orders_payload if o["side"] == OrderSide.SELL]
+
+        total_buy_notional = sum(o["price"] * o["size"] for o in buy_orders)
+
+        if total_buy_notional <= available:
+            return orders_payload
+
+        logger.warning(
+            f"[{self.token_id[:6]}] 本地资金预检: BUY 总名义=${total_buy_notional:.2f} > "
+            f"可用预算=${available:.2f} (max={max_exposure}, used={used_notional:.2f}). "
+            f"正在自动缩减挂单."
+        )
+
+        if available <= 0:
+            logger.warning(
+                f"[{self.token_id[:6]}] 可用预算已耗尽, 跳过全部 BUY 挂单."
+            )
+            return sell_orders
+
+        # Strategy: keep orders from most aggressive (highest price) first,
+        # shrink size or drop tail levels to stay within budget.
+        buy_orders.sort(key=lambda o: o["price"], reverse=True)
+        remaining = available
+        kept: List[dict] = []
+        for o in buy_orders:
+            notional = o["price"] * o["size"]
+            if notional <= remaining:
+                kept.append(o)
+                remaining -= notional
+            else:
+                # Try to shrink size to fit remaining budget
+                if o["price"] > 0:
+                    max_size = remaining / o["price"]
+                    # Polymarket min order size is 5
+                    if max_size >= 5.0:
+                        shrunk = dict(o)
+                        shrunk["size"] = round(max_size, 1)
+                        kept.append(shrunk)
+                        logger.warning(
+                            f"[{self.token_id[:6]}] 缩减 BUY@{o['price']} size: "
+                            f"{o['size']:.1f} -> {shrunk['size']:.1f}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] 跳过 BUY@{o['price']}: "
+                            f"余额不足最小单量 5"
+                        )
+                break  # no budget left for further levels
+
+        return sell_orders + kept
+
+    @staticmethod
+    def _order_signature(side: str, price: float, size: float) -> Tuple[str, float, float]:
+        return (
+            side,
+            round(float(price), 4),
+            round(float(size), 4),
+        )
+
+    async def sync_orders_diff(self, desired_orders: List[dict]):
+        desired_by_sig: Dict[Tuple[str, float, float], List[dict]] = defaultdict(list)
+        for o in desired_orders:
+            sig = self._order_signature(o["side"].value, o["price"], o["size"])
+            desired_by_sig[sig].append(o)
+
+        # 1) Keep exact matches to preserve time-priority.
+        to_cancel: List[str] = []
+        for order_id, meta in list(self.active_orders.items()):
+            sig = self._order_signature(
+                str(meta.get("side", "")),
+                float(meta.get("price", 0.0)),
+                float(meta.get("size", 0.0)),
+            )
+            bucket = desired_by_sig.get(sig)
+            if bucket:
+                bucket.pop()
+                if not bucket:
+                    desired_by_sig.pop(sig, None)
+            else:
+                to_cancel.append(order_id)
+
+        # 2) Cancel only stale orders.
+        if to_cancel:
+            logger.info(f"[{self.token_id[:6]}] Diff quoting: cancel stale={len(to_cancel)}")
+            tasks = [oms.cancel_order(oid) for oid in to_cancel]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for order_id, success in zip(to_cancel, results):
+                if success is True:
+                    self.active_orders.pop(order_id, None)
+                else:
+                    logger.warning(
+                        f"[{self.token_id[:6]}] Diff cancel failed for {order_id}: {success}"
+                    )
+
+        # 3) Create only missing desired orders.
+        to_create = [o for bucket in desired_by_sig.values() for o in bucket]
+        if to_create:
+            logger.info(f"[{self.token_id[:6]}] Diff quoting: create missing={len(to_create)}")
+            await self.place_orders(to_create)
 
     async def place_orders(self, orders_payload: List[dict]):
         """Executes the placement of multiple orders concurrently through OMS"""
@@ -511,9 +715,13 @@ class QuotingEngine:
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        for res in results:
+        for order_req, res in zip(orders_payload, results):
             if isinstance(res, str):
-                self.active_orders[res] = res
+                self.active_orders[res] = {
+                    "side": order_req["side"].value,
+                    "price": float(order_req["price"]),
+                    "size": float(order_req["size"]),
+                }
 
     async def cancel_all_orders(self):
         """Cancel current active grid and ensure no orphan orders remain."""
@@ -530,7 +738,9 @@ class QuotingEngine:
             if success is True:
                 del self.active_orders[order_id]
             else:
-                logger.error(f"[{self.token_id[:6]}] CRITICAL: Failed to cancel order {order_id}. Reason: {success}")
+                # Downgraded from CRITICAL: OMS already handles matched-order scenarios
+                # at INFO level. Remaining failures are transient network / circuit-breaker.
+                logger.warning(f"[{self.token_id[:6]}] Cancel failed for order {order_id} (reason: {success}). Will retry next tick.")
 
 async def start_quoting_engine(condition_id: str, token_id: str):
     engine = QuotingEngine(condition_id, token_id)
