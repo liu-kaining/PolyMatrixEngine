@@ -593,6 +593,7 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             "category": display_category,
             "rewards_min_size": r_min_s,
             "rewards_max_spread": r_max_sp,
+            "reward_rate_per_day": m.get("rewardsDailyRate"),
             "best_bid": best_bid,
             "best_ask": best_ask,
         })
@@ -925,14 +926,29 @@ with col_load:
 screened_markets = st.session_state.get("screener_markets", [])
 if screened_markets:
     # Filter: 只显示 4 星及以上（默认开启）
-    filter_4star = st.checkbox(
-        t("app.filter_4star"),
-        value=True,
-        key="screener_filter_4star_cb",
-        help=t("app.filter_4star_help"),
-    )
+    col_f1, col_f2 = st.columns([1, 2])
+    with col_f1:
+        filter_4star = st.checkbox(
+            t("app.filter_4star"),
+            value=True,
+            key="screener_filter_4star_cb",
+            help=t("app.filter_4star_help"),
+        )
+    with col_f2:
+        filter_rewards_only = st.checkbox(
+            "仅显示带官方奖励的市场 (Rewards Only)",
+            value=False,
+            key="screener_filter_rewards_cb",
+            help="只显示 Polymarket 官方提供了 Liquidity Rewards 参数的市场（自动适配猎人模式）。",
+        )
 
-    display_markets = [m for m in screened_markets if m.get("stars", 0) >= 4] if filter_4star else screened_markets
+    # Apply filters
+    display_markets = screened_markets
+    if filter_4star:
+        display_markets = [m for m in display_markets if m.get("stars", 0) >= 4]
+    if filter_rewards_only:
+        display_markets = [m for m in display_markets if (m.get("rewards_min_size") or 0) > 0]
+    
     if not display_markets:
         st.info(t("app.no_4star"))
     else:
@@ -950,9 +966,9 @@ if screened_markets:
         current_idx = max(0, min(current_idx, len(display_markets) - 1))
 
         # Table header
-        col_w = [0.4, 0.6, 0.6, 3.5, 0.9, 0.6, 0.6, 0.6, 0.7]
+        col_w = [0.3, 0.5, 0.4, 2.5, 0.7, 0.5, 0.5, 0.5, 0.6, 0.5, 0.5, 0.5]
         hc = st.columns(col_w)
-        for col, label in zip(hc, ["", "Stars", "Score", "Question", "Category", "YES", "Vol 24h", "Liq", t("app.select")]):
+        for col, label in zip(hc, ["", "Stars", "Score", "Question", "Category", "YES", "Vol 24h", "Liq", "💰奖励/天", "📏门槛", "🎯点差", t("app.select")]):
             col.markdown(f"**{label}**" if label else "")
 
         # Rows: click Select to choose that market
@@ -975,7 +991,19 @@ if screened_markets:
                 st.write(f"{m.get('volume24hr', 0):.0f}")
             with cols[7]:
                 st.write(f"{m.get('liquidity', 0):.0f}")
+            
+            # Rewards columns
+            r_rate = m.get("reward_rate_per_day")
+            r_min = m.get("rewards_min_size")
+            r_sp = m.get("rewards_max_spread")
             with cols[8]:
+                st.write(f"{r_rate:.2f}" if r_rate else "—")
+            with cols[9]:
+                st.write(f"{r_min:.0f}" if r_min else "—")
+            with cols[10]:
+                st.write(f"{r_sp * 100:.1f}¢" if r_sp else "—")
+                
+            with cols[11]:
                 if st.button("✓", key=f"screener_sel_{i}", help=t("app.click_to_select")):
                     st.session_state["screener_selected_idx"] = i
                     st.rerun()
