@@ -334,37 +334,111 @@ def resolve_condition_id(market_input: str) -> str | None:
     return None
 
 
-def calculate_opportunity_score(market: dict) -> float:
-    """Multi-factor opportunity score optimized for High-Frequency Grid Trading.
-    Favors absolute volume and extreme turnover (Volume/Liquidity) for maximum fill rate.
+# ---------------------------------------------------------------------------
+# Screener Scoring Logic (Quantitative Market-Making)
+# ---------------------------------------------------------------------------
+# 量化逻辑说明：
+# 1. 硬性过滤：深度<5k、24h量<5k、YES价越界、危险题材 → 直接剔除，不参与打分
+# 2. 换手率得分(40%)：volume_24h/liquidity 越高越好，ratio>=2 拿满，0.5~2 线性，<0.5 得0
+# 3. 价格居中得分(30%)：越接近0.50多空分歧越大，做市空间越好；偏差>0.3得0
+# 4. 绝对流动性得分(30%)：大池子容纳大资金更安全；10万美金满分
+# 5. 点差惩罚(最多-20)：spread>0.05 开始扣分，每多0.01扣5分
+# ---------------------------------------------------------------------------
+
+DANGER_KEYWORDS = [
+    "war", "israel", "gaza", "lebanon", "hamas", "missile", "strike",
+    "nuclear", "assassination", "dead",
+]
+
+
+def _fails_hard_filters(market_data: dict) -> bool:
     """
-    vol = max(1.0, float(market.get("volume24hr") or 0))
-    liq = max(1.0, float(market.get("liquidity") or 0))
-    yp = market.get("yes_price")
-    yp = 0.5 if yp is None else float(yp)
+    Hard filters: any trigger → exclude (return True).
+    - liquidity < 5000
+    - volume_24h < 5000
+    - yes_price < 0.20 or yes_price > 0.80
+    - Title/Question contains danger keywords
+    """
+    liq = float(market_data.get("liquidity") or market_data.get("liquidityNum") or 0)
+    vol = float(market_data.get("volume24hr") or 0)
+    yp = market_data.get("yes_price")
+    if yp is None:
+        return True
+    yp = float(yp)
 
-    # 1. Volume Score: Heavily favor markets with high absolute 24h volume
-    # log10(100k) = 5. Scale it up.
-    vol_score = math.log10(vol) * 12.0
+    if liq < 5000 or vol < 5000:
+        return True
+    if yp < 0.20 or yp > 0.80:
+        return True
 
-    # 2. Turnover Score: (Volume / Liquidity)
-    # High turnover means the market is trading rapidly compared to its order book depth.
-    # This is the "Engine Room" for grid trading fills.
-    # Increase weight for turnover to prioritize active small-cap pools.
-    turnover = (vol / liq) if liq > 0 else 0
-    turnover_score = min(50.0, turnover * 3.0) 
+    title_text = (market_data.get("question") or market_data.get("title") or "").lower()
+    for kw in DANGER_KEYWORDS:
+        if kw in title_text:
+            return True
+    return False
 
-    # 3. Price Skew Penalty: prefer YES near 0.5
-    # Increased penalty to keep grid trading in the 'safe' 0.3-0.7 zone
-    price_penalty = abs(yp - 0.5) * 40.0
 
-    score = vol_score + turnover_score - price_penalty
-    
-    # 4. Floor Risk: extreme skew = resolution imminent or no movement
-    # Re-tightened to 0.15/0.85 to avoid 'one-way trip' resolution markets
-    if yp < 0.15 or yp > 0.85:
-        score -= 80.0
-    return score
+def calculate_market_score(market_data: dict) -> float:
+    """
+    Polymarket 市场打分函数（满分 100 分）— 面向高频做市商的真实交易需求。
+
+    硬性过滤由调用方在传入前完成；本函数假定 market_data 已通过硬性过滤。
+
+    计分维度：
+    1. 换手率得分 (40%)：ratio = volume_24h / liquidity；ratio>=2 拿满 40 分，
+       0.5~2 线性插值，<0.5 得 0 分。
+    2. 价格居中得分 (30%)：distance = |yes_price - 0.50|；
+       30 * (1 - distance/0.30)，偏差>0.3 得 0。
+    3. 绝对流动性得分 (30%)：liquidity/100000 * 30，封顶 30 分。
+    4. 点差惩罚 (最多 -20)：spread = best_ask - best_bid；
+       spread>0.05 时每多 0.01 扣 5 分，最多扣 20 分。
+       best_bid/best_ask 缺失时不做惩罚。
+    """
+    vol = max(1.0, float(market_data.get("volume24hr") or 0))
+    liq = max(1.0, float(market_data.get("liquidity") or market_data.get("liquidityNum") or 0))
+    yp = market_data.get("yes_price")
+    if yp is None:
+        return 0.0
+    yp = float(yp)
+
+    # 1. Turnover Score (40%): volume_24h / liquidity
+    ratio = vol / liq if liq > 0 else 0.0
+    if ratio >= 2.0:
+        turnover_score = 40.0
+    elif ratio >= 0.5:
+        # Linear: 0.5 -> 0, 2.0 -> 40
+        turnover_score = 40.0 * (ratio - 0.5) / (2.0 - 0.5)
+    else:
+        turnover_score = 0.0
+
+    # 2. Price Centrality Score (30%): closer to 0.50 = higher
+    distance = abs(yp - 0.50)
+    if distance >= 0.30:
+        price_score = 0.0
+    else:
+        price_score = 30.0 * (1.0 - (distance / 0.30))
+
+    # 3. Absolute Liquidity Score (30%): liquidity / 100000, capped at 30
+    liq_score = min(30.0, (liq / 100_000.0) * 30.0)
+
+    # 4. Spread Penalty (up to -20): best_ask - best_bid
+    spread_penalty = 0.0
+    best_bid = market_data.get("best_bid") or market_data.get("bestBid")
+    best_ask = market_data.get("best_ask") or market_data.get("bestAsk")
+    if best_bid is not None and best_ask is not None:
+        try:
+            bid = float(best_bid)
+            ask = float(best_ask)
+            spread = ask - bid
+            if spread > 0.05:
+                # 5 points per 0.01 above 0.05, max 20
+                excess = spread - 0.05
+                spread_penalty = min(20.0, (excess / 0.01) * 5.0)
+        except (ValueError, TypeError):
+            pass
+
+    score = turnover_score + price_score + liq_score - spread_penalty
+    return max(0.0, min(100.0, score))
 
 
 def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
@@ -425,6 +499,9 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         category_haystack = " ".join([category_raw, tag_text, slug]).lower()
         if any(kw in category_haystack for kw in sports_blacklist) or any(kw in question_lower for kw in question_blacklist):
             continue
+        # Hard filter: danger topic keywords (war, etc.) in title/question
+        if any(kw in question_lower for kw in DANGER_KEYWORDS):
+            continue
         cat_source = category_raw.strip() or (tags_list[0].strip() if tags_list else "")
         cat_match_text = (category_raw or "") + " " + tag_text
         is_politics_semantic = any(w in question_lower for w in politics_words) or any(w in slug for w in politics_words)
@@ -457,6 +534,9 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             liq = float(m.get("liquidityNum") or 0.0)
         except Exception:
             continue
+        # Hard filter: liquidity < 5000 or volume_24h < 5000 → exclude
+        if liq < 5000 or vol_24h < 5000:
+            continue
         yes_price = None
         prices_raw = m.get("outcomePrices")
         if prices_raw:
@@ -476,15 +556,14 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         # No valid YES price → can't evaluate, skip
         if yes_price is None:
             continue
+        # Hard filter: yes_price outside [0.20, 0.80] → exclude (oscillation zone only)
+        if yes_price < 0.20 or yes_price > 0.80:
+            continue
         if screener_mode != "Ultra":
             if end_dt - now < min_dte or vol_24h <= min_vol or liq <= min_liq:
                 continue
             if not (price_low <= yes_price <= price_high):
                 continue
-        # Even in Ultra mode, reject absolute dead-ends (price < 0.15 or > 0.85)
-        # 0.15-0.85 is the minimum 'oscillation room' needed for grid strategy
-        if yes_price < 0.15 or yes_price > 0.85:
-            continue
         r_min_s = None
         r_max_sp = None
         try:
@@ -500,6 +579,9 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         except (ValueError, TypeError):
             pass
 
+        # best_bid/best_ask for spread penalty (Gamma may expose these; CLOB has full book)
+        best_bid = m.get("bestBid") or m.get("best_bid")
+        best_ask = m.get("bestAsk") or m.get("best_ask")
         screened.append({
             "question": question_text,
             "yes_price": yes_price,
@@ -511,14 +593,16 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             "category": display_category,
             "rewards_min_size": r_min_s,
             "rewards_max_spread": r_max_sp,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
         })
 
     if screened:
         for m in screened:
-            score = calculate_opportunity_score(m)
+            score = calculate_market_score(m)
             m["recommendation_score"] = round(score, 1)
-            # Star bands: 2* ≥15, 3* ≥30, 4* ≥45, 5* ≥60 (so "4+ stars" shows more results)
-            m["stars"] = max(1, min(5, 1 + int(score / 15)))
+            # Star bands: 1* 0-19, 2* 20-39, 3* 40-59, 4* 60-79, 5* 80-100
+            m["stars"] = max(1, min(5, 1 + int(score / 20)))
     screened.sort(key=lambda x: (x.get("recommendation_score", 0), x["volume24hr"]), reverse=True)
 
     # Category diversity cap removed for high-frequency trading focus
