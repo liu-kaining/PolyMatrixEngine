@@ -149,6 +149,7 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
                 no_token_id=gamma_info.no_token_id,
                 rewards_min_size=gamma_info.rewards_min_size,
                 rewards_max_spread=gamma_info.rewards_max_spread,
+                reward_rate_per_day=gamma_info.reward_rate_per_day,
             )
             new_inventory = InventoryLedger(market_id=condition_id)
             db.add(market)
@@ -158,12 +159,14 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
             market.no_token_id = gamma_info.no_token_id
             market.rewards_min_size = gamma_info.rewards_min_size
             market.rewards_max_spread = gamma_info.rewards_max_spread
+            market.reward_rate_per_day = gamma_info.reward_rate_per_day
         await db.commit()
 
         # Publish rewards config to Redis so QuotingEngine can read it without DB query per tick
         rewards_payload = {
             "rewards_min_size": gamma_info.rewards_min_size,
             "rewards_max_spread": gamma_info.rewards_max_spread,
+            "reward_rate_per_day": gamma_info.reward_rate_per_day,
         }
         await redis_client.set_state(f"rewards:{condition_id}", rewards_payload)
         
@@ -383,6 +386,7 @@ async def get_markets_status(
         rewards_data = await redis_client.get_state(f"rewards:{cid}") or {}
         r_min_size = rewards_data.get("rewards_min_size")
         r_max_spread = rewards_data.get("rewards_max_spread")
+        r_rate = rewards_data.get("reward_rate_per_day")
 
         markets.append(
             {
@@ -399,6 +403,7 @@ async def get_markets_status(
                 "no_runtime": no_runtime,
                 "rewards_min_size": r_min_size,
                 "rewards_max_spread": r_max_spread,
+                "reward_rate_per_day": r_rate,
             }
         )
 

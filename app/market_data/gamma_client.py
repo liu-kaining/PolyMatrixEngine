@@ -13,6 +13,7 @@ class GammaMarketInfo:
     no_token_id: str
     rewards_min_size: Optional[float] = None
     rewards_max_spread: Optional[float] = None
+    reward_rate_per_day: Optional[float] = None
 
 
 class GammaAPIClient:
@@ -47,6 +48,7 @@ class GammaAPIClient:
 
                 rewards_min_size: Optional[float] = None
                 rewards_max_spread: Optional[float] = None
+                reward_rate_per_day: Optional[float] = None
                 try:
                     raw_min = market_data.get("rewardsMinSize")
                     if raw_min is not None:
@@ -60,12 +62,19 @@ class GammaAPIClient:
                         rewards_max_spread = float(raw_spread) / 100.0
                 except (ValueError, TypeError):
                     pass
+                try:
+                    raw_rate = market_data.get("rewardsDailyRate")
+                    if raw_rate is not None:
+                        reward_rate_per_day = float(raw_rate)
+                except (ValueError, TypeError):
+                    pass
 
                 return GammaMarketInfo(
                     yes_token_id=tokens[0],
                     no_token_id=tokens[1],
                     rewards_min_size=rewards_min_size,
                     rewards_max_spread=rewards_max_spread,
+                    reward_rate_per_day=reward_rate_per_day,
                 )
 
             except httpx.HTTPStatusError as e:

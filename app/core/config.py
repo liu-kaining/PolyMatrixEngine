@@ -27,13 +27,14 @@ class Settings(BaseSettings):
     ALCHEMY_RPC_URL: str = ""
     
     # Trading params
-    MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch
+    AUTO_TUNE_FOR_REWARDS: bool = True    # 开启全自动赏金猎人模式
+    MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch (风控红线)
+    GLOBAL_MAX_BUDGET: float = 1000.0     # 绝对的资金红线 (风控红线)
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
     RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills
-    BASE_ORDER_SIZE: float = 10.0         # Default $ size per order (can be overridden via .env)
+    BASE_ORDER_SIZE: float = 10.0         # 兜底（Fallback）默认值
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
-    # Strategy: 少而精 — we only get filled when the market hits our price (below fair value). No chasing fills.
-    QUOTE_BASE_SPREAD: float = 0.02       # Edge per fill: BUY at fair_value - spread/2 (wider = more edge, fewer fills)
+    QUOTE_BASE_SPREAD: float = 0.02       # 兜底（Fallback）默认值
     QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.01   # Refresh grid when mid moves this much; larger = orders sit longer, more chance to get filled
     # When True, first bid is at most 1 tick below best_bid (more fills, still ~1¢ edge). When False, strictly at bid_1 only.
     QUOTE_BID_ONE_TICK_BELOW_TOUCH: bool = True

@@ -82,6 +82,7 @@ class QuotingEngine:
         self._rewards_loaded = False
         self.rewards_min_size: float = 0.0
         self.rewards_max_spread: float = 0.0
+        self.reward_rate_per_day: float = 0.0
 
     async def run(self):
         """Main loop for the quoting engine"""
@@ -256,10 +257,15 @@ class QuotingEngine:
                 self.rewards_max_spread = float(rewards.get("rewards_max_spread") or 0)
             except (ValueError, TypeError):
                 self.rewards_max_spread = 0.0
+            try:
+                self.reward_rate_per_day = float(rewards.get("reward_rate_per_day") or 0)
+            except (ValueError, TypeError):
+                self.reward_rate_per_day = 0.0
             if self.rewards_min_size > 0 or self.rewards_max_spread > 0:
                 logger.info(
                     f"[{self.token_id[:6]}] Rewards config loaded: "
-                    f"min_size={self.rewards_min_size}, max_spread={self.rewards_max_spread:.4f}"
+                    f"min_size={self.rewards_min_size}, max_spread={self.rewards_max_spread:.4f}, "
+                    f"daily_rate={self.reward_rate_per_day}"
                 )
         self._rewards_loaded = True
 
@@ -267,16 +273,37 @@ class QuotingEngine:
         """
         Grid-budget-aware size calculation.
 
-        total_slots = grid_levels * 2  (YES engine + NO engine each post grid_levels orders)
-        budget_per_order = MAX_EXPOSURE_PER_MARKET / total_slots
-
-        If the rewards-target notional exceeds budget_per_order, we fall back to
-        base_size to avoid blowing through the wallet balance across all grid slots.
+        If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
+        Fall back to BASE_ORDER_SIZE if it breaches risk limits.
         """
+        auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
         total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
+        # [AUTOTUNE] Logic
+        if auto_tune and self.rewards_min_size > 0:
+            target_size = max(5.0, round(self.rewards_min_size * 1.05, 1))
+            exposure_cost = target_size * self.grid_levels
+            
+            # Risk check 1: Target * GRID_LEVELS > MAX_EXPOSURE_PER_MARKET
+            if exposure_cost > max_exposure:
+                logger.warning(
+                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-size {target_size:.1f} rejected by MAX_EXPOSURE_PER_MARKET ({max_exposure:.1f}). Using Fallback Size: {self.base_size}."
+                )
+                return self.base_size
+            
+            # Risk check 2: Single order notional > budget_per_order
+            # (In Auto-tune mode, if you pass exposure_cost check, you usually pass this, but we keep it safe)
+            if (target_size * price) > budget_per_order:
+                logger.warning(
+                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-size {target_size:.1f} (notional {target_size*price:.2f}) rejected by per-order budget ({budget_per_order:.2f}). Using Fallback Size: {self.base_size}."
+                )
+                return self.base_size
+            
+            return target_size
+
+        # Fallback to standard base logic
         if self.rewards_min_size <= 0:
             fallback_notional = self.base_size * price
             if fallback_notional > budget_per_order:
@@ -289,6 +316,7 @@ class QuotingEngine:
                 return round(safe_size, 1)
             return self.base_size
 
+        # Legacy rewards logic (when auto_tune=False)
         target = max(self.base_size, self.rewards_min_size)
         notional = target * price
 
@@ -407,6 +435,28 @@ class QuotingEngine:
             # Update the baseline anchor mid-price for future comparisons
             self.last_anchor_mid_price = fair_value
             
+            # [AUTOTUNE] Auto-Spread 动态点差决策
+            auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
+            if auto_tune and self.rewards_min_size > 0 and self.rewards_max_spread > 0:
+                logger.info(
+                    f"[{self.token_id[:6]}] [AUTOTUNE] Market has rewards! "
+                    f"MinSize: {self.rewards_min_size}, MaxSpread: {self.rewards_max_spread:.4f}."
+                )
+                target_spread = self.rewards_max_spread * 0.90
+                base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
+                
+                # If target spread is wider than base, take target_spread (safe fishing)
+                applied_spread = dynamic_spread
+                if target_spread > base_spread:
+                    applied_spread = max(dynamic_spread, target_spread)
+                    dynamic_spread = applied_spread
+                
+                target_size_log = max(5.0, round(self.rewards_min_size * 1.05, 1))
+                logger.info(
+                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-adjusting -> "
+                    f"Size: {target_size_log:.1f} | Spread: {applied_spread:.4f}."
+                )
+
             # 4. Calculate optimal grid bounds based on Skewed Fair Value and Dynamic Spread
             anchor_distance = dynamic_spread / 2.0
             bid_1 = round(fair_value - anchor_distance, 2)
@@ -591,6 +641,8 @@ class QuotingEngine:
         available budget.  Budget = MAX_EXPOSURE_PER_MARKET minus notional already
         locked by existing positions on BOTH sides of this market.
 
+        Also strictly capped by GLOBAL_MAX_BUDGET if specified in .env.
+
         BUY orders lock price*size USDC.  SELL orders only need shares already held
         (no incremental USDC).
         """
@@ -598,9 +650,14 @@ class QuotingEngine:
             return orders_payload
 
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", max_exposure))
+        
+        # We take the stricter of MAX_EXPOSURE_PER_MARKET and GLOBAL_MAX_BUDGET
+        budget_limit = min(max_exposure, global_max_budget)
+        
         # Conservative: existing exposure on both sides counts against the budget.
         used_notional = current_exposure + opposite_exposure
-        available = max(0.0, max_exposure - used_notional)
+        available = max(0.0, budget_limit - used_notional)
 
         buy_orders = [o for o in orders_payload if o["side"] == OrderSide.BUY]
         sell_orders = [o for o in orders_payload if o["side"] == OrderSide.SELL]
@@ -612,7 +669,7 @@ class QuotingEngine:
 
         logger.warning(
             f"[{self.token_id[:6]}] 本地资金预检: BUY 总名义=${total_buy_notional:.2f} > "
-            f"可用预算=${available:.2f} (max={max_exposure}, used={used_notional:.2f}). "
+            f"可用预算=${available:.2f} (limit={budget_limit}, used={used_notional:.2f}). "
             f"正在自动缩减挂单."
         )
 

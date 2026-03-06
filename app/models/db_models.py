@@ -27,6 +27,7 @@ class MarketMeta(Base):
     no_token_id = Column(String)
     rewards_min_size = Column(Numeric(20, 4), nullable=True)
     rewards_max_spread = Column(Numeric(10, 4), nullable=True)
+    reward_rate_per_day = Column(Numeric(20, 4), nullable=True)
 
     # Relationships
     orders = relationship("OrderJournal", back_populates="market")
