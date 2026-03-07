@@ -105,6 +105,14 @@ EN = {
     "app.backend_offline": "FastAPI Backend: **OFFLINE** (Is the API container running?)",
     "app.log_tip": "Tip: Use `docker compose logs -f api` to view real-time tick execution and QuotingEngine algorithmic logs.",
     "app.language": "Language",
+    "app.filter_rewards_only": "Rewards Only",
+    "app.filter_rewards_only_help": "Show only markets with Polymarket Liquidity Rewards (min size / max spread).",
+    "app.col_rewards_per_day": "💰 Rewards/day",
+    "app.col_min_size": "📏 Min size",
+    "app.col_spread": "🎯 Spread (¢)",
+    "app.col_competition": "📊 Competition",
+    "app.filter_low_competition": "Low competition only",
+    "app.filter_low_competition_help": "Show only markets with competition score below 60% (easier to earn rewards).",
 }
 
 ZH = {
@@ -212,6 +220,14 @@ ZH = {
     "app.backend_offline": "FastAPI 后端：**离线**（API 容器是否在运行？）",
     "app.log_tip": "提示：使用 `docker compose logs -f api` 查看实时 tick 与报价引擎日志。",
     "app.language": "语言",
+    "app.filter_rewards_only": "仅显示带官方奖励的市场",
+    "app.filter_rewards_only_help": "只显示 Polymarket 官方提供了 Liquidity Rewards 参数的市场（自动适配猎人模式）。",
+    "app.col_rewards_per_day": "💰 奖励/天",
+    "app.col_min_size": "📏 门槛",
+    "app.col_spread": "🎯 点差",
+    "app.col_competition": "📊 竞争度",
+    "app.filter_low_competition": "仅竞争度低",
+    "app.filter_low_competition_help": "只显示竞争度低于 60% 的市场（更容易拿到奖励）。",
 }
 
 TRANSLATIONS = {"en": EN, "zh": ZH}

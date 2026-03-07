@@ -64,6 +64,10 @@ class GammaAPIClient:
                     pass
                 try:
                     raw_rate = market_data.get("rewardsDailyRate")
+                    if raw_rate is None:
+                        cr = market_data.get("clobRewards") or []
+                        if isinstance(cr, list) and len(cr) > 0 and isinstance(cr[0], dict):
+                            raw_rate = cr[0].get("rewardsDailyRate")
                     if raw_rate is not None:
                         reward_rate_per_day = float(raw_rate)
                 except (ValueError, TypeError):
