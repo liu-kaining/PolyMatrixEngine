@@ -100,6 +100,31 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 
 ---
 
+## Alignment with Polymarket market-maker docs
+
+PolyMatrix Engine implements the **official Polymarket market-maker (MM) workflow**. The logic and data sources match the docs below.
+
+| Doc | What it describes | How we align |
+|-----|--------------------|--------------|
+| [Overview](https://docs.polymarket.com/cn/market-makers/overview) | MM = post limit orders, provide liquidity, use WebSocket + Gamma + CLOB | We use **Gamma API** for metadata, **CLOB REST** (py-clob-client) for orders; no DB in tick loop; cross-book guard so we stay maker-only. |
+| [Getting started](https://docs.polymarket.com/cn/market-makers/getting-started) | Top up USDC.e, deploy wallet, approve tokens, derive API creds from wallet | We use **ClobClient** with `create_or_derive_api_creds()` and POLY_PROXY (gasless). Top-up and approvals are done outside the app. |
+| [Liquidity rewards](https://docs.polymarket.com/cn/market-makers/liquidity-rewards) | Orders **within max spread** and **≥ min size** count for daily rewards; params from Markets API | We read **rewardsMinSize** / **rewardsMaxSpread** (and **rewardsDailyRate** from Gamma / `clobRewards`); engine enforces size ≥ min and spread ≤ max (with margin). |
+| [Maker rebates](https://docs.polymarket.com/cn/market-makers/maker-rebates) | In fee-enabled markets (e.g. crypto), taker fees fund daily USDC rebates to makers whose orders get filled | We are makers by design (limit orders only). Rebates are paid by Polymarket; we do not compute them. |
+
+### Liquidity rewards: field mapping
+
+Official docs use **min_incentive_size** and **max_incentive_spread** (from Markets API). We use the same data from Gamma:
+
+| Official / Markets API | Gamma / our code | Notes |
+|------------------------|------------------|--------|
+| min_incentive_size (shares) | `rewardsMinSize` → `rewards_min_size` | Engine uses `max(base_size, rewards_min_size)` and, when `AUTO_TUNE_FOR_REWARDS=True`, targets `rewards_min_size * 1.05` with a safety cap. |
+| max_incentive_spread (cents) | `rewardsMaxSpread` → `rewards_max_spread` (price) | We divide cents by 100. Engine keeps `target_spread ≤ rewards_max_spread * 0.90` and validates before placing. |
+| Daily reward rate | `rewardsDailyRate` or `clobRewards[0].rewardsDailyRate` → `reward_rate_per_day` | Shown in dashboard “Rewards/day”; used for display and tuning. |
+
+We **do not** implement the full reward formula (order scoring, sampling, epoch normalization). We only **qualify** for rewards by posting orders that satisfy the market’s min size and max spread; Polymarket runs the scoring and distribution.
+
+---
+
 ## Code Layout
 
 | Path | Description |
@@ -113,6 +138,18 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 | `app/models/` | OrderJournal, InventoryLedger, MarketMeta. |
 | `app/core/` | Config, Redis, DB session. |
 | `dashboard/` | Streamlit: Gamma screener, start/stop/liquidate, inventory & risk, active orders, engine status, logs. |
+
+---
+
+## Dashboard & screener
+
+The Streamlit dashboard (port **8501**) provides:
+
+- **Market screener** — Load active markets from Gamma (`active=true`, `closed=false`). Filters: binary only, liquidity/volume/price by mode (Conservative / Normal / Aggressive / Ultra). Hard filters: liquidity and volume ≥ 5k, YES price in [0.20, 0.80], no danger keywords.
+- **Scoring** — Each market gets a 0–100 score (turnover 40%, price centrality 30%, absolute liquidity 30%, spread penalty up to -20). Stars 1–5 from score bands; table shows Stars, Score, Rewards/day, Min size, Spread (¢), **Competition** (Gamma `competitive`, lower = easier to earn rewards).
+- **Pool size** — Caption shows “Pool: **X** (from **Y** loaded)”: X = markets passing the screener, Y = raw count from Gamma. Env `GAMMA_MAX_MARKETS` (default 50k) and `GAMMA_PAGE_LIMIT` (default 2k) control fetch size.
+- **Filters** — Optional: 4+ stars only, rewards-only (min size &gt; 0), low competition (&lt; 60%).
+- **Control** — Start / stop / liquidate per market; inventory & PnL; active orders; engine status; log tail.
 
 ---
 
@@ -178,8 +215,19 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `BASE_ORDER_SIZE` | Size per order (min 5) | e.g. `5.0` |
 | `GRID_LEVELS` | Grid levels per side | `2` |
 | `QUOTE_BASE_SPREAD` | Spread around fair value | `0.02` |
+| `AUTO_TUNE_FOR_REWARDS` | When true, size/spread adapt to Gamma rewards min size and max spread (within risk limits) | `True` |
+| `GAMMA_MAX_MARKETS` | Max markets to fetch in dashboard screener (Gamma list) | `50000` |
+| `GAMMA_PAGE_LIMIT` | Per-page limit for Gamma list (dashboard) | `2000` |
 
 Full reference: see `.env.example` and the tables in [README-zh.md](README-zh.md) (环境变量说明).
+
+## References
+
+- [Polymarket Market Makers — Overview](https://docs.polymarket.com/cn/market-makers/overview)
+- [Polymarket Market Makers — Getting started](https://docs.polymarket.com/cn/market-makers/getting-started)
+- [Polymarket — Liquidity rewards](https://docs.polymarket.com/cn/market-makers/liquidity-rewards)
+- [Polymarket — Maker rebates](https://docs.polymarket.com/cn/market-makers/maker-rebates)
+- [Polymarket Rewards (product)](https://polymarket.com/zh/rewards)
 
 ## Disclaimer
 
