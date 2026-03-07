@@ -72,9 +72,9 @@ LOG_FILE_PATH = os.getenv(
     ),
 )
 
-# Gamma API fetch: concurrency & cap
+# Gamma API fetch: concurrency & cap (larger pages = fewer rounds to fill pool)
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-GAMMA_PAGE_LIMIT = 1000
+GAMMA_PAGE_LIMIT = int(os.getenv("GAMMA_PAGE_LIMIT", "2000"))  # per-page; 2000 → 10k/round with sem 5
 MAX_MARKETS = int(os.getenv("GAMMA_MAX_MARKETS", "50000"))
 GAMMA_SEMAPHORE = 5
 
@@ -935,6 +935,7 @@ with col_load:
                 st.error(t("app.no_markets_loaded"))
             else:
                 st.session_state["screener_markets"] = screened
+                st.session_state["screener_raw_count"] = len(raw_markets)
                 st.session_state["screener_load_mode"] = screener_mode
         except Exception as e:
             st.error(t("app.gamma_error").format(e=e))
@@ -979,11 +980,13 @@ if screened_markets:
         st.info(t("app.no_4star"))
     else:
         filter_label = t("app.filter_label_4star") if filter_4star else t("app.filter_label_all")
+        raw_count = st.session_state.get("screener_raw_count")
         st.caption(
             t("app.caption_display").format(
                 n=len(display_markets),
                 filter_label=filter_label,
                 total=len(screened_markets),
+                raw_count=raw_count if raw_count is not None else "?",
             )
         )
 
@@ -1088,7 +1091,8 @@ if screened_markets:
                     st.session_state["pending_screener_start_cid"] = m_sel["condition_id"]
                     st.session_state["pending_screener_question"] = m_sel["question"]
         with col_info:
-            st.write(t("app.displaying_markets").format(n=len(display_markets), total=len(screened_markets)))
+            raw_count = st.session_state.get("screener_raw_count")
+            st.write(t("app.displaying_markets").format(n=len(display_markets), total=len(screened_markets), raw_count=raw_count if raw_count is not None else "?"))
 
         # Compact confirmation panel for screener-based starts
         pending_screener_cid = st.session_state.get("pending_screener_start_cid")
