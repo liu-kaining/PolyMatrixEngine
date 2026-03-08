@@ -106,10 +106,18 @@ class QuotingEngine:
         
         try:
             async for message in pubsub.listen():
-                if message['type'] == 'message':
-                    channel = message['channel']
-                    data = json.loads(message['data'])
-                    
+                if message.get("type") != "message":
+                    continue
+                try:
+                    channel = message.get("channel", "")
+                    raw_data = message.get("data")
+                    if raw_data is None:
+                        continue
+                    data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+                except (TypeError, ValueError, KeyError) as e:
+                    logger.warning(f"[{self.token_id[:6]}] PubSub message parse error: {e}. Skip.")
+                    continue
+                try:
                     if channel == f"control:{self.condition_id}":
                         await self.on_control_message(data)
                     elif channel == f"tick:{self.token_id}":
@@ -117,6 +125,13 @@ class QuotingEngine:
                             await self.on_tick(data)
                     elif channel == order_status_channel:
                         await self.on_order_status_message(data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception(
+                        f"[{self.token_id[:6]}] Error processing channel {channel}: {e}. "
+                        "Engine continues to avoid permanent exit."
+                    )
         except asyncio.CancelledError:
             logger.info(f"QuotingEngine shutting down for Token {self.token_id}")
         finally:
@@ -655,7 +670,7 @@ class QuotingEngine:
         # We take the stricter of MAX_EXPOSURE_PER_MARKET and GLOBAL_MAX_BUDGET
         budget_limit = min(max_exposure, global_max_budget)
         
-        # Conservative: existing exposure on both sides counts against the budget.
+        # Cautious: existing exposure on both sides counts against the budget.
         used_notional = current_exposure + opposite_exposure
         available = max(0.0, budget_limit - used_notional)
 

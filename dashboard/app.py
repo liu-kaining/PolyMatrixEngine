@@ -97,9 +97,6 @@ if "screener_load_page" not in st.session_state:
     st.session_state["screener_load_page"] = 0
 if "screener_raw_markets" not in st.session_state:
     st.session_state["screener_raw_markets"] = []
-if "screener_load_mode" not in st.session_state:
-    st.session_state["screener_load_mode"] = "Normal"
-
 @st.cache_resource
 def get_engine():
     """Create a synchronous SQLAlchemy engine for Pandas to read from PostgreSQL"""
@@ -335,133 +332,59 @@ def resolve_condition_id(market_input: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Screener Scoring Logic (Quantitative Market-Making)
+# Screener Scoring Logic V3.0 — LP Farming (赏金猎人)
 # ---------------------------------------------------------------------------
-# 量化逻辑说明：
-# 1. 硬性过滤：深度<5k、24h量<5k、YES价越界、危险题材 → 直接剔除，不参与打分
-# 2. 换手率得分(40%)：volume_24h/liquidity 越高越好，ratio>=2 拿满，0.5~2 线性，<0.5 得0
-# 3. 价格居中得分(30%)：越接近0.50多空分歧越大，做市空间越好；偏差>0.3得0
-# 4. 绝对流动性得分(30%)：大池子容纳大资金更安全；10万美金满分
-# 5. 点差惩罚(最多-20)：spread>0.05 开始扣分，每多0.01扣5分
+# 策略从 HFT 转向 LP Farming：寻找官方奖励高、竞争小、价格偏斜大（安全）、门槛适合散户的市场。
+#
+# 硬性过滤：rewards_min_size>0 且 <=250，liquidity>=1000；保留体育/博彩黑名单，放开地缘政治类。
+# 打分公式（100 分）：
+#   A. 资金回报率 (50 分)：daily_yield = reward_rate_per_day/liquidity，0.0005 为极优基准
+#   B. 安全偏斜度 (30 分)：distance = |yes_price-0.50|，越偏越高分
+#   C. 盘口静默度 (20 分)：turnover = volume_24h/liquidity，越低越高分，>=1 得 0
 # ---------------------------------------------------------------------------
-
-DANGER_KEYWORDS = [
-    "war", "israel", "gaza", "lebanon", "hamas", "missile", "strike",
-    "nuclear", "assassination", "dead",
-]
-
-
-def _fails_hard_filters(market_data: dict) -> bool:
-    """
-    Hard filters: any trigger → exclude (return True).
-    - liquidity < 5000
-    - volume_24h < 5000
-    - yes_price < 0.20 or yes_price > 0.80
-    - Title/Question contains danger keywords
-    """
-    liq = float(market_data.get("liquidity") or market_data.get("liquidityNum") or 0)
-    vol = float(market_data.get("volume24hr") or 0)
-    yp = market_data.get("yes_price")
-    if yp is None:
-        return True
-    yp = float(yp)
-
-    if liq < 5000 or vol < 5000:
-        return True
-    if yp < 0.20 or yp > 0.80:
-        return True
-
-    title_text = (market_data.get("question") or market_data.get("title") or "").lower()
-    for kw in DANGER_KEYWORDS:
-        if kw in title_text:
-            return True
-    return False
 
 
 def calculate_market_score(market_data: dict) -> float:
     """
-    Polymarket 市场打分函数（满分 100 分）— 面向高频做市商的真实交易需求。
+    Farming Score V3.0（满分 100 分）— 赏金猎人模式。
 
-    硬性过滤由调用方在传入前完成；本函数假定 market_data 已通过硬性过滤。
+    假定 market_data 已通过硬性过滤（rewards_min_size>0, <=250, liquidity>=1000）。
 
-    计分维度：
-    1. 换手率得分 (40%)：ratio = volume_24h / liquidity；ratio>=2 拿满 40 分，
-       0.5~2 线性插值，<0.5 得 0 分。
-    2. 价格居中得分 (30%)：distance = |yes_price - 0.50|；
-       30 * (1 - distance/0.30)，偏差>0.3 得 0。
-    3. 绝对流动性得分 (30%)：liquidity/100000 * 30，封顶 30 分。
-    4. 点差惩罚 (最多 -20)：spread = best_ask - best_bid；
-       spread>0.05 时每多 0.01 扣 5 分，最多扣 20 分。
-       best_bid/best_ask 缺失时不做惩罚。
+    维度 A - 资金回报率 (50 分)：daily_yield = reward_rate_per_day / liquidity
+        基准 0.0005（日化 0.05%，年化约 18%）为极优；yield_score = min(50, (daily_yield/0.0005)*50)
+    维度 B - 安全偏斜度 (30 分)：distance = |yes_price - 0.50|
+        safety_score = (distance / 0.50) * 30；越偏 0.5 悬念越小越安全
+    维度 C - 盘口静默度 (20 分)：turnover = volume_24h / liquidity
+        turnover>=1 得 0；quietness_score = max(0, 20 * (1 - turnover))
     """
-    vol = max(1.0, float(market_data.get("volume24hr") or 0))
     liq = max(1.0, float(market_data.get("liquidity") or market_data.get("liquidityNum") or 0))
+    vol = max(0.0, float(market_data.get("volume24hr") or 0))
     yp = market_data.get("yes_price")
     if yp is None:
         return 0.0
     yp = float(yp)
+    r_rate = float(market_data.get("reward_rate_per_day") or 0)
 
-    # 1. Turnover Score (40%): volume_24h / liquidity
-    ratio = vol / liq if liq > 0 else 0.0
-    if ratio >= 2.0:
-        turnover_score = 40.0
-    elif ratio >= 0.5:
-        # Linear: 0.5 -> 0, 2.0 -> 40
-        turnover_score = 40.0 * (ratio - 0.5) / (2.0 - 0.5)
-    else:
-        turnover_score = 0.0
+    # A. Yield Score (50): daily_yield = reward_rate_per_day / liquidity
+    #    Gamma reward_rate_per_day 通常为百分比（如 1=1%），需 /100 得小数；此处按原始值，基准 0.0005
+    daily_yield = r_rate / max(liq, 1.0)
+    YIELD_BENCHMARK = 0.0005
+    yield_score = min(50.0, (daily_yield / YIELD_BENCHMARK) * 50.0) if YIELD_BENCHMARK > 0 else 0.0
 
-    # 2. Price Centrality Score (30%): closer to 0.50 = higher
+    # B. Safety Score (30): distance from 0.50, max distance 0.50
     distance = abs(yp - 0.50)
-    if distance >= 0.30:
-        price_score = 0.0
-    else:
-        price_score = 30.0 * (1.0 - (distance / 0.30))
+    safety_score = (distance / 0.50) * 30.0
 
-    # 3. Absolute Liquidity Score (30%): liquidity / 100000, capped at 30
-    liq_score = min(30.0, (liq / 100_000.0) * 30.0)
+    # C. Quietness Score (20): turnover = vol/liquidity; >=1 → 0, else 20*(1-turnover)
+    turnover = vol / liq if liq > 0 else 0.0
+    quietness_score = max(0.0, 20.0 * (1.0 - turnover))
 
-    # 4. Spread Penalty (up to -20): best_ask - best_bid
-    spread_penalty = 0.0
-    best_bid = market_data.get("best_bid") or market_data.get("bestBid")
-    best_ask = market_data.get("best_ask") or market_data.get("bestAsk")
-    if best_bid is not None and best_ask is not None:
-        try:
-            bid = float(best_bid)
-            ask = float(best_ask)
-            spread = ask - bid
-            if spread > 0.05:
-                # 5 points per 0.01 above 0.05, max 20
-                excess = spread - 0.05
-                spread_penalty = min(20.0, (excess / 0.01) * 5.0)
-        except (ValueError, TypeError):
-            pass
-
-    score = turnover_score + price_score + liq_score - spread_penalty
-    return max(0.0, min(100.0, score))
+    total_score = yield_score + safety_score + quietness_score
+    return max(0.0, min(100.0, total_score))
 
 
-def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
-    """Filter raw Gamma markets (binary, blacklist, DTE/vol/liq) and compute opportunity score. Returns list of screened dicts."""
-    now = datetime.now(timezone.utc)
-    # Adjusted thresholds to favor high-frequency turnover
-    if screener_mode == "Conservative":
-        min_dte = timedelta(days=3)
-        min_vol, min_liq = 10_000.0, 2_000.0
-        price_low, price_high = 0.20, 0.80
-    elif screener_mode == "Normal":
-        min_dte = timedelta(days=1)
-        min_vol, min_liq = 2_000.0, 400.0
-        price_low, price_high = 0.15, 0.85
-    elif screener_mode == "Aggressive":
-        min_dte = timedelta(hours=6)
-        min_vol, min_liq = 500.0, 50.0
-        price_low, price_high = 0.05, 0.95
-    else:
-        min_dte = timedelta(hours=1)  # Ultra: basically everything active
-        min_vol, min_liq = 0.0, 0.0
-        price_low, price_high = 0.0, 1.0
-
+def _filter_and_score_screener(raw_markets: list) -> list:
+    """Filter raw Gamma markets (binary, blacklist, V3.0 farming hard filters) and compute Farming Score. Returns list of screened dicts."""
     sports_blacklist = {
         "sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "tennis",
         "hockey", "baseball", "basketball", "premier-league", "premier league",
@@ -499,9 +422,7 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         category_haystack = " ".join([category_raw, tag_text, slug]).lower()
         if any(kw in category_haystack for kw in sports_blacklist) or any(kw in question_lower for kw in question_blacklist):
             continue
-        # Hard filter: danger topic keywords (war, etc.) in title/question
-        if any(kw in question_lower for kw in DANGER_KEYWORDS):
-            continue
+        # V3.0: 放开地缘政治类（iran, election 等），不再过滤
         cat_source = category_raw.strip() or (tags_list[0].strip() if tags_list else "")
         cat_match_text = (category_raw or "") + " " + tag_text
         is_politics_semantic = any(w in question_lower for w in politics_words) or any(w in slug for w in politics_words)
@@ -534,8 +455,37 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             liq = float(m.get("liquidityNum") or 0.0)
         except Exception:
             continue
-        # Hard filter: liquidity < 5000 or volume_24h < 5000 → exclude
-        if liq < 5000 or vol_24h < 5000:
+        # Parse rewards params first (needed for V3.0 hard filters)
+        r_min_s = None
+        r_max_sp = None
+        r_rate_val = None
+        try:
+            raw_rms = m.get("rewardsMinSize")
+            if raw_rms is not None:
+                r_min_s = float(raw_rms)
+        except (ValueError, TypeError):
+            pass
+        try:
+            raw_rmsp = m.get("rewardsMaxSpread")
+            if raw_rmsp is not None:
+                r_max_sp = float(raw_rmsp) / 100.0
+        except (ValueError, TypeError):
+            pass
+        r_rate_raw = m.get("rewardsDailyRate")
+        if r_rate_raw is None:
+            cr = m.get("clobRewards") or []
+            if isinstance(cr, list) and len(cr) > 0 and isinstance(cr[0], dict):
+                r_rate_raw = cr[0].get("rewardsDailyRate")
+        try:
+            r_rate_val = float(r_rate_raw) if r_rate_raw is not None else None
+        except (ValueError, TypeError):
+            r_rate_val = None
+        # V3.0 Hard filters: rewards_min_size>0, <=250; liquidity>=1000
+        if r_min_s is None or r_min_s <= 0:
+            continue
+        if r_min_s > 250:
+            continue
+        if liq < 1000:
             continue
         yes_price = None
         prices_raw = m.get("outcomePrices")
@@ -556,41 +506,7 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
         # No valid YES price → can't evaluate, skip
         if yes_price is None:
             continue
-        # Hard filter: yes_price outside [0.20, 0.80] → exclude (oscillation zone only)
-        if yes_price < 0.20 or yes_price > 0.80:
-            continue
-        if screener_mode != "Ultra":
-            if end_dt - now < min_dte or vol_24h <= min_vol or liq <= min_liq:
-                continue
-            if not (price_low <= yes_price <= price_high):
-                continue
-        r_min_s = None
-        r_max_sp = None
-        try:
-            raw_rms = m.get("rewardsMinSize")
-            if raw_rms is not None:
-                r_min_s = float(raw_rms)
-        except (ValueError, TypeError):
-            pass
-        try:
-            raw_rmsp = m.get("rewardsMaxSpread")
-            if raw_rmsp is not None:
-                r_max_sp = float(raw_rmsp) / 100.0
-        except (ValueError, TypeError):
-            pass
-
-        # Reward rate: Gamma may put it at top-level "rewardsDailyRate" or inside "clobRewards"[0]
-        r_rate_raw = m.get("rewardsDailyRate")
-        if r_rate_raw is None:
-            cr = m.get("clobRewards") or []
-            if isinstance(cr, list) and len(cr) > 0 and isinstance(cr[0], dict):
-                r_rate_raw = cr[0].get("rewardsDailyRate")
-        try:
-            r_rate_val = float(r_rate_raw) if r_rate_raw is not None else None
-        except (ValueError, TypeError):
-            r_rate_val = None
-
-        # best_bid/best_ask for spread penalty (Gamma may expose these; CLOB has full book)
+        # best_bid/best_ask (kept for potential future use; not in V3.0 score)
         best_bid = m.get("bestBid") or m.get("best_bid")
         best_ask = m.get("bestAsk") or m.get("best_ask")
         # Polymarket "竞争度" (competition): 0–1, lower = less competition = better for reward farming
@@ -621,10 +537,8 @@ def _filter_and_score_screener(raw_markets: list, screener_mode: str) -> list:
             m["recommendation_score"] = round(score, 1)
             # Star bands: 1* 0-19, 2* 20-39, 3* 40-59, 4* 60-79, 5* 80-100
             m["stars"] = max(1, min(5, 1 + int(score / 20)))
-    screened.sort(key=lambda x: (x.get("recommendation_score", 0), x["volume24hr"]), reverse=True)
-
-    # Category diversity cap removed for high-frequency trading focus
-    # We want the absolute most active markets regardless of category
+    # V3.0: 按 Farming Score 降序排列（不再按交易量）
+    screened.sort(key=lambda x: x.get("recommendation_score", 0), reverse=True)
     return screened
 
 
@@ -913,15 +827,6 @@ with st.expander(f"📌 {t('app.screener_expander')}", expanded=False):
         f"{t('app.screener_data_source')}"
     )
 
-mode_col, _ = st.columns([1, 3])
-with mode_col:
-    screener_mode = st.selectbox(
-        t("app.screener_mode"),
-        options=["Conservative", "Normal", "Aggressive", "Ultra"],
-        index=1,  # Default: Normal (min_dte=3d, safer than Ultra)
-        help=t("app.screener_mode_help"),
-    )
-
 st.caption(t("app.loading_markets_hint"))
 
 col_load, _ = st.columns([1, 3])
@@ -930,13 +835,12 @@ with col_load:
         try:
             raw_markets = fetch_gamma_markets_cached()
             with st.spinner(t("app.loading_filtering")):
-                screened = _filter_and_score_screener(raw_markets, screener_mode)
+                screened = _filter_and_score_screener(raw_markets)
             if not screened:
                 st.error(t("app.no_markets_loaded"))
             else:
                 st.session_state["screener_markets"] = screened
                 st.session_state["screener_raw_count"] = len(raw_markets)
-                st.session_state["screener_load_mode"] = screener_mode
         except Exception as e:
             st.error(t("app.gamma_error").format(e=e))
         st.rerun()
@@ -1003,13 +907,19 @@ if screened_markets:
         # Rows: click Select to choose that market
         for i, m in enumerate(display_markets):
             cols = st.columns(col_w)
-            stars = "★" * m.get("stars", 0) + "☆" * (5 - m.get("stars", 0))
+            # Stars = 1 + int(score/20); derive from score if missing so display matches score
+            score_val = m.get("recommendation_score", 0) or 0
+            stars_val = m.get("stars")
+            if stars_val is None or (score_val >= 80 and (stars_val or 0) < 4):
+                stars_val = max(1, min(5, 1 + int(float(score_val) / 20)))
+            stars_val = max(1, min(5, int(stars_val or 0)))
+            stars = "★" * stars_val + "☆" * (5 - stars_val)
             with cols[0]:
                 st.write("▶" if i == current_idx else "")
             with cols[1]:
                 st.write(stars)
             with cols[2]:
-                st.write(f"{m.get('recommendation_score', 0):.1f}")
+                st.write(f"{score_val:.1f}")
             with cols[3]:
                 st.write(m["question"])
             with cols[4]:

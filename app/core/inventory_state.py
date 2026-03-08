@@ -149,15 +149,22 @@ class InventoryStateManager:
             updated = dict(snap)
 
         # Fire-and-forget style persistence via async queue.
-        self._persist_queue.put_nowait(
-            (
-                market_id,
-                updated["yes_exposure"],
-                updated["no_exposure"],
-                updated["realized_pnl"],
-                updated["updated_at"],
+        # If queue is full, do not raise (would crash handle_fill task); log and skip this persist.
+        try:
+            self._persist_queue.put_nowait(
+                (
+                    market_id,
+                    updated["yes_exposure"],
+                    updated["no_exposure"],
+                    updated["realized_pnl"],
+                    updated["updated_at"],
+                )
             )
-        )
+        except asyncio.QueueFull:
+            logger.error(
+                f"InventoryStateManager persist queue FULL (maxsize={self._persist_queue.maxsize}). "
+                f"Dropping persist for {market_id[:12]}...; in-memory state is updated but DB may drift."
+            )
         return updated
 
     async def apply_reconciliation_snapshot(

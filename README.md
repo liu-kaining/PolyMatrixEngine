@@ -145,8 +145,8 @@ We **do not** implement the full reward formula (order scoring, sampling, epoch 
 
 The Streamlit dashboard (port **8501**) provides:
 
-- **Market screener** — Load active markets from Gamma (`active=true`, `closed=false`). Filters: binary only, liquidity/volume/price by mode (Conservative / Normal / Aggressive / Ultra). Hard filters: liquidity and volume ≥ 5k, YES price in [0.20, 0.80], no danger keywords.
-- **Scoring** — Each market gets a 0–100 score (turnover 40%, price centrality 30%, absolute liquidity 30%, spread penalty up to -20). Stars 1–5 from score bands; table shows Stars, Score, Rewards/day, Min size, Spread (¢), **Competition** (Gamma `competitive`, lower = easier to earn rewards).
+- **Market screener** — Load active markets from Gamma (`active=true`, `closed=false`). V3.0 Farming: binary only, hard filters (rewards_min_size 1–250, liquidity ≥ 1k), sports/gambling blacklist. No mode selector.
+- **Scoring** — V3.0 Farming Score 0–100: yield (50), safety skew (30), quietness (20). Stars 1–5 from score bands; table shows Stars, Score, Rewards/day, Min size, Spread (¢), **Competition** (Gamma `competitive`).
 - **Pool size** — Caption shows “Pool: **X** (from **Y** loaded)”: X = markets passing the screener, Y = raw count from Gamma. Env `GAMMA_MAX_MARKETS` (default 50k) and `GAMMA_PAGE_LIMIT` (default 2k) control fetch size.
 - **Filters** — Optional: 4+ stars only, rewards-only (min size &gt; 0), low competition (&lt; 60%).
 - **Control** — Start / stop / liquidate per market; inventory & PnL; active orders; engine status; log tail.
