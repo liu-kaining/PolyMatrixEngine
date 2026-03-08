@@ -201,8 +201,14 @@ class MarketDataGateway:
             logger.info("Resubscribed to active markets on Market WS.")
 
     async def _listen(self):
-        async for message in self.ws:
+        while True:
+            if getattr(self.ws, "closed", True):
+                break
             try:
+                # Add strict receive timeout. If no message (tick or PONG) arrives for 30s,
+                # the connection is a zombie. Force an exception to trigger reconnection.
+                message = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
+                
                 if message == "PONG":
                     continue
 
@@ -219,10 +225,14 @@ class MarketDataGateway:
                             await redis_client.set_state(f"ob:{aid}", snap)
                             await redis_client.publish(f"tick:{aid}", snap)
 
+            except asyncio.TimeoutError:
+                logger.error("Market WS silent drop detected (30s without message). Forcing reconnect...")
+                break # Break out of listen loop, allowing connect() to handle reconnection
             except json.JSONDecodeError:
                 logger.debug(f"Non-JSON WS message (ignored): {message[:80]}")
             except Exception as e:
                 logger.error(f"Error processing market WS message: {e}")
+                break
 
 
 md_gateway = MarketDataGateway()

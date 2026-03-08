@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # When True, first bid is at most 1 tick below best_bid (more fills, still ~1¢ edge). When False, strictly at bid_1 only.
     QUOTE_BID_ONE_TICK_BELOW_TOUCH: bool = True
 
+    # Auto-Router (V4.0): global scheduling / portfolio manager
+    AUTO_ROUTER_ENABLED: bool = False
+    AUTO_ROUTER_MAX_MARKETS: int = 4
+    AUTO_ROUTER_SCAN_INTERVAL_SEC: int = 3600
+
     class Config:
         env_file = ".env"
         case_sensitive = True

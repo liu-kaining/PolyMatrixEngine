@@ -98,9 +98,13 @@ class InventoryStateManager:
     async def get_snapshot(self, market_id: str) -> Dict[str, float]:
         return await self.ensure_loaded(market_id)
 
-    async def get_exposures(self, market_id: str) -> Tuple[float, float]:
-        snap = await self.ensure_loaded(market_id)
-        return float(snap["yes_exposure"]), float(snap["no_exposure"])
+    async def get_global_exposure(self) -> float:
+        """Calculate total USDC exposure across all tracked markets."""
+        total = 0.0
+        async with self._lock:
+            for snap in self._state.values():
+                total += float(snap.get("yes_exposure", 0.0)) + float(snap.get("no_exposure", 0.0))
+        return total
 
     async def get_last_local_fill_timestamp(self, market_id: str) -> float:
         await self.ensure_loaded(market_id)

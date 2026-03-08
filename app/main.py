@@ -19,6 +19,7 @@ from app.market_data.user_stream import user_stream
 from app.market_data.gamma_client import gamma_client
 from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
+from app.core.market_lifecycle import start_market_making_impl, stop_all_markets
 from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide, OrderStatus
 from logging.handlers import RotatingFileHandler
 
@@ -107,16 +108,32 @@ async def lifespan(app: FastAPI):
     background_tasks.add(task_md)
     background_tasks.add(task_user)
     background_tasks.add(task_watchdog)
+
+    if getattr(settings, "AUTO_ROUTER_ENABLED", False):
+        from app.core.auto_router import run as auto_router_run
+        task_router = asyncio.create_task(auto_router_run())
+        background_tasks.add(task_router)
+        logger.info("Auto-Router (Portfolio Manager) started.")
     
     yield
     
     # Shutdown Events
     logger.info("Shutting down...")
-    await inventory_state.stop()
-    await redis_client.disconnect()
     
+    # 1. Cancel background network tasks (Stops Router, Market Gateway, User Stream, Watchdog)
+    # This prevents new markets from starting and new stream data from arriving.
     for task in background_tasks:
         task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+    
+    # 2. Stop all running market engines safely (Wait for pubsub close & cancellation)
+    await stop_all_markets()
+    
+    # 3. Drain inventory queue safely to DB before connection closes
+    await inventory_state.stop()
+    
+    # 4. Disconnect Redis safely
+    await redis_client.disconnect()
     
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
@@ -124,111 +141,27 @@ app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "0.1.0"}
+    health_data = {"status": "ok", "version": "0.1.0"}
+    if getattr(settings, "AUTO_ROUTER_ENABLED", False):
+        try:
+            from app.core.auto_router import router_state
+            health_data["auto_router"] = router_state
+        except ImportError:
+            pass
+    return health_data
 
 @app.post("/markets/{condition_id}/start")
-async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
-    """Add market to engine and start quoting"""
+async def start_market_making(condition_id: str):
+    """Add market to engine and start quoting (shared impl with Auto-Router)."""
     logger.info(f"POST /markets/{condition_id[:12]}.../start received")
-    
-    # Check if market exists in DB
-    result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
-    market = result.scalar_one_or_none()
-    
-    # Always refresh token IDs + rewards params from Gamma to ensure we use current CLOB tokens.
-    gamma_info = await gamma_client.get_market_info(condition_id)
-    if not gamma_info and (not market or not market.yes_token_id or not market.no_token_id):
-        raise HTTPException(status_code=404, detail="Market tokens not found in Polymarket Gamma API")
-    
-    if gamma_info:
-        if not market:
-            market = MarketMeta(
-                condition_id=condition_id,
-                status="active",
-                yes_token_id=gamma_info.yes_token_id,
-                no_token_id=gamma_info.no_token_id,
-                rewards_min_size=gamma_info.rewards_min_size,
-                rewards_max_spread=gamma_info.rewards_max_spread,
-                reward_rate_per_day=gamma_info.reward_rate_per_day,
-            )
-            new_inventory = InventoryLedger(market_id=condition_id)
-            db.add(market)
-            db.add(new_inventory)
-        else:
-            market.yes_token_id = gamma_info.yes_token_id
-            market.no_token_id = gamma_info.no_token_id
-            market.rewards_min_size = gamma_info.rewards_min_size
-            market.rewards_max_spread = gamma_info.rewards_max_spread
-            market.reward_rate_per_day = gamma_info.reward_rate_per_day
-        await db.commit()
-
-        # Publish rewards config to Redis so QuotingEngine can read it without DB query per tick
-        rewards_payload = {
-            "rewards_min_size": gamma_info.rewards_min_size,
-            "rewards_max_spread": gamma_info.rewards_max_spread,
-            "reward_rate_per_day": gamma_info.reward_rate_per_day,
-        }
-        await redis_client.set_state(f"rewards:{condition_id}", rewards_payload)
-        
-    # Pre-flight Check: USDC Balance (best-effort, only when LIVE_TRADING_ENABLED=True and SDK exposes it)
-    # Minimum for 1 market: 2 sides × 2 grid levels × 5 USDC ≈ 20
-    MIN_REQUIRED_USDC = 20.0
-    from app.oms.core import oms
-    if oms.client and settings.LIVE_TRADING_ENABLED:
-        try:
-            if hasattr(oms.client, "get_balance"):
-                balance = float(oms.client.get_balance())
-                if balance < MIN_REQUIRED_USDC:
-                    logger.error(f"Insufficient USDC balance: {balance} < {MIN_REQUIRED_USDC}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, Available: {balance} USDC",
-                    )
-                logger.info(f"Pre-flight check passed. USDC Balance: {balance}")
-            else:
-                logger.warning("ClobClient does not expose balance API; skipping capital pre-flight check.")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"Could not verify USDC balance during pre-flight (might be offline/dry-run): {e}")
-    
-    # Subscribe to WS with token IDs (asset_ids)
-    await md_gateway.subscribe([market.yes_token_id, market.no_token_id])
-    
-    # Subscribe to private User Stream (uses condition_id)
-    await user_stream.subscribe(condition_id)
-    
-    # Start Quoting Engine Daemon FIRST so they subscribe to Redis PubSub
-    # before we publish the initial snapshot tick.
-    task_quoting_yes = asyncio.create_task(start_quoting_engine(condition_id, market.yes_token_id))
-    task_quoting_no = asyncio.create_task(start_quoting_engine(condition_id, market.no_token_id))
-    
-    background_tasks.add(task_quoting_yes)
-    background_tasks.add(task_quoting_no)
-    
-    # Give engines a moment to complete their Redis PubSub subscribe.
-    # asyncio.create_task schedules them but they need one event-loop turn
-    # to actually reach `await pubsub.subscribe(...)` inside engine.run().
-    await asyncio.sleep(0.5)
-    
-    # NOW seed the local orderbook from REST and publish the initial tick.
-    # The engines are already listening so they will receive this immediately.
-    await md_gateway.fetch_initial_snapshot(market.yes_token_id)
-    await md_gateway.fetch_initial_snapshot(market.no_token_id)
-
-    logger.info(
-        f"Market making started for {condition_id[:10]}... "
-        f"YES={market.yes_token_id[:10]}... NO={market.no_token_id[:10]}..."
-    )
-    
-    return {
-        "status": "started", 
-        "condition_id": condition_id,
-        "tokens": {
-            "YES": market.yes_token_id,
-            "NO": market.no_token_id
-        }
-    }
+    try:
+        result = await start_market_making_impl(condition_id)
+        return result
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
 @app.post("/markets/{condition_id}/stop")
 async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):

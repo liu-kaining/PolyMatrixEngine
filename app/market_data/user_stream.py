@@ -88,16 +88,27 @@ class UserStreamGateway:
             logger.info(f"User WS Subscribed to markets: {self.subscribed_markets}")
 
     async def _listen(self):
-        async for message in self.ws:
+        while True:
+            if getattr(self.ws, "closed", True):
+                break
             try:
+                # Add strict receive timeout. If no message (trade/order or PONG) arrives for 45s,
+                # the connection is a zombie. Force an exception to trigger reconnection.
+                # User stream is less chatty, so 45s is safer.
+                message = await asyncio.wait_for(self.ws.recv(), timeout=45.0)
+                
                 if message == "PONG":
                     continue
                 data = json.loads(message)
                 await self.process_message(data)
+            except asyncio.TimeoutError:
+                logger.error("User WS silent drop detected (45s without message). Forcing reconnect...")
+                break
             except json.JSONDecodeError:
                 pass
             except Exception as e:
                 logger.error(f"Error processing User WS message: {e}")
+                break
 
     async def process_message(self, data: dict):
         # We need to handle trades and cancellations carefully

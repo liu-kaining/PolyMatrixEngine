@@ -77,6 +77,8 @@ class QuotingEngine:
         self.local_no_exposure: float = 0.0
         
         self.suspended = False # Internal flag for Kill Switch
+        self.exit_mode = False   # Graceful exit: stop BUY, unwind inventory, then shut down
+        self._shutdown_requested = False  # Set when exposure cleared so run() can break
 
         # Rewards Farming: loaded once from Redis on first tick
         self._rewards_loaded = False
@@ -132,6 +134,8 @@ class QuotingEngine:
                         f"[{self.token_id[:6]}] Error processing channel {channel}: {e}. "
                         "Engine continues to avoid permanent exit."
                     )
+                if getattr(self, "_shutdown_requested", False):
+                    break
         except asyncio.CancelledError:
             logger.info(f"QuotingEngine shutting down for Token {self.token_id}")
         finally:
@@ -193,7 +197,7 @@ class QuotingEngine:
             )
 
     async def on_control_message(self, data: dict):
-        """Handle incoming signals from the Watchdog or API"""
+        """Handle incoming signals from the Watchdog, API, or Auto-Router"""
         action = data.get("action")
         if action == "suspend":
             async with self._trade_lock:
@@ -206,6 +210,27 @@ class QuotingEngine:
             async with self._trade_lock:
                 self.suspended = False
                 logger.info(f"[{self.token_id[:6]}] QuotingEngine RESUMED by Control Signal.")
+        elif action == "graceful_exit":
+            async with self._trade_lock:
+                if self.exit_mode:
+                    return
+                self.exit_mode = True
+                self.last_anchor_mid_price = None  # Force re-eval on next tick without debounce
+                logger.info(
+                    f"[QuotingEngine {self.condition_id[:10]}] Entered GRACEFUL_EXIT mode. "
+                    "Immediately canceling all active orders..."
+                )
+                await self.cancel_all_orders()
+                await self._publish_engine_mode("GRACEFUL_EXIT")
+                
+    async def _complete_graceful_exit(self, mode_label="GRACEFUL_EXIT"):
+        """Cleanly release resources for this token engine upon exit."""
+        logger.info(f"[QuotingEngine {self.condition_id[:10]}] {mode_label} complete. Shutting down.")
+        await self.cancel_all_orders()
+        side = "YES" if self.is_yes_token else "NO"
+        if redis_client.client:
+            await redis_client.client.delete(f"engine_state:{self.condition_id}:{side}")
+        self._shutdown_requested = True
 
     async def _resolve_market_context(self, session) -> bool:
         """Resolve YES/NO token mapping once for unified pricing + cross-token lock."""
@@ -408,10 +433,6 @@ class QuotingEngine:
         bids = tick_data.get("bids", [])
         asks = tick_data.get("asks", [])
         
-        if not bids or not asks:
-            logger.debug(f"[{self.token_id[:6]}] Orderbook missing bids or asks. Skipping calculation.")
-            return
-            
         await self._load_rewards_config()
 
         async with self._trade_lock:
@@ -431,14 +452,43 @@ class QuotingEngine:
             current_exposure = yes_exposure if self.is_yes_token else no_exposure
             opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
 
+            # [Graceful Exit] State Machine
+            if self.exit_mode:
+                if current_exposure <= 1.0:
+                    await self._complete_graceful_exit("Exposure Cleared")
+                    return
+                
+                # Check for dust below minimum exchange order size
+                if current_exposure < 5.0:
+                    logger.warning(
+                        f"[QuotingEngine {self.condition_id[:10]}] Residual exposure {current_exposure:.4f} "
+                        "is below Polymarket min size (5.0). Executing DUST_EXIT to prevent deadlock."
+                    )
+                    await self._complete_graceful_exit("DUST_EXIT")
+                    return
+
+                logger.info(
+                    f"[QuotingEngine {self.condition_id[:10]}] GRACEFUL_EXIT mode. Current exposure: $%.2f. Waiting to unwind...",
+                    current_exposure,
+                )
+
+            # Check orderbook data AFTER graceful exit dust checks
+            if not bids or not asks:
+                if self.exit_mode:
+                    # Still hold exposure but book is empty, publish mode and wait
+                    await self._publish_engine_mode("GRACEFUL_EXIT", current_exposure=current_exposure)
+                else:
+                    logger.debug(f"[{self.token_id[:6]}] Orderbook missing bids or asks. Skipping calculation.")
+                return
+
             # 2. Unified pricing (YES anchor + NO derived from 1-FV_yes)
             unified = await self._get_unified_fair_value(bids, asks)
             if unified is None:
                 return
             fair_value, dynamic_spread, fv_yes = unified
             
-            # 3. Debounce / Throttle Mechanism Check
-            if self.last_anchor_mid_price is not None:
+            # 3. Debounce / Throttle Mechanism Check (Bypassed if exiting)
+            if not self.exit_mode and self.last_anchor_mid_price is not None:
                 price_diff = abs(fair_value - self.last_anchor_mid_price)
                 if price_diff <= self.price_offset_threshold:
                     logger.debug(
@@ -483,7 +533,10 @@ class QuotingEngine:
             # V3 State Machine: partial-fill aware.
             # Any fragment > 20% of base_size triggers liquidation / cross-lock,
             # preventing exposure stacking from partial fills (e.g. 4.7 / 5.0).
+            # In graceful_exit mode we force sell-only (no BUY) until exposure cleared.
             is_long = current_exposure >= self.liquidate_threshold
+            if self.exit_mode and current_exposure > 1.0:
+                is_long = True
             cross_token_locked = opposite_exposure >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
@@ -580,7 +633,9 @@ class QuotingEngine:
                         # Once inventory >= LIQUIDATE_THRESHOLD, the engine automatically switches
                         # to aggressive SELL mode above.
 
-            mode = "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
+            mode = "GRACEFUL_EXIT" if self.exit_mode else (
+                "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
+            )
 
             # Rewards eligibility: check size and spread vs official requirements
             rewards_size_ok = True
@@ -622,10 +677,14 @@ class QuotingEngine:
                 f"{mode}"
             )
             # 5b. Local balance pre-check: trim orders if total notional exceeds budget
+            # Get global usage asynchronously before passing to the synchronous filter.
+            global_exposure = await inventory_state.get_global_exposure()
+            
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
                 current_exposure=current_exposure,
                 opposite_exposure=opposite_exposure,
+                global_exposure=global_exposure,
             )
 
             logger.info("Order Instructions Payload:")
@@ -650,29 +709,34 @@ class QuotingEngine:
         orders_payload: List[dict],
         current_exposure: float,
         opposite_exposure: float,
+        global_exposure: float = 0.0,
     ) -> List[dict]:
         """
         Estimate total USDC commitment for this batch and trim if it would exceed
-        available budget.  Budget = MAX_EXPOSURE_PER_MARKET minus notional already
-        locked by existing positions on BOTH sides of this market.
+        available budget.
 
-        Also strictly capped by GLOBAL_MAX_BUDGET if specified in .env.
-
-        BUY orders lock price*size USDC.  SELL orders only need shares already held
-        (no incremental USDC).
+        Calculates available budget based on two hard constraints:
+        1. Local Constraint: MAX_EXPOSURE_PER_MARKET minus local current_exposure + opposite_exposure
+        2. Global Constraint: GLOBAL_MAX_BUDGET minus TOTAL exposure across ALL markets.
         """
         if not orders_payload:
             return orders_payload
 
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
-        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", max_exposure))
+        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
         
-        # We take the stricter of MAX_EXPOSURE_PER_MARKET and GLOBAL_MAX_BUDGET
-        budget_limit = min(max_exposure, global_max_budget)
-        
-        # Cautious: existing exposure on both sides counts against the budget.
-        used_notional = current_exposure + opposite_exposure
-        available = max(0.0, budget_limit - used_notional)
+        # Local available space
+        local_used = current_exposure + opposite_exposure
+        local_available = max(0.0, max_exposure - local_used)
+
+        # Global available space
+        # Exclude this market's usage from global usage so we don't double count it 
+        # when evaluating the headroom available to this specific market.
+        global_other_used = max(0.0, global_exposure - local_used)
+        global_available = max(0.0, global_max_budget - global_other_used - local_used)
+
+        # The strict constraint is the smaller of the two
+        available = min(local_available, global_available)
 
         buy_orders = [o for o in orders_payload if o["side"] == OrderSide.BUY]
         sell_orders = [o for o in orders_payload if o["side"] == OrderSide.SELL]

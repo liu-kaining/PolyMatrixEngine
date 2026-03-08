@@ -27,9 +27,10 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 
 | Area | What we do |
 |------|------------|
-| **Performance** | Memory-first inventory; zero Postgres reads in the tick loop; async persist queue with bounded size and graceful drain on shutdown. |
-| **Execution** | Diff quoting (keep/cancel/create by signature); preserves time priority and cuts API churn. |
-| **Risk** | Kill switch, circuit breaker, per-market exposure cap, reconciliation with timestamp guard, balance precheck before sending orders. |
+| **Auto-Router (V4)** | Background portfolio manager. Scans Gamma for highest ROI opportunities, gracefully exits deteriorating markets, and seamlessly swaps in new ones without exceeding capital limits. |
+| **Performance** | Memory-first inventory; zero Postgres reads in the tick loop; `EngineSupervisor` task registry; async persist queue with bounded size and graceful drain on shutdown. |
+| **Execution** | Diff quoting (keep/cancel/create by signature); preserves time priority and cuts API churn. Fail-closed resilient WS with heartbeat dropping detection. |
+| **Risk** | Global max budget (`GLOBAL_MAX_BUDGET`) enforcing across all engines. Per-market kill switch, circuit breaker, reconciliation with timestamp guard, and balance precheck. |
 | **Maker discipline** | Crosses-the-book guard (SELL ≥ best_bid + tick, BUY ≤ best_ask - tick); no accidental taker flow. |
 | **Rewards** | Gamma-driven rewards params (min size, max spread); adaptive sizing with a safety fuse so grid budget is never exceeded. |
 | **Ops** | Streamlit dashboard (screener, exposure, logs, emergency stop/liquidate); FastAPI control plane; full .env configuration. |
@@ -38,11 +39,13 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 
 ## Features
 
-- **Market Data Gateway** — Order book via Polymarket Market WebSocket + REST snapshot; local orderbook merge and top-N BBO published to Redis for engines.
+- **V4.0 Auto-Router (Portfolio Manager)** — Fully automated mode. When enabled, it continuously scans the Polymarket Gamma API, ranks binary markets by Daily ROI (Rewards per Day / Min Size), filters out blacklisted markets, and maintains a top-N portfolio. It handles graceful eviction (sell-only mode) for falling markets while rotating in new ones.
+- **Engine Supervisor** — Strict, concurrency-safe lifecycle manager. Guarantees exactly one async task per market side, preventing duplicate instances and ensuring total cleanup upon exit to avoid "ghost orders".
+- **Market Data Gateway** — Order book via Polymarket Market WebSocket + REST snapshot; local orderbook merge and top-N BBO published to Redis for engines. Includes a 30s silent-drop detection for resilient reconnects.
 - **In-Memory Inventory State** — `InventoryStateManager` single source of truth for exposure in the hot path; fills update memory immediately and enqueue async DB writes; bounded queue and drain-on-shutdown to avoid OOM and data loss.
-- **Unified Pricing (AlphaModel)** — Single anchor from YES book (mid + OBI skew); NO side derived; dynamic spread and inventory-aware state machine (QUOTING / LIQUIDATING / LOCKED_BY_OPPOSITE).
+- **Unified Pricing (AlphaModel)** — Single anchor from YES book (mid + OBI skew); NO side derived; dynamic spread and inventory-aware state machine (QUOTING / GRACEFUL_EXIT / LIQUIDATING / LOCKED_BY_OPPOSITE).
 - **Diff Quoting** — Compare current active orders to desired grid by (side, price, size); cancel only stale, create only missing; preserves time priority and reduces CLOB traffic.
-- **Balance Precheck** — Before placing a batch, check total BUY notional vs available budget; auto-shrink or drop levels so you don’t hit “not enough balance” from the API.
+- **Balance Precheck** — Before placing a batch, check total BUY notional against BOTH `MAX_EXPOSURE_PER_MARKET` and `GLOBAL_MAX_BUDGET`. Auto-shrinks or drops levels to absolutely prevent hitting capital ceilings.
 - **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Rewards Farming Ready** — Read rewards min size and max spread from Gamma; adapt size when safe, else fall back to base size; dashboard shows rewards eligibility.
@@ -209,7 +212,11 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | Variable | Meaning | Default / note |
 |----------|---------|----------------|
 | `LIVE_TRADING_ENABLED` | Real CLOB orders vs dry-run | `False` = simulate only |
-| `MAX_EXPOSURE_PER_MARKET` | Cap per market (USDC); watchdog kill switch | e.g. `15` |
+| `AUTO_ROUTER_ENABLED` | Enable V4 Auto-Router background portfolio manager | `False` |
+| `AUTO_ROUTER_MAX_MARKETS` | Max concurrent markets managed by the router | `4` |
+| `AUTO_ROUTER_SCAN_INTERVAL_SEC` | Time between Gamma API scans for rebalancing | `3600` |
+| `GLOBAL_MAX_BUDGET` | Absolute max USDC deployed across ALL markets | `1000.0` |
+| `MAX_EXPOSURE_PER_MARKET` | Cap per market (USDC); watchdog kill switch | e.g. `50.0` |
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | Seconds after last local fill to skip REST overwrite | `8.0` |
 | `BASE_ORDER_SIZE` | Size per order (min 5) | e.g. `5.0` |
