@@ -786,7 +786,7 @@ if status_rows:
             f"NO exposure={float(row.get('no_exposure', 0.0)):.4f}"
         )
 
-        # Rewards Eligibility
+        # Rewards Eligibility (only show INELIGIBLE when engine has reported it; missing = Pending)
         r_min_size = row.get("rewards_min_size")
         r_max_spread = row.get("rewards_max_spread")
         has_rewards = (r_min_size is not None and float(r_min_size) > 0) or (
@@ -795,10 +795,15 @@ if status_rows:
         if has_rewards:
             yes_rt = row.get("yes_runtime") or {}
             no_rt = row.get("no_runtime") or {}
-            yes_elig = yes_rt.get("rewards_eligible", False)
-            no_elig = no_rt.get("rewards_eligible", False)
-            farming = yes_elig or no_elig
-            status_icon = "🟢 FARMING" if farming else "⚪ INELIGIBLE"
+            yes_has = "rewards_eligible" in yes_rt
+            no_has = "rewards_eligible" in no_rt
+            if yes_has or no_has:
+                yes_elig = yes_rt.get("rewards_eligible", False)
+                no_elig = no_rt.get("rewards_eligible", False)
+                farming = yes_elig or no_elig
+                status_icon = "🟢 FARMING" if farming else "⚪ INELIGIBLE"
+            else:
+                status_icon = "⚪ Pending"
             min_s = f"{float(r_min_size):.0f}" if r_min_size else "—"
             max_sp = f"{float(r_max_spread) * 100:.1f}¢" if r_max_spread else "—"
             st.markdown(
