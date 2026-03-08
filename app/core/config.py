@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # Redis (REDIS_PORT is for docker-compose host mapping only; app uses REDIS_URL)
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_PORT: str = "6380"
+
+    # Dashboard: passphrase to unlock UI and authorize dangerous API calls (stop/wipe/liquidate).
+    # If set, dashboard shows login first; API expects header X-Admin-Token: <passphrase>.
+    DASHBOARD_PASSPHRASE: str = ""
     
     # Alchemy RPC (Kill Switch)
     ALCHEMY_RPC_URL: str = ""

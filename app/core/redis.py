@@ -40,6 +40,9 @@ class RedisManager:
         val = await self.client.get(key)
         return json.loads(val) if val else None
 
+    async def delete_key(self, key: str) -> None:
+        await self.client.delete(key)
+
     async def publish(self, channel: str, message: Any):
         """Publish market updates to strategies"""
         await self.client.publish(channel, json.dumps(message))

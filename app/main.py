@@ -5,12 +5,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete
 
 from app.core.config import settings
+from app.core.runtime_config import get_all_effective, set_override, get_effective, allowlist as config_allowlist
 from app.db.session import init_db, get_db, AsyncSessionLocal
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
@@ -120,6 +121,19 @@ async def lifespan(app: FastAPI):
     
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
+
+async def require_admin_token(x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token")):
+    """Require DASHBOARD_PASSPHRASE to be set and X-Admin-Token to match; else 503 or 401."""
+    passphrase = (getattr(settings, "DASHBOARD_PASSPHRASE", None) or "").strip()
+    if not passphrase:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin must set DASHBOARD_PASSPHRASE in .env to enable start/stop/wipe/liquidate.",
+        )
+    if not x_admin_token or x_admin_token != passphrase:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Token")
+
+
 # --- API Endpoints ---
 
 @app.get("/health")
@@ -127,7 +141,11 @@ async def health_check():
     return {"status": "ok", "version": "0.1.0"}
 
 @app.post("/markets/{condition_id}/start")
-async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
+async def start_market_making(
+    condition_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_admin_token),
+):
     """Add market to engine and start quoting"""
     logger.info(f"POST /markets/{condition_id[:12]}.../start received")
     
@@ -230,8 +248,39 @@ async def start_market_making(condition_id: str, db: AsyncSession = Depends(get_
         }
     }
 
+@app.get("/config")
+async def get_config():
+    """Return effective runtime config (Redis overrides + env defaults). No auth required (read-only)."""
+    return await get_all_effective()
+
+
+@app.post("/config")
+async def post_config(
+    body: dict,
+    _: None = Depends(require_admin_token),
+):
+    """Set runtime override for a key. Requires X-Admin-Token. Body: {"key": "BASE_ORDER_SIZE", "value": 20}."""
+    key = (body.get("key") or "").strip()
+    value = body.get("value")
+    if not key or value is None:
+        raise HTTPException(status_code=400, detail="key and value required")
+    if key not in config_allowlist():
+        raise HTTPException(status_code=400, detail=f"Key not overridable: {key}")
+    ok = await set_override(key, value)
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid value for {key} (check type and bounds: e.g. BASE_ORDER_SIZE >= 5, GRID_LEVELS >= 1).",
+        )
+    return {"key": key, "value": value}
+
+
 @app.post("/markets/{condition_id}/stop")
-async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
+async def stop_market_making(
+    condition_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_admin_token),
+):
     """Soft stop: Cancel all orders and suspend quoting engine for this market"""
     from app.oms.core import oms
     
@@ -252,7 +301,11 @@ async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_d
     return {"status": "stopped", "condition_id": condition_id}
 
 @app.post("/markets/{condition_id}/liquidate")
-async def liquidate_market(condition_id: str, db: AsyncSession = Depends(get_db)):
+async def liquidate_market(
+    condition_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_admin_token),
+):
     """Liquidate all positions: Cancel orders and market dump (Cross the spread)"""
     from app.oms.core import oms
     
@@ -346,7 +399,8 @@ async def get_markets_status(
 
     rows = (await db.execute(stmt)).all()
 
-    base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
+    base_size_val = await get_effective("BASE_ORDER_SIZE")
+    base_size = max(5.0, float(base_size_val if base_size_val is not None else getattr(settings, "BASE_ORDER_SIZE", 10.0)))
     liquidate_threshold = base_size * 0.2
 
     def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
@@ -432,7 +486,10 @@ async def get_active_orders(db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/admin/wipe")
-async def wipe_all_data(db: AsyncSession = Depends(get_db)):
+async def wipe_all_data(
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_admin_token),
+):
     """
     DANGER: Wipe all local state (Postgres + Redis) for a clean reset.
     Intended for development / manual recovery only.

@@ -61,6 +61,14 @@ DB_URL_SYNC = (
 )
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
+
+def _admin_headers() -> dict:
+    """Headers for admin-only API calls (start/stop/liquidate/wipe/config)."""
+    token = st.session_state.get("dashboard_admin_token")
+    if token:
+        return {"X-Admin-Token": token}
+    return {}
+
 # Path to backend trading log (can be overridden by TRADING_LOG_PATH)
 LOG_FILE_PATH = os.getenv(
     "TRADING_LOG_PATH",
@@ -77,6 +85,30 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 GAMMA_PAGE_LIMIT = int(os.getenv("GAMMA_PAGE_LIMIT", "2000"))  # per-page; 2000 → 10k/round with sem 5
 MAX_MARKETS = int(os.getenv("GAMMA_MAX_MARKETS", "50000"))
 GAMMA_SEMAPHORE = 5
+
+# --- Access control: passphrase gate (must be first so nothing is shown until logged in) ---
+DASHBOARD_PASSPHRASE = os.getenv("DASHBOARD_PASSPHRASE", "").strip()
+if "dashboard_authenticated" not in st.session_state:
+    st.session_state["dashboard_authenticated"] = False
+if "dashboard_admin_token" not in st.session_state:
+    st.session_state["dashboard_admin_token"] = None  # stored passphrase for API X-Admin-Token
+
+if not DASHBOARD_PASSPHRASE:
+    st.warning("⚠️ **Admin:** Set `DASHBOARD_PASSPHRASE` in `.env` to enable login. Dashboard is disabled until then.")
+    st.stop()
+
+if not st.session_state["dashboard_authenticated"]:
+    st.title("🔐 Dashboard Login")
+    st.markdown("Enter the passphrase to access the dashboard.")
+    pw = st.text_input("Passphrase", type="password", key="login_passphrase")
+    if st.button("Unlock"):
+        if pw and pw == DASHBOARD_PASSPHRASE:
+            st.session_state["dashboard_authenticated"] = True
+            st.session_state["dashboard_admin_token"] = pw
+            st.rerun()
+        else:
+            st.error("Incorrect passphrase.")
+    st.stop()
 
 # Session state for two-step confirmations
 if "pending_start_condition_id" not in st.session_state:
@@ -588,7 +620,7 @@ if pending_cid:
         if st.button(f"✅ {t('app.confirm_start')}", key="confirm_start_sidebar"):
             try:
                 with st.spinner(t("app.initializing")):
-                    response = requests.post(f"{API_URL}/markets/{pending_cid}/start")
+                    response = requests.post(f"{API_URL}/markets/{pending_cid}/start", headers=_admin_headers())
                 if response.status_code == 200:
                     data = response.json()
                     st.success(t("app.started_quoting").format(cid=pending_cid[:8]))
@@ -640,7 +672,7 @@ if pending_kill_action and pending_kill_cid:
         if st.button(f"✅ {t('app.confirm_stop') if pending_kill_action == 'stop' else t('app.confirm_liquidate')}", key="confirm_kill_action"):
             endpoint = "stop" if pending_kill_action == "stop" else "liquidate"
             try:
-                res = requests.post(f"{API_URL}/markets/{pending_kill_cid}/{endpoint}")
+                res = requests.post(f"{API_URL}/markets/{pending_kill_cid}/{endpoint}", headers=_admin_headers())
                 if res.status_code == 200:
                     st.success(t("app.label_executed").format(label=label))
                     st.session_state["pending_kill_action"] = None
@@ -671,7 +703,7 @@ with st.sidebar.form("wipe_form"):
             st.warning(t("app.please_type_wipe"))
         else:
             try:
-                res = requests.post(f"{API_URL}/admin/wipe")
+                res = requests.post(f"{API_URL}/admin/wipe", headers=_admin_headers())
                 if res.status_code == 200:
                     st.success(t("app.wipe_success"))
                     st.rerun()
@@ -683,9 +715,59 @@ with st.sidebar.form("wipe_form"):
 st.sidebar.markdown("---")
 if st.sidebar.button(t("app.refresh_data"), use_container_width=True):
     st.rerun()
+if st.sidebar.button("🚪 Log out", use_container_width=True):
+    st.session_state["dashboard_authenticated"] = False
+    st.session_state["dashboard_admin_token"] = None
+    st.rerun()
 
 # ----------------- MAIN PAGE -----------------
 st.title(f"📈 {t('app.dashboard_title')}")
+
+# Runtime Config (no restart)
+with st.expander("⚙️ Runtime Config (takes effect without restart)", expanded=False):
+    try:
+        cfg_res = requests.get(f"{API_URL}/config", timeout=3)
+        if cfg_res.status_code == 200:
+            cfg = cfg_res.json()
+            # Keys that are integers in backend (use step=1, min=1)
+            int_keys = {"GRID_LEVELS"}
+            # Bounds for numeric keys (backend also enforces BASE_ORDER_SIZE >= 5, GRID_LEVELS >= 1)
+            min_vals = {"BASE_ORDER_SIZE": 5.0, "GRID_LEVELS": 1, "MAX_EXPOSURE_PER_MARKET": 1.0, "GLOBAL_MAX_BUDGET": 1.0,
+                        "QUOTE_BASE_SPREAD": 0.0, "QUOTE_PRICE_OFFSET_THRESHOLD": 0.0}
+            # Build form: one row per key with current value and save
+            for key in sorted(cfg.keys()):
+                val = cfg[key]
+                if isinstance(val, bool):
+                    new_val = st.checkbox(key, value=val, key=f"cfg_{key}")
+                elif isinstance(val, (int, float)):
+                    default = float(val) if isinstance(val, (int, float)) else 0.0
+                    if key in int_keys:
+                        new_val = st.number_input(
+                            key, value=max(1, int(default)), min_value=1, max_value=20, step=1, key=f"cfg_{key}"
+                        )
+                    else:
+                        min_v = min_vals.get(key)
+                        new_val = st.number_input(
+                            key, value=default,
+                            min_value=float(min_v) if min_v is not None else None,
+                            key=f"cfg_{key}"
+                        )
+                else:
+                    new_val = st.text_input(key, value=str(val), key=f"cfg_{key}")
+                if st.button("Save", key=f"save_{key}"):
+                    body = {"key": key, "value": new_val}
+                    save_res = requests.post(f"{API_URL}/config", json=body, headers=_admin_headers(), timeout=3)
+                    if save_res.status_code == 200:
+                        st.success(f"Saved {key}")
+                        st.rerun()
+                    else:
+                        st.error(save_res.text or str(save_res.status_code))
+        else:
+            st.caption("Could not load config.")
+    except Exception as e:
+        st.caption(f"Config API error: {e}")
+
+st.markdown("---")
 
 # 1. Inventory & Risk Panel
 st.header(f"🛡️ {t('app.inventory_risk')}")
@@ -795,10 +877,16 @@ if status_rows:
         if has_rewards:
             yes_rt = row.get("yes_runtime") or {}
             no_rt = row.get("no_runtime") or {}
-            yes_elig = yes_rt.get("rewards_eligible", False)
-            no_elig = no_rt.get("rewards_eligible", False)
-            farming = yes_elig or no_elig
-            status_icon = "🟢 FARMING" if farming else "⚪ INELIGIBLE"
+            yes_has_key = "rewards_eligible" in yes_rt
+            no_has_key = "rewards_eligible" in no_rt
+            yes_elig = yes_rt.get("rewards_eligible", False) if yes_has_key else None
+            no_elig = no_rt.get("rewards_eligible", False) if no_has_key else None
+            if not yes_has_key and not no_has_key:
+                status_icon = "⚪ No recent data"
+            elif yes_elig or no_elig:
+                status_icon = "🟢 FARMING"
+            else:
+                status_icon = "⚪ INELIGIBLE"
             min_s = f"{float(r_min_size):.0f}" if r_min_size else "—"
             max_sp = f"{float(r_max_spread) * 100:.1f}¢" if r_max_spread else "—"
             st.markdown(

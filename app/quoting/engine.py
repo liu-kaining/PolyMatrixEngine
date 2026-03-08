@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.redis import redis_client
+from app.core import runtime_config as runtime_config_module
 from app.core.inventory_state import inventory_state
 from app.oms.core import oms
 from app.models.db_models import OrderSide, OrderStatus, OrderJournal
@@ -83,6 +84,12 @@ class QuotingEngine:
         self.rewards_min_size: float = 0.0
         self.rewards_max_spread: float = 0.0
         self.reward_rate_per_day: float = 0.0
+
+        # Runtime config cache (refreshed each tick for dashboard-override support)
+        self._rt_auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
+        self._rt_max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        self._rt_global_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
+        self._rt_one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
 
     async def run(self):
         """Main loop for the quoting engine"""
@@ -291,8 +298,8 @@ class QuotingEngine:
         If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
         Fall back to BASE_ORDER_SIZE if it breaches risk limits.
         """
-        auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
-        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        auto_tune = self._rt_auto_tune
+        max_exposure = self._rt_max_exposure
         total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
@@ -414,6 +421,32 @@ class QuotingEngine:
             
         await self._load_rewards_config()
 
+        # Refresh runtime config (dashboard overrides without restart)
+        try:
+            base = await runtime_config_module.get_effective("BASE_ORDER_SIZE")
+            if base is not None:
+                self.base_size = max(5.0, float(base))
+            gl = await runtime_config_module.get_effective("GRID_LEVELS")
+            if gl is not None:
+                self.grid_levels = max(1, int(gl))
+            po = await runtime_config_module.get_effective("QUOTE_PRICE_OFFSET_THRESHOLD")
+            if po is not None:
+                self.price_offset_threshold = float(po)
+            self.liquidate_threshold = self.base_size * 0.2
+            spread = await runtime_config_module.get_effective("QUOTE_BASE_SPREAD")
+            if spread is not None:
+                self.alpha_model.base_spread = float(spread)
+            at = await runtime_config_module.get_effective("AUTO_TUNE_FOR_REWARDS")
+            self._rt_auto_tune = at if at is not None else getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
+            mx = await runtime_config_module.get_effective("MAX_EXPOSURE_PER_MARKET")
+            self._rt_max_exposure = float(mx) if mx is not None else float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            gb = await runtime_config_module.get_effective("GLOBAL_MAX_BUDGET")
+            self._rt_global_budget = float(gb) if gb is not None else float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
+            ot = await runtime_config_module.get_effective("QUOTE_BID_ONE_TICK_BELOW_TOUCH")
+            self._rt_one_tick_below = ot if ot is not None else getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
+        except Exception as e:
+            logger.debug("runtime_config refresh: %s", e)
+
         async with self._trade_lock:
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:
@@ -451,14 +484,14 @@ class QuotingEngine:
             self.last_anchor_mid_price = fair_value
             
             # [AUTOTUNE] Auto-Spread 动态点差决策
-            auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
+            auto_tune = self._rt_auto_tune
             if auto_tune and self.rewards_min_size > 0 and self.rewards_max_spread > 0:
                 logger.info(
                     f"[{self.token_id[:6]}] [AUTOTUNE] Market has rewards! "
                     f"MinSize: {self.rewards_min_size}, MaxSpread: {self.rewards_max_spread:.4f}."
                 )
                 target_spread = self.rewards_max_spread * 0.90
-                base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
+                base_spread = float(self.alpha_model.base_spread)
                 
                 # If target spread is wider than base, take target_spread (safe fishing)
                 applied_spread = dynamic_spread
@@ -541,7 +574,7 @@ class QuotingEngine:
                     # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
                     # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
                     # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
-                    one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
+                    one_tick_below = self._rt_one_tick_below
                     seen_bid_prices: set = set()
                     for i in range(self.grid_levels):
                         raw = round(bid_1 - (i * self.tick_size), 2)
@@ -582,19 +615,22 @@ class QuotingEngine:
 
             mode = "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
 
-            # Rewards eligibility: check size and spread vs official requirements
-            rewards_size_ok = True
-            rewards_spread_ok = True
-            if self.rewards_min_size > 0:
-                actual_sizes = [o["size"] for o in orders_payload] if orders_payload else [self.base_size]
-                rewards_size_ok = all(s >= self.rewards_min_size for s in actual_sizes)
-            if self.rewards_max_spread > 0 and dynamic_spread > self.rewards_max_spread:
-                rewards_spread_ok = False
-                logger.info(
-                    f"[{self.token_id[:6]}] Spread too wide for rewards: "
-                    f"dynamic_spread={dynamic_spread:.4f} > max_spread={self.rewards_max_spread:.4f}. "
-                    f"Current orders will NOT earn liquidity rewards."
-                )
+            # Rewards eligibility: only when we have orders; check size and spread vs official requirements
+            rewards_eligible = False
+            if orders_payload:
+                rewards_size_ok = True
+                rewards_spread_ok = True
+                if self.rewards_min_size > 0:
+                    actual_sizes = [o["size"] for o in orders_payload]
+                    rewards_size_ok = all(s >= self.rewards_min_size for s in actual_sizes)
+                if self.rewards_max_spread > 0 and dynamic_spread > self.rewards_max_spread:
+                    rewards_spread_ok = False
+                    logger.info(
+                        f"[{self.token_id[:6]}] Spread too wide for rewards: "
+                        f"dynamic_spread={dynamic_spread:.4f} > max_spread={self.rewards_max_spread:.4f}. "
+                        f"Current orders will NOT earn liquidity rewards."
+                    )
+                rewards_eligible = rewards_size_ok and rewards_spread_ok
 
             await self._publish_engine_mode(
                 mode=mode,
@@ -602,7 +638,7 @@ class QuotingEngine:
                 fv_yes=fv_yes,
                 current_exposure=current_exposure,
                 opposite_exposure=opposite_exposure,
-                rewards_eligible=rewards_size_ok and rewards_spread_ok,
+                rewards_eligible=rewards_eligible,
             )
 
             # 5. Log Execution output
@@ -664,8 +700,8 @@ class QuotingEngine:
         if not orders_payload:
             return orders_payload
 
-        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
-        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", max_exposure))
+        max_exposure = self._rt_max_exposure
+        global_max_budget = self._rt_global_budget
         
         # We take the stricter of MAX_EXPOSURE_PER_MARKET and GLOBAL_MAX_BUDGET
         budget_limit = min(max_exposure, global_max_budget)
