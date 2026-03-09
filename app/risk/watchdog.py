@@ -40,29 +40,47 @@ class RiskMonitor:
                 await asyncio.sleep(5)
 
     async def check_exposure(self):
-        async with AsyncSessionLocal() as session:
-            # Load inventory + market status so we don't re-trigger kill switch every second for same market
-            stmt = select(InventoryLedger, MarketMeta).outerjoin(
-                MarketMeta, InventoryLedger.market_id == MarketMeta.condition_id
-            )
-            result = await session.execute(stmt)
-            rows = result.all()
+        """
+        Real-time risk check based on in-memory state.
+        This ensures immediate kill-switch activation on fill, without waiting for DB persistence.
+        """
+        # 1. Get all active condition_ids from the EngineSupervisor
+        from app.core.market_lifecycle import get_active_router_markets
+        active_cids = get_active_router_markets()
 
-            for inv, market in rows:
-                if abs(float(inv.yes_exposure)) <= self.max_exposure and \
-                   abs(float(inv.no_exposure)) <= self.max_exposure:
-                    continue
-                # Already suspended: only log once per cycle at DEBUG to avoid log spam
+        for cid in active_cids:
+            # 2. Check memory-first snapshot for each active market
+            snap = await inventory_state.get_snapshot(cid)
+            yes_exp = abs(float(snap.get("yes_exposure", 0.0)))
+            no_exp = abs(float(snap.get("no_exposure", 0.0)))
+
+            if yes_exp <= self.max_exposure and no_exp <= self.max_exposure:
+                continue
+
+            # 3. Breach detected: Verify status in DB before triggering
+            async with AsyncSessionLocal() as session:
+                stmt = select(MarketMeta).filter(MarketMeta.condition_id == cid)
+                result = await session.execute(stmt)
+                market = result.scalar_one_or_none()
+
                 if market and (market.status or "").lower() == "suspended":
-                    logger.debug(
-                        f"Market {inv.market_id[:12]}... already suspended (YES: {inv.yes_exposure}, NO: {inv.no_exposure}). Skip re-trigger."
-                    )
                     continue
 
-                logger.critical(f"RISK BREACH: Market {inv.market_id} exceeded limit ({self.max_exposure})!")
-                logger.critical(f"Exposure YES: {inv.yes_exposure}, NO: {inv.no_exposure}")
+                logger.critical(
+                    f"RISK BREACH (Memory): Market {cid[:12]} exceeded limit ({self.max_exposure})! "
+                    f"Exposure YES: {yes_exp:.2f}, NO: {no_exp:.2f}"
+                )
+                await self.trigger_kill_switch(cid, session)
 
-                await self.trigger_kill_switch(inv.market_id, session)
+        # 4. Global Budget Check
+        global_exposure = await inventory_state.get_global_exposure()
+        global_max = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
+        if global_exposure > global_max * 1.05: # Allow 5% leeway for race conditions
+             logger.critical(
+                 f"GLOBAL RISK BREACH: Total exposure ${global_exposure:.2f} exceeds budget ${global_max:.2f}!"
+             )
+             # Note: We don't trigger a global kill switch here yet to avoid market-wide panic,
+             # but we log it as critical. The per-engine balance_precheck is the primary preventer.
                     
     async def trigger_kill_switch(self, condition_id: str, session):
         """Emergency procedure: cancel all orders, suspend quoting"""

@@ -195,6 +195,8 @@ class QuotingEngine:
             logger.info(
                 f"[{self.token_id[:6]}] Active order removed by status event: {order_id[:10]}... ({status})"
             )
+            # Release locked margin immediately
+            await self._update_pending_buy_notional()
 
     async def on_control_message(self, data: dict):
         """Handle incoming signals from the Watchdog, API, or Auto-Router"""
@@ -314,63 +316,48 @@ class QuotingEngine:
         Grid-budget-aware size calculation.
 
         If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
-        Fall back to BASE_ORDER_SIZE if it breaches risk limits.
+        Fallback logic: shrink to fit budget, or return 0.0 if below 5.0 (Polymarket min).
         """
         auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
         total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
-        # [AUTOTUNE] Logic
+        # 1. Determine target size
         if auto_tune and self.rewards_min_size > 0:
             target_size = max(5.0, round(self.rewards_min_size * 1.05, 1))
-            exposure_cost = target_size * self.grid_levels
-            
-            # Risk check 1: Target * GRID_LEVELS > MAX_EXPOSURE_PER_MARKET
-            if exposure_cost > max_exposure:
-                logger.warning(
-                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-size {target_size:.1f} rejected by MAX_EXPOSURE_PER_MARKET ({max_exposure:.1f}). Using Fallback Size: {self.base_size}."
-                )
-                return self.base_size
-            
-            # Risk check 2: Single order notional > budget_per_order
-            # (In Auto-tune mode, if you pass exposure_cost check, you usually pass this, but we keep it safe)
-            if (target_size * price) > budget_per_order:
-                logger.warning(
-                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-size {target_size:.1f} (notional {target_size*price:.2f}) rejected by per-order budget ({budget_per_order:.2f}). Using Fallback Size: {self.base_size}."
-                )
-                return self.base_size
-            
-            return target_size
+        else:
+            target_size = self.base_size
 
-        # Fallback to standard base logic
-        if self.rewards_min_size <= 0:
-            fallback_notional = self.base_size * price
-            if fallback_notional > budget_per_order:
-                safe_size = max(5.0, budget_per_order / price if price > 0 else self.base_size)
-                logger.warning(
-                    f"[{self.token_id[:6]}] 基础单量超预算 "
-                    f"(base={self.base_size}×{price:.2f}=${fallback_notional:.2f} > "
-                    f"budget_per_order=${budget_per_order:.2f}), 缩小至 {safe_size:.1f}"
-                )
-                return round(safe_size, 1)
-            return self.base_size
-
-        # Legacy rewards logic (when auto_tune=False)
-        target = max(self.base_size, self.rewards_min_size)
-        notional = target * price
-
-        if notional > budget_per_order:
+        # 2. Risk Check: Total exposure cost for this engine's grid levels
+        # (Approximate check: target_size * grid_levels should not exceed max_exposure)
+        exposure_cost = target_size * self.grid_levels
+        if exposure_cost > max_exposure:
+            # Shrink target_size to fit max_exposure across all levels
+            shrunk_size = max_exposure / self.grid_levels
             logger.warning(
-                f"[{self.token_id[:6]}] 单笔预算不足 "
-                f"(target={target}×{price:.2f}=${notional:.2f} > "
-                f"budget_per_order=${budget_per_order:.2f}, "
-                f"slots={total_slots}), "
-                f"为保证多档网格安全，放弃追求官方奖励，回退至基础单量 ({self.base_size})"
+                f"[{self.token_id[:6]}] [BUDGET] Shrinking size {target_size:.1f} -> {shrunk_size:.1f} "
+                f"to fit MAX_EXPOSURE_PER_MARKET ({max_exposure:.1f}) across {self.grid_levels} levels."
             )
-            return self.base_size
+            target_size = shrunk_size
 
-        return target
+        # 3. Risk Check: Single order notional vs per-order budget
+        if (target_size * price) > budget_per_order:
+            # Shrink target_size to fit per-order notional budget
+            shrunk_size = budget_per_order / price if price > 0 else 0.0
+            logger.warning(
+                f"[{self.token_id[:6]}] [BUDGET] Shrinking size {target_size:.1f} -> {shrunk_size:.1f} "
+                f"to fit per-order notional budget ({budget_per_order:.2f} @ price {price:.2f})."
+            )
+            target_size = shrunk_size
+
+        # 4. Final floor check (Polymarket minimum)
+        if target_size < 5.0:
+            if target_size > 0:
+                logger.warning(f"[{self.token_id[:6]}] [BUDGET] Final size {target_size:.1f} < 5.0. Dropping BUY order.")
+            return 0.0
+
+        return round(target_size, 1)
 
     async def _get_unified_fair_value(self, bids: list, asks: list) -> Optional[Tuple[float, float, float]]:
         """
@@ -618,6 +605,8 @@ class QuotingEngine:
                         seen_bid_prices.add(bid_price)
 
                         effective_size = self._compute_effective_size(bid_price)
+                        if effective_size <= 0:
+                            continue  # budget too tight for this level; skip
                         orders_payload.append(
                             {
                                 "condition_id": self.condition_id,
@@ -678,13 +667,25 @@ class QuotingEngine:
             )
             # 5b. Local balance pre-check: trim orders if total notional exceeds budget
             # Get global usage asynchronously before passing to the synchronous filter.
-            global_exposure = await inventory_state.get_global_exposure()
+            # Exclude THIS market from global sum, and manually add back its components 
+            # minus THIS engine's current pending BUYs to avoid double-counting.
+            global_other_markets = await inventory_state.get_global_exposure_excluding(self.condition_id)
+            market_snap = await inventory_state.get_snapshot(self.condition_id)
             
+            pending_yes = float(market_snap.get("pending_yes_buy_notional", 0.0))
+            pending_no = float(market_snap.get("pending_no_buy_notional", 0.0))
+            
+            if self.is_yes_token:
+                other_side_pending = pending_no
+            else:
+                other_side_pending = pending_yes
+                
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
                 current_exposure=current_exposure,
                 opposite_exposure=opposite_exposure,
-                global_exposure=global_exposure,
+                other_side_pending=other_side_pending,
+                global_other_markets=global_other_markets,
             )
 
             logger.info("Order Instructions Payload:")
@@ -709,15 +710,16 @@ class QuotingEngine:
         orders_payload: List[dict],
         current_exposure: float,
         opposite_exposure: float,
-        global_exposure: float = 0.0,
+        other_side_pending: float,
+        global_other_markets: float,
     ) -> List[dict]:
         """
         Estimate total USDC commitment for this batch and trim if it would exceed
         available budget.
 
         Calculates available budget based on two hard constraints:
-        1. Local Constraint: MAX_EXPOSURE_PER_MARKET minus local current_exposure + opposite_exposure
-        2. Global Constraint: GLOBAL_MAX_BUDGET minus TOTAL exposure across ALL markets.
+        1. Local Constraint: MAX_EXPOSURE_PER_MARKET minus local current_exposure + opposite_exposure + opposite pending buy
+        2. Global Constraint: GLOBAL_MAX_BUDGET minus TOTAL exposure across ALL OTHER markets minus local exposures and opposite pending buy
         """
         if not orders_payload:
             return orders_payload
@@ -725,15 +727,13 @@ class QuotingEngine:
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
         global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
         
-        # Local available space
-        local_used = current_exposure + opposite_exposure
+        # Local available space (Excluding THIS engine's current pending BUYs, as we are replacing them)
+        local_used = current_exposure + opposite_exposure + other_side_pending
         local_available = max(0.0, max_exposure - local_used)
 
         # Global available space
-        # Exclude this market's usage from global usage so we don't double count it 
-        # when evaluating the headroom available to this specific market.
-        global_other_used = max(0.0, global_exposure - local_used)
-        global_available = max(0.0, global_max_budget - global_other_used - local_used)
+        global_used = global_other_markets + local_used
+        global_available = max(0.0, global_max_budget - global_used)
 
         # The strict constraint is the smaller of the two
         available = min(local_available, global_available)
@@ -746,9 +746,13 @@ class QuotingEngine:
         if total_buy_notional <= available:
             return orders_payload
 
+        # Prevent unneeded logging if we are not attempting to place BUY orders
+        if not buy_orders:
+            return sell_orders
+
         logger.warning(
             f"[{self.token_id[:6]}] 本地资金预检: BUY 总名义=${total_buy_notional:.2f} > "
-            f"可用预算=${available:.2f} (limit={budget_limit}, used={used_notional:.2f}). "
+            f"可用预算=${available:.2f} (local_used={local_used:.2f}, global_used={global_used:.2f}). "
             f"正在自动缩减挂单."
         )
 
@@ -798,6 +802,24 @@ class QuotingEngine:
             round(float(size), 4),
         )
 
+    async def _update_pending_buy_notional(self):
+        """Calculate and update the total notional value of active BUY orders in inventory_state."""
+        if self.is_yes_token is None:
+            return
+        
+        total_buy_notional = 0.0
+        for meta in self.active_orders.values():
+            if str(meta.get("side", "")).upper() == "BUY":
+                price = float(meta.get("price", 0.0))
+                size = float(meta.get("size", 0.0))
+                total_buy_notional += price * size
+
+        await inventory_state.update_pending_buy_notional(
+            market_id=self.condition_id,
+            is_yes=self.is_yes_token,
+            notional=total_buy_notional
+        )
+
     async def sync_orders_diff(self, desired_orders: List[dict]):
         desired_by_sig: Dict[Tuple[str, float, float], List[dict]] = defaultdict(list)
         for o in desired_orders:
@@ -839,6 +861,9 @@ class QuotingEngine:
             logger.info(f"[{self.token_id[:6]}] Diff quoting: create missing={len(to_create)}")
             await self.place_orders(to_create)
 
+        # 4) Update pending buy notional tracker
+        await self._update_pending_buy_notional()
+
     async def place_orders(self, orders_payload: List[dict]):
         """Executes the placement of multiple orders concurrently through OMS"""
         tasks = []
@@ -864,6 +889,8 @@ class QuotingEngine:
     async def cancel_all_orders(self):
         """Cancel current active grid and ensure no orphan orders remain."""
         if not self.active_orders:
+            # Still update notional to 0 just to be sure
+            await self._update_pending_buy_notional()
             return
             
         order_ids = list(self.active_orders.keys())
@@ -879,6 +906,8 @@ class QuotingEngine:
                 # Downgraded from CRITICAL: OMS already handles matched-order scenarios
                 # at INFO level. Remaining failures are transient network / circuit-breaker.
                 logger.warning(f"[{self.token_id[:6]}] Cancel failed for order {order_id} (reason: {success}). Will retry next tick.")
+                
+        await self._update_pending_buy_notional()
 
 async def start_quoting_engine(condition_id: str, token_id: str):
     engine = QuotingEngine(condition_id, token_id)

@@ -87,6 +87,8 @@ class InventoryStateManager:
         snapshot = {
             "yes_exposure": yes_exposure,
             "no_exposure": no_exposure,
+            "pending_yes_buy_notional": 0.0,
+            "pending_no_buy_notional": 0.0,
             "realized_pnl": realized_pnl,
             "last_local_fill_timestamp": 0.0,
             "updated_at": time.time(),
@@ -99,12 +101,45 @@ class InventoryStateManager:
         return await self.ensure_loaded(market_id)
 
     async def get_global_exposure(self) -> float:
-        """Calculate total USDC exposure across all tracked markets."""
+        """Calculate total USDC exposure across all tracked markets (including pending buy orders)."""
         total = 0.0
         async with self._lock:
             for snap in self._state.values():
-                total += float(snap.get("yes_exposure", 0.0)) + float(snap.get("no_exposure", 0.0))
+                total += (
+                    float(snap.get("yes_exposure", 0.0))
+                    + float(snap.get("no_exposure", 0.0))
+                    + float(snap.get("pending_yes_buy_notional", 0.0))
+                    + float(snap.get("pending_no_buy_notional", 0.0))
+                )
         return total
+
+    async def get_global_exposure_excluding(self, market_id: str) -> float:
+        """Calculate total USDC exposure across all markets EXCEPT the specified one."""
+        total = 0.0
+        async with self._lock:
+            for m_id, snap in self._state.items():
+                if m_id == market_id:
+                    continue
+                total += (
+                    float(snap.get("yes_exposure", 0.0))
+                    + float(snap.get("no_exposure", 0.0))
+                    + float(snap.get("pending_yes_buy_notional", 0.0))
+                    + float(snap.get("pending_no_buy_notional", 0.0))
+                )
+        return total
+
+    async def update_pending_buy_notional(
+        self, market_id: str, is_yes: bool, notional: float
+    ) -> None:
+        """Update the total notional value of all active BUY orders for a token."""
+        await self.ensure_loaded(market_id)
+        async with self._lock:
+            snap = self._state[market_id]
+            if is_yes:
+                snap["pending_yes_buy_notional"] = float(max(0.0, notional))
+            else:
+                snap["pending_no_buy_notional"] = float(max(0.0, notional))
+            snap["updated_at"] = time.time()
 
     async def get_last_local_fill_timestamp(self, market_id: str) -> float:
         await self.ensure_loaded(market_id)
