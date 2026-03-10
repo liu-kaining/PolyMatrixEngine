@@ -198,7 +198,7 @@ class MarketDataGateway:
                 "custom_feature_enabled": True,
             }
             await self.ws.send(json.dumps(sub_msg))
-            logger.info("Resubscribed to active markets on Market WS.")
+            logger.debug("Resubscribed to active markets on Market WS.")
 
     async def _listen(self):
         while True:
@@ -210,6 +210,9 @@ class MarketDataGateway:
                 message = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
                 
                 if message == "PONG":
+                    continue
+                if message == "PING":
+                    await self.ws.send("PONG")
                     continue
 
                 data = json.loads(message)

@@ -85,7 +85,7 @@ class UserStreamGateway:
                 "type": "user"
             }
             await self.ws.send(json.dumps(sub_msg))
-            logger.info(f"User WS Subscribed to markets: {self.subscribed_markets}")
+            logger.debug(f"User WS Subscribed to markets: {self.subscribed_markets}")
 
     async def _listen(self):
         while True:
@@ -98,6 +98,9 @@ class UserStreamGateway:
                 message = await asyncio.wait_for(self.ws.recv(), timeout=45.0)
                 
                 if message == "PONG":
+                    continue
+                if message == "PING":
+                    await self.ws.send("PONG")
                     continue
                 data = json.loads(message)
                 await self.process_message(data)
