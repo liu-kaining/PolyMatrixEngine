@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import httpx
 import websockets
 from typing import List, Set, Dict, Optional
@@ -138,11 +139,17 @@ class MarketDataGateway:
 
     async def connect(self):
         while True:
+            connected_at = None
             try:
                 logger.debug(f"Connecting to Polymarket WS: {self.ws_url}")
-                async with websockets.connect(self.ws_url, ping_interval=None) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                ) as ws:
                     self.ws = ws
-                    self.reconnect_delay = 1.0
+                    connected_at = time.monotonic()
                     logger.info("Market WS connected.")
 
                     self.ping_task = asyncio.create_task(self._heartbeat())
@@ -151,17 +158,31 @@ class MarketDataGateway:
                         await self._resubscribe()
 
                     await self._listen()
+                    raise RuntimeError("Market WS listen loop exited unexpectedly without exception.")
 
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Market WS connection closed: {e}. Reconnecting...")
+                logger.exception(
+                    "Market WS connection closed. code=%s reason=%s clean=%s",
+                    getattr(e, "code", None),
+                    getattr(e, "reason", ""),
+                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
+                )
             except Exception as e:
-                logger.error(f"Market WS error: {e}. Reconnecting...")
+                logger.exception(f"Market WS connect loop crashed: {e}")
             finally:
                 if self.ping_task:
                     self.ping_task.cancel()
                     self.ping_task = None
                 self.ws = None
-                logger.debug(f"Market WS reconnecting in {self.reconnect_delay}s...")
+                connected_for = 0.0
+                if connected_at is not None:
+                    connected_for = max(0.0, time.monotonic() - connected_at)
+                if connected_for >= 60.0:
+                    self.reconnect_delay = 1.0
+                logger.warning(
+                    f"Market WS reconnecting in {self.reconnect_delay:.1f}s "
+                    f"(last_session={connected_for:.1f}s)."
+                )
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
@@ -175,7 +196,7 @@ class MarketDataGateway:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Heartbeat error: {e}")
+            logger.exception(f"Market WS heartbeat error: {e}")
 
     async def subscribe(self, asset_ids: List[str]):
         self.subscribed_markets.update(asset_ids)
@@ -186,8 +207,12 @@ class MarketDataGateway:
                 "operation": "subscribe",
                 "custom_feature_enabled": True,
             }
-            await self.ws.send(json.dumps(sub_msg))
-            logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
+            try:
+                await self.ws.send(json.dumps(sub_msg))
+                logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
+            except Exception as e:
+                logger.exception(f"Market WS subscribe send failed: {e}")
+                raise
 
     async def _resubscribe(self):
         if self.ws is not None and not getattr(self.ws, "closed", False) and self.subscribed_markets:
@@ -197,17 +222,23 @@ class MarketDataGateway:
                 "operation": "subscribe",
                 "custom_feature_enabled": True,
             }
-            await self.ws.send(json.dumps(sub_msg))
-            logger.debug("Resubscribed to active markets on Market WS.")
+            try:
+                await self.ws.send(json.dumps(sub_msg))
+                logger.debug("Resubscribed to active markets on Market WS.")
+            except Exception as e:
+                logger.exception(f"Market WS resubscribe send failed: {e}")
+                raise
 
     async def _listen(self):
         while True:
             if getattr(self.ws, "closed", True):
-                break
+                raise RuntimeError("Market WS socket marked closed before recv()")
             try:
                 # Add strict receive timeout. If no message (tick or PONG) arrives for 30s,
                 # the connection is a zombie. Force an exception to trigger reconnection.
                 message = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
                 
                 if message == "PONG":
                     continue
@@ -215,7 +246,13 @@ class MarketDataGateway:
                     await self.ws.send("PONG")
                     continue
 
-                data = json.loads(message)
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    logger.exception(
+                        f"Market WS JSON decode failed: {e}. Raw message (first 200 chars): {str(message)[:200]}"
+                    )
+                    continue
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
@@ -229,13 +266,19 @@ class MarketDataGateway:
                             await redis_client.publish(f"tick:{aid}", snap)
 
             except asyncio.TimeoutError:
-                logger.error("Market WS silent drop detected (30s without message). Forcing reconnect...")
-                break # Break out of listen loop, allowing connect() to handle reconnection
-            except json.JSONDecodeError:
-                logger.debug(f"Non-JSON WS message (ignored): {message[:80]}")
+                logger.exception("Market WS silent drop detected (30s without message). Forcing reconnect...")
+                raise
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.exception(
+                    "Market WS recv closed. code=%s reason=%s clean=%s",
+                    getattr(e, "code", None),
+                    getattr(e, "reason", ""),
+                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
+                )
+                raise
             except Exception as e:
-                logger.error(f"Error processing market WS message: {e}")
-                break
+                logger.exception(f"Error processing market WS message: {e}")
+                raise
 
 
 md_gateway = MarketDataGateway()

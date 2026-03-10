@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import websockets
 from typing import Dict, Set
 
@@ -30,11 +31,17 @@ class UserStreamGateway:
             await asyncio.sleep(2.0)
             
         while True:
+            connected_at = None
             try:
                 logger.debug(f"Connecting to Polymarket User WS: {self.ws_url}")
-                async with websockets.connect(self.ws_url, ping_interval=None) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                ) as ws:
                     self.ws = ws
-                    self.reconnect_delay = 1.0
+                    connected_at = time.monotonic()
                     logger.info("User WS connected.")
                     
                     self.ping_task = asyncio.create_task(self._heartbeat())
@@ -43,18 +50,31 @@ class UserStreamGateway:
                         await self._resubscribe()
                     
                     await self._listen()
+                    raise RuntimeError("User WS listen loop exited unexpectedly without exception.")
                     
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"User WS connection closed: {e}. Reconnecting...")
+                logger.exception(
+                    "User WS connection closed. code=%s reason=%s clean=%s",
+                    getattr(e, "code", None),
+                    getattr(e, "reason", ""),
+                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
+                )
             except Exception as e:
-                logger.error(f"User WS error: {e}. Reconnecting...")
+                logger.exception(f"User WS connect loop crashed: {e}")
             finally:
                 if self.ping_task:
                     self.ping_task.cancel()
                     self.ping_task = None
                 self.ws = None
-                
-                logger.debug(f"User WS reconnecting in {self.reconnect_delay} seconds...")
+                connected_for = 0.0
+                if connected_at is not None:
+                    connected_for = max(0.0, time.monotonic() - connected_at)
+                if connected_for >= 60.0:
+                    self.reconnect_delay = 1.0
+                logger.warning(
+                    f"User WS reconnecting in {self.reconnect_delay:.1f}s "
+                    f"(last_session={connected_for:.1f}s)."
+                )
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
@@ -67,6 +87,8 @@ class UserStreamGateway:
                     await self.ws.send("PING")
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            logger.exception(f"User WS heartbeat error: {e}")
 
     async def subscribe(self, condition_id: str):
         self.subscribed_markets.add(condition_id)
@@ -84,34 +106,52 @@ class UserStreamGateway:
                 "markets": list(self.subscribed_markets),
                 "type": "user"
             }
-            await self.ws.send(json.dumps(sub_msg))
-            logger.debug(f"User WS Subscribed to markets: {self.subscribed_markets}")
+            try:
+                await self.ws.send(json.dumps(sub_msg))
+                logger.debug(f"User WS Subscribed to markets: {self.subscribed_markets}")
+            except Exception as e:
+                logger.exception(f"User WS subscribe send failed: {e}")
+                raise
 
     async def _listen(self):
         while True:
             if getattr(self.ws, "closed", True):
-                break
+                raise RuntimeError("User WS socket marked closed before recv()")
             try:
                 # Add strict receive timeout. If no message (trade/order or PONG) arrives for 45s,
                 # the connection is a zombie. Force an exception to trigger reconnection.
                 # User stream is less chatty, so 45s is safer.
                 message = await asyncio.wait_for(self.ws.recv(), timeout=45.0)
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
                 
                 if message == "PONG":
                     continue
                 if message == "PING":
                     await self.ws.send("PONG")
                     continue
-                data = json.loads(message)
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    logger.exception(
+                        f"User WS JSON decode failed: {e}. Raw message (first 200 chars): {str(message)[:200]}"
+                    )
+                    continue
                 await self.process_message(data)
             except asyncio.TimeoutError:
-                logger.error("User WS silent drop detected (45s without message). Forcing reconnect...")
-                break
-            except json.JSONDecodeError:
-                pass
+                logger.exception("User WS silent drop detected (45s without message). Forcing reconnect...")
+                raise
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.exception(
+                    "User WS recv closed. code=%s reason=%s clean=%s",
+                    getattr(e, "code", None),
+                    getattr(e, "reason", ""),
+                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
+                )
+                raise
             except Exception as e:
-                logger.error(f"Error processing User WS message: {e}")
-                break
+                logger.exception(f"Error processing User WS message: {e}")
+                raise
 
     async def process_message(self, data: dict):
         # We need to handle trades and cancellations carefully
