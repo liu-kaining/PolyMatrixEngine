@@ -231,8 +231,6 @@ class MarketDataGateway:
 
     async def _listen(self):
         while True:
-            if getattr(self.ws, "closed", True):
-                raise RuntimeError("Market WS socket marked closed before recv()")
             try:
                 # Add strict receive timeout. If no message (tick or PONG) arrives for 30s,
                 # the connection is a zombie. Force an exception to trigger reconnection.

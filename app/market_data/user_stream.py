@@ -115,8 +115,6 @@ class UserStreamGateway:
 
     async def _listen(self):
         while True:
-            if getattr(self.ws, "closed", True):
-                raise RuntimeError("User WS socket marked closed before recv()")
             try:
                 # Add strict receive timeout. If no message (trade/order or PONG) arrives for 45s,
                 # the connection is a zombie. Force an exception to trigger reconnection.
