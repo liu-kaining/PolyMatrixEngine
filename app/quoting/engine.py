@@ -351,10 +351,20 @@ class QuotingEngine:
             )
             target_size = shrunk_size
 
-        # 4. Final floor check (Polymarket minimum)
+        # 4. Rewards-mode guardrail: avoid charity quoting when shrunk below rewards_min_size.
+        if auto_tune and self.rewards_min_size > 0 and target_size < self.rewards_min_size:
+            logger.warning(
+                f"[{self.token_id[:6]}] [REWARDS] Shrunk size {target_size:.1f} below rewards_min_size "
+                f"{self.rewards_min_size:.1f}. Dropping BUY order to avoid charity quoting."
+            )
+            return 0.0
+
+        # 5. Final floor check (Polymarket minimum)
         if target_size < 5.0:
             if target_size > 0:
-                logger.warning(f"[{self.token_id[:6]}] [BUDGET] Final size {target_size:.1f} < 5.0. Dropping BUY order.")
+                logger.warning(
+                    f"[{self.token_id[:6]}] [BUDGET] Final size {target_size:.1f} < 5.0. Dropping BUY order."
+                )
             return 0.0
 
         return round(target_size, 1)
