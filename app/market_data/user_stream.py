@@ -45,10 +45,7 @@ class UserStreamGateway:
                     logger.info("User WS connected.")
                     
                     self.ping_task = asyncio.create_task(self._heartbeat())
-                    
-                    if self.subscribed_markets:
-                        await self._resubscribe()
-                    
+                    await self._authenticate()
                     await self._listen()
                     raise RuntimeError("User WS listen loop exited unexpectedly without exception.")
                     
@@ -90,28 +87,29 @@ class UserStreamGateway:
         except Exception as e:
             logger.exception(f"User WS heartbeat error: {e}")
 
-    async def subscribe(self, condition_id: str):
-        self.subscribed_markets.add(condition_id)
-        await self._resubscribe()
-        
-    async def _resubscribe(self):
-        if self.ws is not None and not getattr(self.ws, "closed", False) and self.subscribed_markets:
-            creds = oms.client.creds
-            sub_msg = {
+    async def _authenticate(self):
+        """Send signed auth (no plaintext secret). User Stream pushes all orders after auth."""
+        try:
+            headers = oms.create_auth_headers("GET", "/ws")
+            auth_msg = {
+                "type": "auth",
                 "auth": {
-                    "apiKey": creds.api_key,
-                    "secret": creds.api_secret,
-                    "passphrase": creds.api_passphrase
+                    "key": headers["POLY_API_KEY"],
+                    "signature": headers["POLY_SIGNATURE"],
+                    "timestamp": headers["POLY_TIMESTAMP"],
+                    "passphrase": headers["POLY_PASSPHRASE"],
                 },
-                "markets": list(self.subscribed_markets),
-                "type": "user"
             }
-            try:
-                await self.ws.send(json.dumps(sub_msg))
-                logger.debug(f"User WS Subscribed to markets: {self.subscribed_markets}")
-            except Exception as e:
-                logger.exception(f"User WS subscribe send failed: {e}")
-                raise
+            await self.ws.send(json.dumps(auth_msg))
+            logger.info("User WS authenticated (signed auth sent).")
+        except Exception as e:
+            logger.exception("User WS auth failed: %s", e)
+            raise
+
+    async def subscribe(self, condition_id: str):
+        """Track condition_id locally only. Do NOT send subscribe to User WS."""
+        self.subscribed_markets.add(condition_id)
+        logger.info("User WS: added condition_id to local tracking: %s", condition_id[:20] + "..." if len(condition_id) > 20 else condition_id)
 
     async def _listen(self):
         while True:

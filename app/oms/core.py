@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, RequestArgs
+from py_clob_client.headers.headers import create_level_2_headers
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
@@ -99,6 +100,16 @@ class OrderManagementSystem:
                 logger.error(f"Failed to init ClobClient: {e}")
                 
         self.circuit_breaker = CircuitBreaker()
+
+    def create_auth_headers(self, method: str, request_path: str) -> Dict[str, str]:
+        """
+        Build L2 HMAC-signed headers for WebSocket auth (no plaintext secret).
+        Used by User Stream: GET /ws.
+        """
+        if not self.client or not self.client.signer or not self.client.creds:
+            raise RuntimeError("ClobClient not initialized or missing signer/creds")
+        request_args = RequestArgs(method=method, request_path=request_path, body="")
+        return create_level_2_headers(self.client.signer, self.client.creds, request_args)
 
     async def create_order(self, condition_id: str, token_id: str, side: OrderSide, price: float, size: float) -> Optional[str]:
         """Creates an order: DB Pending -> API Call -> DB Open/Failed"""

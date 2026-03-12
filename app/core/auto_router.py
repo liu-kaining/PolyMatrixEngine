@@ -16,6 +16,9 @@ from app.core.market_lifecycle import start_market_making_impl, get_active_route
 
 logger = logging.getLogger(__name__)
 
+# Per-market start time for min-hold enforcement (rewards threshold)
+market_start_times: Dict[str, float] = {}
+
 # Global health metrics for the dashboard/API
 router_state = {
     "last_scan_ts": 0.0,
@@ -200,29 +203,45 @@ async def _rebalance(
     active_set: Set[str],
 ) -> None:
     """
-    Evict markets not in target by sending graceful_exit, then calculate available 
-    slots and start new markets to keep capital dynamically deployed.
+    Evict markets not in target by sending graceful_exit (only after min_hold_sec),
+    then calculate available slots and start new markets.
     """
     max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
+    min_hold_sec = float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 12)) * 3600.0
     target_ids = {m["condition_id"] for m in target_markets}
+    now = time.time()
 
-    # 1. Evict: Send graceful_exit to markets that dropped out of Top N
+    # 1. Evict: Only send graceful_exit if runtime >= min_hold_sec (定力锁)
+    retained_active = active_set.intersection(target_ids)
+    actually_retained: Set[str] = set(retained_active)
+
     for cid in list(active_set):
         if cid not in target_ids:
-            logger.info(
-                "[AutoRouter] Evicting %s (dropped from Top N). Sending graceful_exit signal.",
-                cid[:10],
-            )
-            try:
-                await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
-            except Exception as e:
-                logger.warning("[AutoRouter] Failed to publish graceful_exit for %s: %s", cid[:10], e)
+            start_ts = market_start_times.get(cid, now)
+            runtime = now - start_ts
+            if runtime < min_hold_sec:
+                actually_retained.add(cid)
+                logger.info(
+                    "[AutoRouter] 定力锁: %s dropped from Top N but runtime %.1fh < %.1fh min hold. Retaining.",
+                    cid[:10], runtime / 3600.0, min_hold_sec / 3600.0,
+                )
+            else:
+                logger.info(
+                    "[AutoRouter] Evicting %s (dropped from Top N, runtime %.1fh >= min hold). Sending graceful_exit.",
+                    cid[:10], runtime / 3600.0,
+                )
+                try:
+                    await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
+                except Exception as e:
+                    logger.warning("[AutoRouter] Failed to publish graceful_exit for %s: %s", cid[:10], e)
 
-    # 2. Add: Start new markets while staying under the maximum capital concurrent slots
-    # Note: Markets in GRACEFUL_EXIT only SELL, they do not consume new USDC buying power.
-    # Therefore, we only count retained active targets against our slot limit.
-    retained_active = active_set.intersection(target_ids)
-    slots_available = max_markets - len(retained_active)
+    # Clean up market_start_times for cids no longer in active_set
+    for cid in list(market_start_times.keys()):
+        if cid not in active_set:
+            del market_start_times[cid]
+
+    # 2. Add: Start new markets based on actually_retained slot count
+    slots_available = max_markets - len(actually_retained)
 
     for m in target_markets:
         cid = m["condition_id"]
@@ -233,6 +252,7 @@ async def _rebalance(
         try:
             await start_market_making_impl(cid)
             active_set.add(cid)
+            market_start_times[cid] = time.time()
             slots_available -= 1
             logger.info(
                 "[AutoRouter] Started market %s (ROI: %.4f).",

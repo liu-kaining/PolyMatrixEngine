@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     AUTO_ROUTER_ENABLED: bool = False
     AUTO_ROUTER_MAX_MARKETS: int = 4
     AUTO_ROUTER_SCAN_INTERVAL_SEC: int = 3600
+    AUTO_ROUTER_MIN_HOLD_HOURS: float = 12.0  # Min hours before evicting (for rewards threshold)
 
     class Config:
         env_file = ".env"
