@@ -101,20 +101,22 @@ class UserStreamGateway:
             logger.exception(f"User WS heartbeat error: {e}")
 
     async def _authenticate(self):
-        """Send signed auth (no plaintext secret). User Stream pushes all orders after auth."""
+        """
+        Send subscription per Polymarket docs: type=user, auth={apiKey, secret, passphrase}.
+        WSS is TLS-encrypted; omit markets to receive all user order/trade events.
+        """
         try:
-            headers = oms.create_auth_headers("GET", "/ws")
-            auth_msg = {
-                "type": "auth",
+            creds = oms.client.creds
+            sub_msg = {
+                "type": "user",
                 "auth": {
-                    "key": headers["POLY_API_KEY"],
-                    "signature": headers["POLY_SIGNATURE"],
-                    "timestamp": headers["POLY_TIMESTAMP"],
-                    "passphrase": headers["POLY_PASSPHRASE"],
+                    "apiKey": creds.api_key,
+                    "secret": creds.api_secret,
+                    "passphrase": creds.api_passphrase,
                 },
             }
-            await self.ws.send(json.dumps(auth_msg))
-            logger.info("User WS authenticated (signed auth sent).")
+            await self.ws.send(json.dumps(sub_msg))
+            logger.info("User WS authenticated (subscription sent).")
         except Exception as e:
             logger.exception("User WS auth failed: %s", e)
             raise
