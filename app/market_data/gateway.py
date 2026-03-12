@@ -62,7 +62,7 @@ class LocalOrderbook:
                 else:
                     continue
 
-                if size == 0:
+                if abs(size) < 1e-9:
                     book.pop(price, None)
                 else:
                     book[price] = size

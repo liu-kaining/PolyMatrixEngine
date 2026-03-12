@@ -53,7 +53,10 @@ async def _mark_market_exited(condition_id: str):
                 await session.commit()
                 logger.info(f"[Supervisor] Market {condition_id[:10]} all engines terminated. Status -> exited.")
     except Exception as e:
-        logger.error(f"[Supervisor] Failed to update DB status for {condition_id[:10]}: {e}")
+        logger.exception(
+            "[Supervisor] Failed to update DB status for %s (market may show stale 'active'): %s",
+            condition_id[:10], e,
+        )
 
 async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
     """

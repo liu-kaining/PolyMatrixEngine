@@ -207,9 +207,15 @@ async def _rebalance(
     then calculate available slots and start new markets.
     """
     max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
-    min_hold_sec = float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 12)) * 3600.0
+    min_hold_sec = max(0.0, float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 12)) * 3600.0)
     target_ids = {m["condition_id"] for m in target_markets}
     now = time.time()
+
+    # 🛠️ 存量盘口强制注册（防重启状态丢失）
+    for cid in active_set:
+        if cid not in market_start_times:
+            market_start_times[cid] = now
+            logger.info("[AutoRouter] ⚡ 发现未记录时间的存量盘口，已初始化时间戳: %s", cid[:10])
 
     # 1. Evict: Only send graceful_exit if runtime >= min_hold_sec (定力锁)
     retained_active = active_set.intersection(target_ids)
@@ -217,7 +223,7 @@ async def _rebalance(
 
     for cid in list(active_set):
         if cid not in target_ids:
-            start_ts = market_start_times.get(cid, now)
+            start_ts = market_start_times[cid]  # 绝对安全（第一步已兜底注册）
             runtime = now - start_ts
             if runtime < min_hold_sec:
                 actually_retained.add(cid)
@@ -240,12 +246,12 @@ async def _rebalance(
         if cid not in active_set:
             del market_start_times[cid]
 
-    # 2. Add: Start new markets based on actually_retained slot count
-    slots_available = max_markets - len(actually_retained)
+    # 2. Add: Start new markets based on actually_retained slot count（槽位防超载）
+    slots_available = max(0, max_markets - len(actually_retained))
 
     for m in target_markets:
-        cid = m["condition_id"]
-        if cid in active_set:
+        cid = m.get("condition_id")
+        if not cid or cid in active_set:
             continue
         if slots_available <= 0:
             break

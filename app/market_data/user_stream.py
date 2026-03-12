@@ -14,6 +14,19 @@ from sqlalchemy.future import select
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_create_task(coro):
+    """Fire-and-forget with exception logging to prevent silent failures."""
+    task = asyncio.create_task(coro)
+    def _done(t):
+        try:
+            t.result()
+        except Exception as e:
+            logger.exception("User WS fire-and-forget task failed: %s", e)
+    task.add_done_callback(_done)
+    return task
+
+
 class UserStreamGateway:
     def __init__(self):
         self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
@@ -176,13 +189,13 @@ class UserStreamGateway:
                     matched_amount = float(maker.get("matched_amount", 0))
                     price = float(maker.get("price", 0))
                     if order_id:
-                        asyncio.create_task(self.handle_fill(order_id, matched_amount, price))
+                        _safe_create_task(self.handle_fill(order_id, matched_amount, price))
                         
                 # Check taker order (if we were the taker)
                 if taker_order_id:
                     size = float(data.get("size", 0))
                     price = float(data.get("price", 0))
-                    asyncio.create_task(self.handle_fill(taker_order_id, size, price))
+                    _safe_create_task(self.handle_fill(taker_order_id, size, price))
                     
         elif event_type == "order":
             # For CANCELLATION or CLOSED events, we check if it was partially filled before
@@ -191,7 +204,7 @@ class UserStreamGateway:
                 order_id = data.get("id") or data.get("order_id")
                 
                 if order_id:
-                    asyncio.create_task(self.handle_cancellation(order_id))
+                    _safe_create_task(self.handle_cancellation(order_id))
 
     async def _resolve_market_tokens(self, session, market_id: str) -> Dict[str, str] | None:
         cached = self.market_tokens.get(market_id)
