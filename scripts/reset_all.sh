@@ -8,9 +8,9 @@ echo "=== PolyMatrix Engine 彻底重置 ==="
 echo "[1/4] 停止容器、删除数据卷和镜像..."
 docker compose down -v --rmi all 2>/dev/null || docker-compose down -v --rmi all 2>/dev/null || true
 
-# 2. 删除本机 data/logs（本地运行时产生的日志）
-echo "[2/4] 删除本地日志目录..."
-rm -rf ./data/logs 2>/dev/null || true
+# 2. 删除本机 data 目录及根目录 .db 残留（含 Docker 挂载产生的 root 权限文件）
+echo "[2/4] 删除本地日志与数据残留..."
+sudo rm -rf ./data *.db 2>/dev/null || rm -rf ./data *.db 2>/dev/null || true
 
 # 3. 清理 Docker 构建缓存
 echo "[3/4] 清理 Docker 构建缓存..."
