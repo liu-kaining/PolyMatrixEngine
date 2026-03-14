@@ -536,11 +536,10 @@ class QuotingEngine:
             # Construct grid orders JSON
             orders_payload: List[dict] = []
 
-            # V3 State Machine: partial-fill aware. Uses dust-filtered exposure for mode decisions.
-            # In graceful_exit mode we force sell-only (no BUY) until exposure cleared.
-            is_long = current_exposure_for_logic >= self.liquidate_threshold
-            if self.exit_mode and current_exposure > 1.0:
-                is_long = True
+            # Two-way quoting: extreme line and exit flags (evaluated once)
+            extreme_threshold = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0)) * 0.9
+            is_extreme_long = current_exposure_for_logic >= extreme_threshold
+            force_taker_exit = self.exit_mode and current_exposure > 1.0
             cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
@@ -548,17 +547,9 @@ class QuotingEngine:
             best_bid_price = float(bids[0]["price"])
             best_ask_price = float(asks[0]["price"])
 
-            if is_long:
-                # Extreme threshold: MAX_EXPOSURE_PER_MARKET * 0.9 (e.g. 180 when cap=200).
-                # Avoids paradox where liquidate_threshold*1.5 > cap and extreme never triggers.
-                max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
-                extreme_threshold = max_exposure_per_market * 0.9
-                is_extreme_long = current_exposure_for_logic >= extreme_threshold
-                # Graceful exit (router eviction): must use Taker to guarantee fund recovery.
-                force_taker_exit = self.exit_mode and current_exposure > 1.0
-
+            # --- Line 1: SELL side (unwind / take profit / stop loss) ---
+            if current_exposure_for_logic >= 5.0 or force_taker_exit:
                 if is_extreme_long or force_taker_exit:
-                    # Extreme disaster or graceful exit: Taker panic sell to guarantee fill (no maker queue deadlock)
                     if force_taker_exit:
                         logger.warning(
                             f"[{self.token_id[:6]}] GRACEFUL EXIT: forcing EXTREME TAKER (exposure {current_exposure:.2f}). "
@@ -569,22 +560,18 @@ class QuotingEngine:
                             f"[{self.token_id[:6]}] EXTREME INVENTORY ({current_exposure:.2f} >= {extreme_threshold:.2f}). "
                             "Entering EXTREME TAKER LIQUIDATION."
                         )
-                    aggressive_ask = best_bid_price - 0.02
-                    ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
+                    ask_price = max(0.01, min(0.99, round(best_bid_price - 0.02, 2)))
                 else:
-                    # Maker unwind: earn spread by joining ask queue; avoid 1-tick spread trap.
                     logger.warning(
-                        f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= {self.liquidate_threshold:.2f}). "
-                        "Entering MAKER UNWINDING."
+                        f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
+                        "MAKER UNWINDING (earn spread)."
                     )
                     ask_price = round(fair_value + anchor_distance, 2)
                     safe_maker_floor = round(best_bid_price + self.tick_size, 2)
                     ask_price = max(safe_maker_floor, ask_price)
                     ask_price = max(0.01, min(0.99, ask_price))
 
-                target_size = max(self.base_size, 5.0)
-                sell_size = min(current_exposure, target_size)
-
+                sell_size = min(current_exposure, max(self.base_size, 5.0))
                 orders_payload.append(
                     {
                         "condition_id": self.condition_id,
@@ -594,25 +581,21 @@ class QuotingEngine:
                         "size": sell_size,
                     }
                 )
-
                 mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
                 logger.info(
                     f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
                     f"Exposure {current_exposure:.2f}"
                 )
 
-            else:
+            # --- Line 2: BUY side (build position / take liquidity when safe) ---
+            if not is_extreme_long and not self.exit_mode:
                 if cross_token_locked:
                     logger.warning(
                         f"[{self.token_id[:6]}] CROSS-TOKEN LOCK: opposite {opposite_side} exposure "
-                        f"{opposite_exposure:.2f} >= BASE_ORDER_SIZE({self.base_size:.2f}). "
+                        f"{opposite_exposure:.2f} >= liquidate_threshold({self.liquidate_threshold:.2f}). "
                         f"Suspend BUY on {own_side}, keep cash for {opposite_side} liquidation."
                     )
                 else:
-                    # State A: neutral / light exposure — 少而精，高概率赚钱。
-                    # We only place BUY at fair_value - spread/2 (and below). No joining best_bid: we get filled only when
-                    # someone sells to us at our price (positive edge per fill). 不轻易出手，一出手就要能高概率赚钱。
-                    # Optional: first level at most 1 tick below best_bid so we get hit first when someone sells (still ~1¢ edge).
                     one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
                     seen_bid_prices: set = set()
                     for i in range(self.grid_levels):
@@ -622,8 +605,6 @@ class QuotingEngine:
                             bid_price = round(max(bid_price, best_bid_price - 0.01), 2)
                             bid_price = max(0.01, min(0.99, bid_price))
 
-                        # Crosses-the-book guard: BUY price must be <= best_ask - tick,
-                        # and never go below the protocol's 0.01 floor.
                         max_buy = max(0.01, round(best_ask_price - self.tick_size, 2))
                         if bid_price > max_buy:
                             logger.warning(
@@ -638,7 +619,7 @@ class QuotingEngine:
 
                         effective_size = self._compute_effective_size(bid_price)
                         if effective_size <= 0:
-                            continue  # budget too tight for this level; skip
+                            continue
                         orders_payload.append(
                             {
                                 "condition_id": self.condition_id,
@@ -649,13 +630,12 @@ class QuotingEngine:
                             }
                         )
 
-                        # SELL side is intentionally skipped in neutral state to avoid inefficient capital lockup
-                        # when we have very limited test capital and no shorting/minting capacity.
-                        # Once inventory >= LIQUIDATE_THRESHOLD, the engine automatically switches
-                        # to aggressive SELL mode above.
-
             mode = "GRACEFUL_EXIT" if self.exit_mode else (
-                "LIQUIDATING" if is_long else ("LOCKED_BY_OPPOSITE" if cross_token_locked else "QUOTING")
+                "EXTREME_LIQUIDATING" if is_extreme_long else (
+                    "LOCKED_BY_OPPOSITE" if cross_token_locked else (
+                        "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
+                    )
+                )
             )
 
             # Rewards eligibility: check size and spread vs official requirements
