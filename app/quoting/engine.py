@@ -59,9 +59,8 @@ class QuotingEngine:
         # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
         # Polymarket requires minimum order size 5, enforce that here.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-        # Panic threshold: exposure >= this triggers AGGRESSIVE SELL.
-        # Raised to BASE_ORDER_SIZE * 0.6 (min 15.0) for more tolerance before liquidation.
-        self.liquidate_threshold = max(15.0, self.base_size * 0.6)
+        # Panic threshold: exposure >= this triggers unwind. base_size * 2.0 = hold 2 orders before defense.
+        self.liquidate_threshold = self.base_size * 2.0
         
         # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
         self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
@@ -331,9 +330,10 @@ class QuotingEngine:
         total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
-        # 1. Determine target size
+        # 1. Determine target size: max(base_size, rewards_min*1.05) when rewards exist
         if auto_tune and self.rewards_min_size > 0:
-            target_size = max(5.0, round(self.rewards_min_size * 1.05, 1))
+            rewards_target = max(5.0, round(self.rewards_min_size * 1.05, 1))
+            target_size = max(self.base_size, rewards_target)
         else:
             target_size = self.base_size
 
@@ -549,16 +549,37 @@ class QuotingEngine:
             best_ask_price = float(asks[0]["price"])
 
             if is_long:
-                # State B: Long inventory → aggressive sell to unwind
-                logger.warning(
-                    f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= {self.liquidate_threshold:.2f}). "
-                    "Entering AGGRESSIVE SELL MODE."
-                )
+                # Extreme threshold: MAX_EXPOSURE_PER_MARKET * 0.9 (e.g. 180 when cap=200).
+                # Avoids paradox where liquidate_threshold*1.5 > cap and extreme never triggers.
+                max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+                extreme_threshold = max_exposure_per_market * 0.9
+                is_extreme_long = current_exposure_for_logic >= extreme_threshold
+                # Graceful exit (router eviction): must use Taker to guarantee fund recovery.
+                force_taker_exit = self.exit_mode and current_exposure > 1.0
 
-                # In LIQUIDATING: allow taker — price 2 ticks below best_bid to hit bids and guarantee fill
-                aggressive_ask = best_bid_price - 0.02
-                ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
-                # Crosses-the-book guard bypassed in LIQUIDATING to allow taker (no maker-only clamp)
+                if is_extreme_long or force_taker_exit:
+                    # Extreme disaster or graceful exit: Taker panic sell to guarantee fill (no maker queue deadlock)
+                    if force_taker_exit:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] GRACEFUL EXIT: forcing EXTREME TAKER (exposure {current_exposure:.2f}). "
+                            "Funds must be recovered within seconds."
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] EXTREME INVENTORY ({current_exposure:.2f} >= {extreme_threshold:.2f}). "
+                            "Entering EXTREME TAKER LIQUIDATION."
+                        )
+                    aggressive_ask = best_bid_price - 0.02
+                    ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
+                else:
+                    # Maker unwind: earn spread by joining ask queue near best_ask
+                    logger.warning(
+                        f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= {self.liquidate_threshold:.2f}). "
+                        "Entering MAKER UNWINDING."
+                    )
+                    ask_price = round(fair_value + anchor_distance, 2)
+                    ask_price = max(best_ask_price - self.tick_size, ask_price)
+                    ask_price = max(0.01, min(0.99, ask_price))
 
                 target_size = max(self.base_size, 5.0)
                 sell_size = min(current_exposure, target_size)
@@ -573,8 +594,9 @@ class QuotingEngine:
                     }
                 )
 
+                mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
                 logger.info(
-                    f"[{self.token_id[:6]}] AGGRESSIVE SELL: Ask {ask_price} | Size {sell_size:.2f} | "
+                    f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
                     f"Exposure {current_exposure:.2f}"
                 )
 
@@ -723,12 +745,9 @@ class QuotingEngine:
         global_other_markets: float,
     ) -> List[dict]:
         """
-        Estimate total USDC commitment for this batch and trim if it would exceed
-        available budget.
-
-        Calculates available budget based on two hard constraints:
-        1. Local Constraint: MAX_EXPOSURE_PER_MARKET minus local current_exposure + opposite_exposure + opposite pending buy
-        2. Global Constraint: GLOBAL_MAX_BUDGET minus TOTAL exposure across ALL OTHER markets minus local exposures and opposite pending buy
+        Estimate total USDC commitment for this batch and trim BUY orders if budget exceeded.
+        SELL orders (unwind/liquidation) are NEVER trimmed — global liquidity crunch must not
+        block 平仓单; only BUY notional is capped by available budget.
         """
         if not orders_payload:
             return orders_payload
@@ -749,6 +768,7 @@ class QuotingEngine:
 
         buy_orders = [o for o in orders_payload if o["side"] == OrderSide.BUY]
         sell_orders = [o for o in orders_payload if o["side"] == OrderSide.SELL]
+        # SELL orders always pass through (liquidation/unwind must never be blocked by budget).
 
         total_buy_notional = sum(o["price"] * o["size"] for o in buy_orders)
 

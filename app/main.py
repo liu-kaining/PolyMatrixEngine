@@ -280,7 +280,7 @@ async def get_markets_status(
     rows = (await db.execute(stmt)).all()
 
     base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-    liquidate_threshold = max(15.0, base_size * 0.6)
+    liquidate_threshold = base_size * 2.0
 
     def _dust_filter(e: float) -> float:
         return 0.0 if abs(e) < 1.0 else e
