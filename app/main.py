@@ -280,11 +280,16 @@ async def get_markets_status(
     rows = (await db.execute(stmt)).all()
 
     base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-    liquidate_threshold = base_size * 0.2
+    liquidate_threshold = max(15.0, base_size * 0.6)
+
+    def _dust_filter(e: float) -> float:
+        return 0.0 if abs(e) < 1.0 else e
 
     def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
         if market_status == "suspended":
             return "SUSPENDED"
+        own_exp = _dust_filter(own_exp)
+        opp_exp = _dust_filter(opp_exp)
         if own_exp >= liquidate_threshold:
             return "LIQUIDATING"
         if opp_exp >= liquidate_threshold:

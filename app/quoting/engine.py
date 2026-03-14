@@ -59,9 +59,9 @@ class QuotingEngine:
         # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
         # Polymarket requires minimum order size 5, enforce that here.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-        # Partial-fill safety: any fragment > 20% of base_size triggers de-inventory.
-        # This prevents exposure stacking from partial fills (e.g. 4.7 out of 5.0).
-        self.liquidate_threshold = self.base_size * 0.2
+        # Panic threshold: exposure >= this triggers AGGRESSIVE SELL.
+        # Raised to BASE_ORDER_SIZE * 0.6 (min 15.0) for more tolerance before liquidation.
+        self.liquidate_threshold = max(15.0, self.base_size * 0.6)
         
         # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
         self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
@@ -85,6 +85,14 @@ class QuotingEngine:
         self.rewards_min_size: float = 0.0
         self.rewards_max_spread: float = 0.0
         self.reward_rate_per_day: float = 0.0
+
+    @staticmethod
+    def _dust_filter(exposure: float, threshold: float = 1.0) -> float:
+        """
+        Dust immunity: treat exposure < threshold as 0 for mode decisions.
+        Prevents tiny residuals from triggering CROSS-TOKEN LOCK or liquidation.
+        """
+        return 0.0 if abs(exposure) < threshold else exposure
 
     async def run(self):
         """Main loop for the quoting engine"""
@@ -444,10 +452,11 @@ class QuotingEngine:
             self.local_yes_exposure = yes_exposure
             self.local_no_exposure = no_exposure
 
-            current_exposure = 0.0
-            opposite_exposure = 0.0
             current_exposure = yes_exposure if self.is_yes_token else no_exposure
             opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
+            # Dust immunity: treat exposure < 1.0 as 0 for mode decisions (is_long, cross_token_locked)
+            current_exposure_for_logic = self._dust_filter(current_exposure)
+            opposite_exposure_for_logic = self._dust_filter(opposite_exposure)
 
             # [Graceful Exit] State Machine
             if self.exit_mode:
@@ -527,14 +536,12 @@ class QuotingEngine:
             # Construct grid orders JSON
             orders_payload: List[dict] = []
 
-            # V3 State Machine: partial-fill aware.
-            # Any fragment > 20% of base_size triggers liquidation / cross-lock,
-            # preventing exposure stacking from partial fills (e.g. 4.7 / 5.0).
+            # V3 State Machine: partial-fill aware. Uses dust-filtered exposure for mode decisions.
             # In graceful_exit mode we force sell-only (no BUY) until exposure cleared.
-            is_long = current_exposure >= self.liquidate_threshold
+            is_long = current_exposure_for_logic >= self.liquidate_threshold
             if self.exit_mode and current_exposure > 1.0:
                 is_long = True
-            cross_token_locked = opposite_exposure >= self.liquidate_threshold
+            cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
 
@@ -548,18 +555,10 @@ class QuotingEngine:
                     "Entering AGGRESSIVE SELL MODE."
                 )
 
-                aggressive_ask = min(fair_value + 0.01, best_ask_price - 0.01)
+                # In LIQUIDATING: allow taker — price 2 ticks below best_bid to hit bids and guarantee fill
+                aggressive_ask = best_bid_price - 0.02
                 ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
-
-                # Crosses-the-book guard: SELL price must be >= best_bid + tick,
-                # and never exceed the protocol's 0.99 ceiling.
-                min_sell = min(0.99, round(best_bid_price + self.tick_size, 2))
-                if ask_price < min_sell:
-                    logger.warning(
-                        f"[{self.token_id[:6]}] 触发价格极值保护: SELL {ask_price} < best_bid+tick {min_sell}, "
-                        f"已强制修正价格以避免 crosses the book"
-                    )
-                    ask_price = min_sell
+                # Crosses-the-book guard bypassed in LIQUIDATING to allow taker (no maker-only clamp)
 
                 target_size = max(self.base_size, 5.0)
                 sell_size = min(current_exposure, target_size)
