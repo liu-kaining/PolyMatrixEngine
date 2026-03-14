@@ -572,13 +572,14 @@ class QuotingEngine:
                     aggressive_ask = best_bid_price - 0.02
                     ask_price = max(0.01, min(0.99, round(aggressive_ask, 2)))
                 else:
-                    # Maker unwind: earn spread by joining ask queue near best_ask
+                    # Maker unwind: earn spread by joining ask queue; avoid 1-tick spread trap.
                     logger.warning(
                         f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= {self.liquidate_threshold:.2f}). "
                         "Entering MAKER UNWINDING."
                     )
                     ask_price = round(fair_value + anchor_distance, 2)
-                    ask_price = max(best_ask_price - self.tick_size, ask_price)
+                    safe_maker_floor = round(best_bid_price + self.tick_size, 2)
+                    ask_price = max(safe_maker_floor, ask_price)
                     ask_price = max(0.01, min(0.99, ask_price))
 
                 target_size = max(self.base_size, 5.0)
