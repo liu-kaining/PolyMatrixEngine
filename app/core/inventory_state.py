@@ -33,7 +33,7 @@ class InventoryStateManager:
         self._state: Dict[str, Dict[str, float]] = {}
         self._lock = asyncio.Lock()
         # Bounded queue to avoid unbounded memory growth under persistent DB failures.
-        self._persist_queue: asyncio.Queue[Tuple[str, float, float, float, float]] = asyncio.Queue(
+        self._persist_queue: asyncio.Queue[Tuple[str, float, float, float, float, float, float]] = asyncio.Queue(
             maxsize=1000
         )
         self._persist_task: Optional[asyncio.Task] = None
@@ -82,11 +82,15 @@ class InventoryStateManager:
             inv = result.scalar_one_or_none()
             yes_exposure = float(inv.yes_exposure or 0.0) if inv else 0.0
             no_exposure = float(inv.no_exposure or 0.0) if inv else 0.0
+            yes_capital_used = float(getattr(inv, "yes_capital_used", 0.0) or 0.0) if inv else 0.0
+            no_capital_used = float(getattr(inv, "no_capital_used", 0.0) or 0.0) if inv else 0.0
             realized_pnl = float(inv.realized_pnl or 0.0) if inv else 0.0
 
         snapshot = {
             "yes_exposure": yes_exposure,
             "no_exposure": no_exposure,
+            "yes_capital_used": yes_capital_used,
+            "no_capital_used": no_capital_used,
             "pending_yes_buy_notional": 0.0,
             "pending_no_buy_notional": 0.0,
             "realized_pnl": realized_pnl,
@@ -100,29 +104,29 @@ class InventoryStateManager:
     async def get_snapshot(self, market_id: str) -> Dict[str, float]:
         return await self.ensure_loaded(market_id)
 
-    async def get_global_exposure(self) -> float:
-        """Calculate total USDC exposure across all tracked markets (including pending buy orders)."""
+    async def get_global_used_dollars(self) -> float:
+        """Total USDC used across all markets (capital_used + pending buy notional). Units: Dollars."""
         total = 0.0
         async with self._lock:
             for snap in self._state.values():
                 total += (
-                    float(snap.get("yes_exposure", 0.0))
-                    + float(snap.get("no_exposure", 0.0))
+                    float(snap.get("yes_capital_used", 0.0))
+                    + float(snap.get("no_capital_used", 0.0))
                     + float(snap.get("pending_yes_buy_notional", 0.0))
                     + float(snap.get("pending_no_buy_notional", 0.0))
                 )
         return total
 
-    async def get_global_exposure_excluding(self, market_id: str) -> float:
-        """Calculate total USDC exposure across all markets EXCEPT the specified one."""
+    async def get_global_used_dollars_excluding(self, market_id: str) -> float:
+        """Total USDC used across all markets EXCEPT the specified one. Units: Dollars."""
         total = 0.0
         async with self._lock:
             for m_id, snap in self._state.items():
                 if m_id == market_id:
                     continue
                 total += (
-                    float(snap.get("yes_exposure", 0.0))
-                    + float(snap.get("no_exposure", 0.0))
+                    float(snap.get("yes_capital_used", 0.0))
+                    + float(snap.get("no_capital_used", 0.0))
                     + float(snap.get("pending_yes_buy_notional", 0.0))
                     + float(snap.get("pending_no_buy_notional", 0.0))
                 )
@@ -164,23 +168,39 @@ class InventoryStateManager:
             snap = self._state[market_id]
             yes_exposure = float(snap["yes_exposure"])
             no_exposure = float(snap["no_exposure"])
+            yes_capital_used = float(snap.get("yes_capital_used", 0.0))
+            no_capital_used = float(snap.get("no_capital_used", 0.0))
             realized_pnl = float(snap["realized_pnl"])
 
             if side_u == "BUY":
+                cost = fill_price * filled_size
                 if is_yes:
                     yes_exposure += filled_size
+                    yes_capital_used += cost
                 else:
                     no_exposure += filled_size
-                realized_pnl -= fill_price * filled_size
+                    no_capital_used += cost
+                realized_pnl -= cost
             elif side_u == "SELL":
                 if is_yes:
+                    # Average-cost reduction
+                    if yes_exposure > 1e-9:
+                        cost_basis = yes_capital_used / yes_exposure
+                        yes_capital_used -= cost_basis * filled_size
+                    yes_capital_used = max(0.0, yes_capital_used)
                     yes_exposure -= filled_size
                 else:
+                    if no_exposure > 1e-9:
+                        cost_basis = no_capital_used / no_exposure
+                        no_capital_used -= cost_basis * filled_size
+                    no_capital_used = max(0.0, no_capital_used)
                     no_exposure -= filled_size
                 realized_pnl += fill_price * filled_size
 
             snap["yes_exposure"] = yes_exposure
             snap["no_exposure"] = no_exposure
+            snap["yes_capital_used"] = yes_capital_used
+            snap["no_capital_used"] = no_capital_used
             snap["realized_pnl"] = realized_pnl
             snap["last_local_fill_timestamp"] = now_ts
             snap["updated_at"] = now_ts
@@ -195,6 +215,8 @@ class InventoryStateManager:
                     market_id,
                     updated["yes_exposure"],
                     updated["no_exposure"],
+                    updated["yes_capital_used"],
+                    updated["no_capital_used"],
                     updated["realized_pnl"],
                     updated["updated_at"],
                 )
@@ -212,17 +234,26 @@ class InventoryStateManager:
         await self.ensure_loaded(market_id)
         async with self._lock:
             snap = self._state[market_id]
+            old_yes = float(snap["yes_exposure"])
+            old_no = float(snap["no_exposure"])
             snap["yes_exposure"] = float(yes_exposure)
             snap["no_exposure"] = float(no_exposure)
+            # Proportional adjustment of capital_used when exposure overwritten by API
+            if old_yes > 1e-9:
+                snap["yes_capital_used"] = float(snap.get("yes_capital_used", 0.0)) * (yes_exposure / old_yes)
+            else:
+                snap["yes_capital_used"] = 0.0
+            if old_no > 1e-9:
+                snap["no_capital_used"] = float(snap.get("no_capital_used", 0.0)) * (no_exposure / old_no)
+            else:
+                snap["no_capital_used"] = 0.0
             snap["updated_at"] = time.time()
-            # Keep last_local_fill_timestamp unchanged for guard logic.
             return dict(snap)
 
     async def _persist_worker(self) -> None:
         while True:
-            market_id, yes_exposure, no_exposure, realized_pnl, snapshot_ts = await self._persist_queue.get()
+            market_id, yes_exposure, no_exposure, yes_capital_used, no_capital_used, realized_pnl, snapshot_ts = await self._persist_queue.get()
             try:
-                # Drop stale queued writes if a newer in-memory snapshot already exists.
                 async with self._lock:
                     current = self._state.get(market_id)
                     if current and float(current.get("updated_at", 0.0)) > float(snapshot_ts):
@@ -240,12 +271,16 @@ class InventoryStateManager:
                             market_id=market_id,
                             yes_exposure=yes_exposure,
                             no_exposure=no_exposure,
+                            yes_capital_used=yes_capital_used,
+                            no_capital_used=no_capital_used,
                             realized_pnl=realized_pnl,
                         )
                         session.add(inv)
                     else:
                         inv.yes_exposure = yes_exposure
                         inv.no_exposure = no_exposure
+                        inv.yes_capital_used = yes_capital_used
+                        inv.no_capital_used = no_capital_used
                         inv.realized_pnl = realized_pnl
                     await session.commit()
             except Exception as e:

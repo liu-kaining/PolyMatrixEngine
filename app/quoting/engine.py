@@ -457,6 +457,13 @@ class QuotingEngine:
             # Dust immunity: treat exposure < 1.0 as 0 for mode decisions (is_long, cross_token_locked)
             current_exposure_for_logic = self._dust_filter(current_exposure)
             opposite_exposure_for_logic = self._dust_filter(opposite_exposure)
+            # Local used dollars (for risk/极端熔断): capital_used + pending notional
+            local_used_dollars = (
+                float(snap.get("yes_capital_used", 0.0))
+                + float(snap.get("no_capital_used", 0.0))
+                + float(snap.get("pending_yes_buy_notional", 0.0))
+                + float(snap.get("pending_no_buy_notional", 0.0))
+            )
 
             # [Graceful Exit] State Machine
             if self.exit_mode:
@@ -536,9 +543,10 @@ class QuotingEngine:
             # Construct grid orders JSON
             orders_payload: List[dict] = []
 
-            # Two-way quoting: extreme line and exit flags (evaluated once)
-            extreme_threshold = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0)) * 0.9
-            is_extreme_long = current_exposure_for_logic >= extreme_threshold
+            # Two-way quoting: extreme line (dollars) and exit flags
+            max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            extreme_threshold_dollars = max_exposure_per_market * 0.9
+            is_extreme_long = local_used_dollars >= extreme_threshold_dollars
             force_taker_exit = self.exit_mode and current_exposure > 1.0
             cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
@@ -557,7 +565,7 @@ class QuotingEngine:
                         )
                     else:
                         logger.warning(
-                            f"[{self.token_id[:6]}] EXTREME INVENTORY ({current_exposure:.2f} >= {extreme_threshold:.2f}). "
+                            f"[{self.token_id[:6]}] EXTREME INVENTORY (local_used_dollars ${local_used_dollars:.2f} >= ${extreme_threshold_dollars:.2f}). "
                             "Entering EXTREME TAKER LIQUIDATION."
                         )
                     ask_price = max(0.01, min(0.99, round(best_bid_price - 0.02, 2)))
@@ -677,27 +685,12 @@ class QuotingEngine:
                 f"Mode: "
                 f"{mode}"
             )
-            # 5b. Local balance pre-check: trim orders if total notional exceeds budget
-            # Get global usage asynchronously before passing to the synchronous filter.
-            # Exclude THIS market from global sum, and manually add back its components 
-            # minus THIS engine's current pending BUYs to avoid double-counting.
-            global_other_markets = await inventory_state.get_global_exposure_excluding(self.condition_id)
-            market_snap = await inventory_state.get_snapshot(self.condition_id)
-            
-            pending_yes = float(market_snap.get("pending_yes_buy_notional", 0.0))
-            pending_no = float(market_snap.get("pending_no_buy_notional", 0.0))
-            
-            if self.is_yes_token:
-                other_side_pending = pending_no
-            else:
-                other_side_pending = pending_yes
-                
+            # 5b. Balance pre-check: trim BUY orders if budget exceeded (all in Dollars)
+            global_other_markets_dollars = await inventory_state.get_global_used_dollars_excluding(self.condition_id)
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
-                current_exposure=current_exposure,
-                opposite_exposure=opposite_exposure,
-                other_side_pending=other_side_pending,
-                global_other_markets=global_other_markets,
+                local_used_dollars=local_used_dollars,
+                global_other_markets_dollars=global_other_markets_dollars,
             )
 
             logger.info("Order Instructions Payload:")
@@ -720,49 +713,38 @@ class QuotingEngine:
     def _apply_balance_precheck(
         self,
         orders_payload: List[dict],
-        current_exposure: float,
-        opposite_exposure: float,
-        other_side_pending: float,
-        global_other_markets: float,
+        local_used_dollars: float,
+        global_other_markets_dollars: float,
     ) -> List[dict]:
         """
-        Estimate total USDC commitment for this batch and trim BUY orders if budget exceeded.
-        SELL orders (unwind/liquidation) are NEVER trimmed — global liquidity crunch must not
-        block 平仓单; only BUY notional is capped by available budget.
+        Trim BUY orders if total notional exceeds available budget. All in Dollars.
+        SELL orders are NEVER trimmed.
         """
         if not orders_payload:
             return orders_payload
 
-        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
         global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
-        
-        # Local available space (Excluding THIS engine's current pending BUYs, as we are replacing them)
-        local_used = current_exposure + opposite_exposure + other_side_pending
-        local_available = max(0.0, max_exposure - local_used)
 
-        # Global available space
-        global_used = global_other_markets + local_used
+        local_available = max(0.0, max_exposure_per_market - local_used_dollars)
+        global_used = global_other_markets_dollars + local_used_dollars
         global_available = max(0.0, global_max_budget - global_used)
-
-        # The strict constraint is the smaller of the two
         available = min(local_available, global_available)
 
         buy_orders = [o for o in orders_payload if o["side"] == OrderSide.BUY]
         sell_orders = [o for o in orders_payload if o["side"] == OrderSide.SELL]
-        # SELL orders always pass through (liquidation/unwind must never be blocked by budget).
 
         total_buy_notional = sum(o["price"] * o["size"] for o in buy_orders)
 
         if total_buy_notional <= available:
             return orders_payload
 
-        # Prevent unneeded logging if we are not attempting to place BUY orders
         if not buy_orders:
             return sell_orders
 
         logger.warning(
             f"[{self.token_id[:6]}] 本地资金预检: BUY 总名义=${total_buy_notional:.2f} > "
-            f"可用预算=${available:.2f} (local_used={local_used:.2f}, global_used={global_used:.2f}). "
+            f"可用预算=${available:.2f} (local_used_dollars=${local_used_dollars:.2f}, global_used=${global_used:.2f}). "
             f"正在自动缩减挂单."
         )
 

@@ -56,6 +56,8 @@ class InventoryLedger(Base):
     market_id = Column(String, ForeignKey("markets_meta.condition_id"), primary_key=True)
     yes_exposure = Column(Numeric(20, 4), default=0)
     no_exposure = Column(Numeric(20, 4), default=0)
+    yes_capital_used = Column(Numeric(20, 4), default=0)  # USDC spent on YES (cost basis)
+    no_capital_used = Column(Numeric(20, 4), default=0)   # USDC spent on NO (cost basis)
     realized_pnl = Column(Numeric(20, 4), default=0)
 
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

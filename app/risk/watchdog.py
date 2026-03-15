@@ -49,12 +49,15 @@ class RiskMonitor:
         active_cids = get_active_router_markets()
 
         for cid in active_cids:
-            # 2. Check memory-first snapshot for each active market
             snap = await inventory_state.get_snapshot(cid)
-            yes_exp = abs(float(snap.get("yes_exposure", 0.0)))
-            no_exp = abs(float(snap.get("no_exposure", 0.0)))
+            local_used_dollars = (
+                float(snap.get("yes_capital_used", 0.0))
+                + float(snap.get("no_capital_used", 0.0))
+                + float(snap.get("pending_yes_buy_notional", 0.0))
+                + float(snap.get("pending_no_buy_notional", 0.0))
+            )
 
-            if yes_exp <= self.max_exposure and no_exp <= self.max_exposure:
+            if local_used_dollars <= self.max_exposure:
                 continue
 
             # 3. Breach detected: Verify status in DB before triggering
@@ -67,18 +70,18 @@ class RiskMonitor:
                     continue
 
                 logger.critical(
-                    f"RISK BREACH (Memory): Market {cid[:12]} exceeded limit ({self.max_exposure})! "
-                    f"Exposure YES: {yes_exp:.2f}, NO: {no_exp:.2f}"
+                    f"RISK BREACH (Memory): Market {cid[:12]} exceeded limit (${self.max_exposure:.2f})! "
+                    f"local_used_dollars: ${local_used_dollars:.2f}"
                 )
                 await self.trigger_kill_switch(cid, session)
 
-        # 4. Global Budget Check
-        global_exposure = await inventory_state.get_global_exposure()
+        # 4. Global Budget Check (all in Dollars)
+        global_used_dollars = await inventory_state.get_global_used_dollars()
         global_max = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
-        if global_exposure > global_max * 1.05: # Allow 5% leeway for race conditions
-             logger.critical(
-                 f"GLOBAL RISK BREACH: Total exposure ${global_exposure:.2f} exceeds budget ${global_max:.2f}!"
-             )
+        if global_used_dollars > global_max * 1.05:
+            logger.critical(
+                f"GLOBAL RISK BREACH: Total used ${global_used_dollars:.2f} exceeds budget ${global_max:.2f}!"
+            )
              # Note: We don't trigger a global kill switch here yet to avoid market-wide panic,
              # but we log it as critical. The per-engine balance_precheck is the primary preventer.
                     
