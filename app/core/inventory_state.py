@@ -118,11 +118,13 @@ class InventoryStateManager:
         return total
 
     async def get_used_dollars_for_market(self, market_id: str) -> float:
-        """USDC used (capital_used) for a single market. For sector exposure aggregation."""
+        """USDC used for a single market. Includes capital already spent + pending open orders."""
         snap = await self.get_snapshot(market_id)
         return (
             float(snap.get("yes_capital_used", 0.0))
             + float(snap.get("no_capital_used", 0.0))
+            + float(snap.get("pending_yes_buy_notional", 0.0))
+            + float(snap.get("pending_no_buy_notional", 0.0))
         )
 
     async def get_global_used_dollars_excluding(self, market_id: str) -> float:
