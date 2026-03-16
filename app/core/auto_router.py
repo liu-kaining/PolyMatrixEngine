@@ -1,10 +1,12 @@
 """
-Auto-Router (V4.0): Portfolio Manager — Radar scan, ROI ranking, graceful rebalancing.
+Auto-Router (V6.2): Portfolio Manager — Event horizon, sector limits, volatility penalty.
 Runs as a background asyncio task when AUTO_ROUTER_ENABLED=True.
 """
 import asyncio
 import json
 import logging
+import math
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -13,11 +15,15 @@ import time
 from app.core.config import settings
 from app.core.redis import redis_client
 from app.core.market_lifecycle import start_market_making_impl, get_active_router_markets
+from app.core.inventory_state import inventory_state
+from app.market_data.gamma_client import gamma_client
 
 logger = logging.getLogger(__name__)
 
 # Per-market start time for min-hold enforcement (rewards threshold)
 market_start_times: Dict[str, float] = {}
+# Per-market metadata (endDate, tags) for event horizon and sector limits
+active_market_meta: Dict[str, dict] = {}
 
 # Global health metrics for the dashboard/API
 router_state = {
@@ -120,6 +126,67 @@ def _is_binary_yes_no(m: dict) -> bool:
     return {str(o).strip().lower() for o in outcomes} == {"yes", "no"}
 
 
+def _parse_end_date(m: dict) -> Optional[datetime]:
+    """Parse endDate from Gamma market dict. Returns None if missing/invalid."""
+    for key in ("endDate", "end_date", "endDateIso"):
+        raw = m.get(key)
+        if raw:
+            try:
+                if isinstance(raw, str):
+                    s = raw.replace("Z", "+00:00").replace("z", "+00:00")
+                    return datetime.fromisoformat(s)
+                if hasattr(raw, "timestamp"):
+                    return raw
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _parse_tags(m: dict) -> List[str]:
+    """Parse tags/category from Gamma market dict."""
+    tags_list: List[str] = []
+    tags_raw = m.get("tags")
+    if tags_raw:
+        if isinstance(tags_raw, str):
+            try:
+                parsed = json.loads(tags_raw)
+                tags_list = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, str) else []
+            except Exception:
+                tags_list = [t.strip() for t in tags_raw.replace(";", ",").split(",") if t.strip()]
+        elif isinstance(tags_raw, list):
+            tags_list = [str(t) for t in tags_raw]
+    cat = m.get("category") or m.get("subCategory")
+    if cat and str(cat) not in tags_list:
+        tags_list.append(str(cat))
+    return tags_list
+
+
+def _parse_liquidity(m: dict) -> float:
+    """Parse liquidity from Gamma market dict."""
+    for key in ("liquidity", "liquidityNum", "volume", "volumeNum"):
+        raw = m.get(key)
+        if raw is not None:
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def _within_event_horizon(end_date: Optional[datetime], hours: float) -> bool:
+    """True if end_date is within `hours` of now (resolution imminent)."""
+    if end_date is None:
+        return False
+    try:
+        now = datetime.now(timezone.utc)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        delta_hours = (end_date - now).total_seconds() / 3600.0
+        return 0 <= delta_hours <= hours
+    except Exception:
+        return False
+
+
 async def _fetch_gamma_page(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
@@ -138,11 +205,12 @@ async def _fetch_gamma_page(
 
 async def _radar_scan() -> List[dict]:
     """
-    Fetch active markets from Gamma (with timeout), filter by rewards + blacklist + BASE_ORDER_SIZE,
-    compute daily_roi = reward_rate_per_day / rewards_min_size, return list of dicts with condition_id and daily_roi.
+    Fetch active markets from Gamma, filter by rewards + blacklist + event horizon,
+    score with volatility penalty (liquidity), return list with condition_id, daily_roi, end_date, tags.
     """
     base_order_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)) * 5  # fetch more to rank
+    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)) * 5
+    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
     all_markets: List[dict] = []
     seen: Set[str] = set()
     sem = asyncio.Semaphore(GAMMA_SEMAPHORE)
@@ -173,20 +241,30 @@ async def _radar_scan() -> List[dict]:
                         continue
                     if r_min > base_order_size:
                         continue
-                    seen.add(cid)
+                    end_date = _parse_end_date(m)
+                    if _within_event_horizon(end_date, event_horizon_hours):
+                        continue
+                    tags = _parse_tags(m)
+                    liquidity = _parse_liquidity(m)
                     rate = (r_rate or 0.0)
                     daily_roi = rate / r_min if r_min > 0 else 0.0
+                    score = daily_roi * math.log10(liquidity + 1.0)
+                    seen.add(cid)
                     all_markets.append({
                         "condition_id": cid,
                         "daily_roi": daily_roi,
+                        "score": score,
                         "rewards_min_size": r_min,
                         "reward_rate_per_day": rate,
+                        "end_date": end_date,
+                        "tags": tags,
+                        "liquidity": liquidity,
                     })
             if done or len(all_markets) >= max_markets:
                 break
             offset += GAMMA_SEMAPHORE * GAMMA_PAGE_LIMIT
 
-    all_markets.sort(key=lambda x: x["daily_roi"], reverse=True)
+    all_markets.sort(key=lambda x: x["score"], reverse=True)
     top_n = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
     return all_markets[:top_n]
 
@@ -203,13 +281,21 @@ async def _rebalance(
     active_set: Set[str],
 ) -> None:
     """
-    Evict markets not in target by sending graceful_exit (only after min_hold_sec),
-    then calculate available slots and start new markets.
+    Evict markets: (1) Event horizon → immediate graceful_exit (bypass min_hold).
+    (2) Dropped from Top N → graceful_exit only after min_hold_sec.
+    Add new markets respecting sector limits (slots + exposure).
     """
     max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
     min_hold_sec = max(0.0, float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 12)) * 3600.0)
+    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
+    max_exposure_per_sector = float(getattr(settings, "MAX_EXPOSURE_PER_SECTOR", 300.0))
+    max_slots_per_sector = int(getattr(settings, "MAX_SLOTS_PER_SECTOR", 2))
+    max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
     target_ids = {m["condition_id"] for m in target_markets}
     now = time.time()
+
+    # Build target lookup for metadata
+    target_by_cid: Dict[str, dict] = {m["condition_id"]: m for m in target_markets if m.get("condition_id")}
 
     # 🛠️ 存量盘口强制注册（防重启状态丢失）
     for cid in active_set:
@@ -217,13 +303,38 @@ async def _rebalance(
             market_start_times[cid] = now
             logger.info("[AutoRouter] ⚡ 发现未记录时间的存量盘口，已初始化时间戳: %s", cid[:10])
 
-    # 1. Evict: Only send graceful_exit if runtime >= min_hold_sec (定力锁)
+    # 0. Event Horizon Eviction (bypass min_hold — do NOT hold into binary resolution)
+    need_meta = [cid for cid in active_set if cid not in active_market_meta]
+    if need_meta:
+        batch = await gamma_client.get_markets_batch(need_meta)
+        for cid, raw in batch.items():
+            active_market_meta[cid] = {
+                "end_date": _parse_end_date(raw),
+                "tags": _parse_tags(raw),
+            }
+    for cid in list(active_set):
+        meta = active_market_meta.get(cid) or {}
+        end_date = meta.get("end_date")
+        if _within_event_horizon(end_date, event_horizon_hours):
+            logger.info(
+                "[AutoRouter] Event horizon: %s resolving within %.1fh. Immediate graceful_exit (bypass min_hold).",
+                cid[:10], event_horizon_hours,
+            )
+            try:
+                await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
+            except Exception as e:
+                logger.warning("[AutoRouter] Failed to publish graceful_exit for %s: %s", cid[:10], e)
+            active_set.discard(cid)
+            market_start_times.pop(cid, None)
+            active_market_meta.pop(cid, None)
+
+    # 1. Evict: Dropped from Top N — graceful_exit only if runtime >= min_hold_sec (定力锁)
     retained_active = active_set.intersection(target_ids)
     actually_retained: Set[str] = set(retained_active)
 
     for cid in list(active_set):
         if cid not in target_ids:
-            start_ts = market_start_times[cid]  # 绝对安全（第一步已兜底注册）
+            start_ts = market_start_times.get(cid, now)
             runtime = now - start_ts
             if runtime < min_hold_sec:
                 actually_retained.add(cid)
@@ -240,13 +351,30 @@ async def _rebalance(
                     await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
                 except Exception as e:
                     logger.warning("[AutoRouter] Failed to publish graceful_exit for %s: %s", cid[:10], e)
+                active_set.discard(cid)
+                market_start_times.pop(cid, None)
+                active_market_meta.pop(cid, None)
 
-    # Clean up market_start_times for cids no longer in active_set
+    # Clean up market_start_times and active_market_meta for cids no longer active
     for cid in list(market_start_times.keys()):
         if cid not in active_set:
             del market_start_times[cid]
+            active_market_meta.pop(cid, None)
 
-    # 2. Add: Start new markets based on actually_retained slot count（槽位防超载）
+    # 2. Compute sector exposure (USD) and slots for actually_retained
+    sector_exposure: Dict[str, float] = {}
+    sector_slots: Dict[str, int] = {}
+    for cid in actually_retained:
+        meta = active_market_meta.get(cid) or {}
+        tags = meta.get("tags") or []
+        if not tags:
+            tags = ["_unknown"]
+        used = await inventory_state.get_used_dollars_for_market(cid)
+        for tag in tags:
+            sector_exposure[tag] = sector_exposure.get(tag, 0.0) + used
+            sector_slots[tag] = sector_slots.get(tag, 0) + 1
+
+    # 3. Add: Start new markets respecting sector limits
     slots_available = max(0, max_markets - len(actually_retained))
 
     for m in target_markets:
@@ -255,14 +383,36 @@ async def _rebalance(
             continue
         if slots_available <= 0:
             break
+        tags = m.get("tags") or []
+        if not tags:
+            tags = ["_unknown"]
+        # Sector limits: slots and exposure
+        would_exceed_slots = any(sector_slots.get(t, 0) >= max_slots_per_sector for t in tags)
+        est_new_exposure = max_exposure_per_market
+        would_exceed_exposure = any(
+            (sector_exposure.get(t, 0.0) + est_new_exposure) > max_exposure_per_sector for t in tags
+        )
+        if would_exceed_slots or would_exceed_exposure:
+            logger.debug(
+                "[AutoRouter] Skipping %s: sector limit (slots=%s exposure=%s).",
+                cid[:10], would_exceed_slots, would_exceed_exposure,
+            )
+            continue
         try:
             await start_market_making_impl(cid)
             active_set.add(cid)
             market_start_times[cid] = time.time()
+            active_market_meta[cid] = {
+                "end_date": m.get("end_date"),
+                "tags": tags,
+            }
+            for t in tags:
+                sector_exposure[t] = sector_exposure.get(t, 0.0) + est_new_exposure
+                sector_slots[t] = sector_slots.get(t, 0) + 1
             slots_available -= 1
             logger.info(
-                "[AutoRouter] Started market %s (ROI: %.4f).",
-                cid[:10], m.get("daily_roi", 0),
+                "[AutoRouter] Started market %s (ROI: %.4f, tags: %s).",
+                cid[:10], m.get("daily_roi", 0), tags[:3],
             )
         except Exception as e:
             logger.warning("[AutoRouter] Failed to start market %s: %s", cid[:10], e)

@@ -1,8 +1,9 @@
 import httpx
 import logging
 import json
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,10 @@ class GammaMarketInfo:
     rewards_min_size: Optional[float] = None
     rewards_max_spread: Optional[float] = None
     reward_rate_per_day: Optional[float] = None
+    end_date: Optional[datetime] = None      # Resolution time (for event horizon)
+    tags: List[str] = field(default_factory=list)  # Sector/category tags
+    category: Optional[str] = None
+    liquidity: float = 0.0                   # For volatility penalty scoring
 
 
 class GammaAPIClient:
@@ -73,12 +78,58 @@ class GammaAPIClient:
                 except (ValueError, TypeError):
                     pass
 
+                # Parse endDate (for event horizon)
+                end_date: Optional[datetime] = None
+                for key in ("endDate", "end_date", "endDateIso"):
+                    raw = market_data.get(key)
+                    if raw:
+                        try:
+                            if isinstance(raw, str):
+                                s = raw.replace("Z", "+00:00").replace("z", "+00:00")
+                                end_date = datetime.fromisoformat(s)
+                            elif hasattr(raw, "timestamp"):
+                                end_date = raw
+                            break
+                        except (ValueError, TypeError):
+                            pass
+
+                # Parse tags/category
+                tags_list: List[str] = []
+                tags_raw = market_data.get("tags")
+                if tags_raw:
+                    if isinstance(tags_raw, str):
+                        try:
+                            parsed = json.loads(tags_raw)
+                            tags_list = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, str) else []
+                        except Exception:
+                            tags_list = [t.strip() for t in tags_raw.replace(";", ",").split(",") if t.strip()]
+                    elif isinstance(tags_raw, list):
+                        tags_list = [str(t) for t in tags_raw]
+                category = market_data.get("category") or market_data.get("subCategory")
+                if category and category not in tags_list:
+                    tags_list.append(str(category))
+
+                # Parse liquidity
+                liquidity = 0.0
+                for key in ("liquidity", "liquidityNum", "volume", "volumeNum"):
+                    raw = market_data.get(key)
+                    if raw is not None:
+                        try:
+                            liquidity = float(raw)
+                            break
+                        except (ValueError, TypeError):
+                            pass
+
                 return GammaMarketInfo(
                     yes_token_id=tokens[0],
                     no_token_id=tokens[1],
                     rewards_min_size=rewards_min_size,
                     rewards_max_spread=rewards_max_spread,
                     reward_rate_per_day=reward_rate_per_day,
+                    end_date=end_date,
+                    tags=tags_list,
+                    category=category,
+                    liquidity=liquidity,
                 )
 
             except httpx.HTTPStatusError as e:
@@ -93,6 +144,30 @@ class GammaAPIClient:
         if info:
             return info.yes_token_id, info.no_token_id
         return None
+
+    async def get_markets_batch(self, condition_ids: List[str]) -> Dict[str, dict]:
+        """Fetch raw market dicts for multiple condition_ids. Returns cid -> raw market dict."""
+        if not condition_ids:
+            return {}
+        result: Dict[str, dict] = {}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                # Gamma API accepts condition_ids as comma-separated
+                ids_param = ",".join(condition_ids[:50])  # Limit batch size
+                resp = await client.get(
+                    f"{self.base_url}/markets",
+                    params={"condition_ids": ids_param},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    for m in data:
+                        cid = m.get("conditionId")
+                        if cid:
+                            result[cid] = m
+        except Exception as e:
+            logger.warning("get_markets_batch failed: %s", e)
+        return result
 
 
 gamma_client = GammaAPIClient()

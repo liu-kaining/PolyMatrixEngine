@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     AUTO_ROUTER_SCAN_INTERVAL_SEC: int = 3600
     AUTO_ROUTER_MIN_HOLD_HOURS: float = 12.0  # Min hours before evicting (for rewards threshold)
 
+    # V6.2 Sector & Event Horizon risk controls
+    MAX_EXPOSURE_PER_SECTOR: float = 300.0   # Max USD per category/tag (prevent over-concentration)
+    EVENT_HORIZON_HOURS: float = 24.0        # Markets resolving within this → avoid or REDUCE_ONLY
+    MAX_SLOTS_PER_SECTOR: int = 2            # Max active markets per tag (simpler sector cap)
+
     class Config:
         env_file = ".env"
         case_sensitive = True
