@@ -368,7 +368,7 @@ async def _rebalance(
         meta = active_market_meta.get(cid) or {}
         tags = meta.get("tags") or []
         if not tags:
-            tags = ["_unknown"]
+            tags = [f"_unknown_{cid[:8]}"]
         used = await inventory_state.get_used_dollars_for_market(cid)
         for tag in tags:
             sector_exposure[tag] = sector_exposure.get(tag, 0.0) + used
@@ -385,7 +385,7 @@ async def _rebalance(
             break
         tags = m.get("tags") or []
         if not tags:
-            tags = ["_unknown"]
+            tags = [f"_unknown_{cid[:8]}"]
         # Sector limits: slots and exposure
         would_exceed_slots = any(sector_slots.get(t, 0) >= max_slots_per_sector for t in tags)
         est_new_exposure = max_exposure_per_market
