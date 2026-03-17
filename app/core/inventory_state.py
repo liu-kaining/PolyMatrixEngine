@@ -239,7 +239,12 @@ class InventoryStateManager:
         return updated
 
     async def apply_reconciliation_snapshot(
-        self, market_id: str, yes_exposure: float, no_exposure: float
+        self,
+        market_id: str,
+        yes_exposure: float,
+        no_exposure: float,
+        yes_capital_used: Optional[float] = None,
+        no_capital_used: Optional[float] = None,
     ) -> Dict[str, float]:
         await self.ensure_loaded(market_id)
         async with self._lock:
@@ -248,15 +253,23 @@ class InventoryStateManager:
             old_no = float(snap["no_exposure"])
             snap["yes_exposure"] = float(yes_exposure)
             snap["no_exposure"] = float(no_exposure)
-            # Proportional adjustment of capital_used when exposure overwritten by API
-            if old_yes > 1e-9:
-                snap["yes_capital_used"] = float(snap.get("yes_capital_used", 0.0)) * (yes_exposure / old_yes)
+            # Capital sync: prefer explicit values from reconciliation (DB-aligned).
+            # If not provided, fall back to proportional adjustment based on exposure ratios.
+            if yes_capital_used is not None:
+                snap["yes_capital_used"] = float(yes_capital_used)
             else:
-                snap["yes_capital_used"] = 0.0
-            if old_no > 1e-9:
-                snap["no_capital_used"] = float(snap.get("no_capital_used", 0.0)) * (no_exposure / old_no)
+                if old_yes > 1e-9:
+                    snap["yes_capital_used"] = float(snap.get("yes_capital_used", 0.0)) * (yes_exposure / old_yes)
+                else:
+                    snap["yes_capital_used"] = 0.0
+
+            if no_capital_used is not None:
+                snap["no_capital_used"] = float(no_capital_used)
             else:
-                snap["no_capital_used"] = 0.0
+                if old_no > 1e-9:
+                    snap["no_capital_used"] = float(snap.get("no_capital_used", 0.0)) * (no_exposure / old_no)
+                else:
+                    snap["no_capital_used"] = 0.0
             snap["updated_at"] = time.time()
             return dict(snap)
 

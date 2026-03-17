@@ -571,7 +571,13 @@ class QuotingEngine:
             )
             is_extreme_long = my_capital_used >= extreme_threshold_dollars
             force_taker_exit = self.exit_mode and current_exposure > 1.0
-            cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
+            opposite_capital_used = (
+                float(snap.get("no_capital_used", 0.0))
+                if self.is_yes_token
+                else float(snap.get("yes_capital_used", 0.0))
+            )
+            # Lock opposite side if it has consumed more than half of the extreme threshold
+            cross_token_locked = opposite_capital_used >= (extreme_threshold_dollars * 0.5)
             own_side = "YES" if self.is_yes_token else "NO"
             opposite_side = "NO" if self.is_yes_token else "YES"
 

@@ -50,14 +50,13 @@ class RiskMonitor:
 
         for cid in active_cids:
             snap = await inventory_state.get_snapshot(cid)
-            local_used_dollars = (
+            # ONLY use actual spent capital for the hard kill switch
+            actual_used_dollars = (
                 float(snap.get("yes_capital_used", 0.0))
                 + float(snap.get("no_capital_used", 0.0))
-                + float(snap.get("pending_yes_buy_notional", 0.0))
-                + float(snap.get("pending_no_buy_notional", 0.0))
             )
 
-            if local_used_dollars <= self.max_exposure:
+            if actual_used_dollars <= self.max_exposure:
                 continue
 
             # 3. Breach detected: Verify status in DB before triggering
@@ -70,8 +69,8 @@ class RiskMonitor:
                     continue
 
                 logger.critical(
-                    f"RISK BREACH (Memory): Market {cid[:12]} exceeded limit (${self.max_exposure:.2f})! "
-                    f"local_used_dollars: ${local_used_dollars:.2f}"
+                    f"RISK BREACH (Actual Capital): Market {cid[:12]} exceeded limit (${self.max_exposure:.2f})! "
+                    f"actual_used_dollars: ${actual_used_dollars:.2f}"
                 )
                 await self.trigger_kill_switch(cid, session)
 
@@ -223,6 +222,8 @@ class RiskMonitor:
                         market_id=cid,
                         yes_exposure=actual["yes"],
                         no_exposure=actual["no"],
+                        yes_capital_used=float(db_inv.yes_capital_used),
+                        no_capital_used=float(db_inv.no_capital_used),
                     )
             
             await session.commit()
