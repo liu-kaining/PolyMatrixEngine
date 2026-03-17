@@ -27,7 +27,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 
 | Area | What we do |
 |------|------------|
-| **Auto-Router (V4)** | Background portfolio manager. Scans Gamma for highest ROI opportunities, gracefully exits deteriorating markets, and seamlessly swaps in new ones without exceeding capital limits. |
+| **Auto-Router (V6.3)** | Background portfolio manager with strict risk controls. Scans Gamma for high-yield opportunities, enforces event-horizon halts and sector limits, and biases selection toward deep-liquidity mid-term markets. |
 | **Performance** | Memory-first inventory; zero Postgres reads in the tick loop; `EngineSupervisor` task registry; async persist queue with bounded size and graceful drain on shutdown. |
 | **Execution** | Diff quoting (keep/cancel/create by signature); preserves time priority and cuts API churn. Fail-closed resilient WS with heartbeat dropping detection. |
 | **Risk** | Global max budget (`GLOBAL_MAX_BUDGET`) enforcing across all engines. Per-market kill switch, circuit breaker, reconciliation with timestamp guard, and balance precheck. |
@@ -39,7 +39,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 
 ## Features
 
-- **V4.0 Auto-Router (Portfolio Manager)** — Fully automated mode. When enabled, it continuously scans the Polymarket Gamma API, ranks binary markets by Daily ROI (Rewards per Day / Min Size), filters out blacklisted markets, and maintains a top-N portfolio. It handles graceful eviction (sell-only mode) for falling markets while rotating in new ones.
+- **V6.3 Auto-Router (Portfolio Manager)** — Fully automated mode. Scans Gamma, ranks markets by a liquidity-aware score, and maintains a top-N portfolio. Enforces **event-horizon halts** (do not hold into binary resolution), **sector/tag concentration limits**, and a **mid-term bias** to avoid dead long-dated markets.
 - **Engine Supervisor** — Strict, concurrency-safe lifecycle manager. Guarantees exactly one async task per market side, preventing duplicate instances and ensuring total cleanup upon exit to avoid "ghost orders".
 - **Market Data Gateway** — Order book via Polymarket Market WebSocket + REST snapshot; local orderbook merge and top-N BBO published to Redis for engines. Includes a 30s silent-drop detection for resilient reconnects.
 - **In-Memory Inventory State** — `InventoryStateManager` single source of truth for exposure in the hot path; fills update memory immediately and enqueue async DB writes; bounded queue and drain-on-shutdown to avoid OOM and data loss.
@@ -49,6 +49,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 - **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Rewards Farming Ready** — Read rewards min size and max spread from Gamma; adapt size when safe, else fall back to base size; dashboard shows rewards eligibility.
+- **Ghost order hard reset** — Periodic TTL-based hard reset clears potential phantom orders after WS drops to avoid pending-notional budget lock.
 - **OMS + Circuit Breaker** — Orders and cancels via `py-clob-client`; transient errors trip a circuit breaker; non-transient (e.g. 400) do not; “matched orders can't be canceled” treated as success (INFO).
 - **Risk Watchdog** — Per-market exposure check; suspend + cancel all on breach; periodic Polymarket positions sync with tolerance and timestamp guard.
 - **Streamlit Dashboard** — Gamma screener, start/stop/liquidate, inventory & PnL, active orders, real-time engine status, logs tail.
@@ -121,7 +122,7 @@ Official docs use **min_incentive_size** and **max_incentive_spread** (from Mark
 | Official / Markets API | Gamma / our code | Notes |
 |------------------------|------------------|--------|
 | min_incentive_size (shares) | `rewardsMinSize` → `rewards_min_size` | Engine uses `max(base_size, rewards_min_size)` and, when `AUTO_TUNE_FOR_REWARDS=True`, targets `rewards_min_size * 1.05` with a safety cap. |
-| max_incentive_spread (cents) | `rewardsMaxSpread` → `rewards_max_spread` (price) | We divide cents by 100. Engine keeps `target_spread ≤ rewards_max_spread * 0.90` and validates before placing. |
+| max_incentive_spread (cents) | `rewardsMaxSpread` → `rewards_max_spread` (price) | We divide cents by 100. Engine keeps `target_spread ≤ rewards_max_spread * 0.95` and validates before placing. |
 | Daily reward rate | `rewardsDailyRate` or `clobRewards[0].rewardsDailyRate` → `reward_rate_per_day` | Shown in dashboard “Rewards/day”; used for display and tuning. |
 
 We **do not** implement the full reward formula (order scoring, sampling, epoch normalization). We only **qualify** for rewards by posting orders that satisfy the market’s min size and max spread; Polymarket runs the scoring and distribution.
@@ -212,9 +213,13 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | Variable | Meaning | Default / note |
 |----------|---------|----------------|
 | `LIVE_TRADING_ENABLED` | Real CLOB orders vs dry-run | `False` = simulate only |
-| `AUTO_ROUTER_ENABLED` | Enable V4 Auto-Router background portfolio manager | `False` |
+| `AUTO_ROUTER_ENABLED` | Enable Auto-Router background portfolio manager | `False` |
 | `AUTO_ROUTER_MAX_MARKETS` | Max concurrent markets managed by the router | `4` |
 | `AUTO_ROUTER_SCAN_INTERVAL_SEC` | Time between Gamma API scans for rebalancing | `3600` |
+| `AUTO_ROUTER_MIN_HOLD_HOURS` | Min-hold before evicting dropped markets (event-horizon bypasses this) | `12.0` |
+| `EVENT_HORIZON_HOURS` | Markets resolving within this window (or already expired) are avoided/evicted | `24.0` |
+| `MAX_EXPOSURE_PER_SECTOR` | Max USD exposure allowed per tag/sector across active markets | `300.0` |
+| `MAX_SLOTS_PER_SECTOR` | Max active markets allowed per tag/sector | `2` |
 | `GLOBAL_MAX_BUDGET` | Absolute max USDC deployed across ALL markets | `1000.0` |
 | `MAX_EXPOSURE_PER_MARKET` | Cap per market (USDC); watchdog kill switch | e.g. `50.0` |
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |

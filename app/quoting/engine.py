@@ -564,7 +564,12 @@ class QuotingEngine:
             # Two-way quoting: extreme line (dollars) and exit flags
             max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
             extreme_threshold_dollars = max_exposure_per_market * 0.9
-            is_extreme_long = actual_capital_used >= extreme_threshold_dollars
+            my_capital_used = (
+                float(snap.get("yes_capital_used", 0.0))
+                if self.is_yes_token
+                else float(snap.get("no_capital_used", 0.0))
+            )
+            is_extreme_long = my_capital_used >= extreme_threshold_dollars
             force_taker_exit = self.exit_mode and current_exposure > 1.0
             cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
@@ -595,23 +600,32 @@ class QuotingEngine:
                     ask_price = round(fair_value + anchor_distance, 2)
                     safe_maker_floor = round(best_bid_price + self.tick_size, 2)
                     ask_price = max(safe_maker_floor, ask_price)
-                    ask_price = max(0.01, min(0.99, ask_price))
+                    
+                    if ask_price > 0.99:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] MAKER SELL blocked: required price {ask_price} > 0.99 "
+                            f"(best_bid={best_bid_price}). Waiting for book to shift."
+                        )
+                        ask_price = None  # Use None to signal skipping this order
+                    else:
+                        ask_price = max(0.01, ask_price)
 
-                sell_size = min(current_exposure, max(self.base_size, 5.0))
-                orders_payload.append(
-                    {
-                        "condition_id": self.condition_id,
-                        "token_id": self.token_id,
-                        "side": OrderSide.SELL,
-                        "price": ask_price,
-                        "size": sell_size,
-                    }
-                )
-                mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
-                logger.info(
-                    f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
-                    f"Exposure {current_exposure:.2f}"
-                )
+                if ask_price is not None:
+                    sell_size = min(current_exposure, max(self.base_size, 5.0))
+                    orders_payload.append(
+                        {
+                            "condition_id": self.condition_id,
+                            "token_id": self.token_id,
+                            "side": OrderSide.SELL,
+                            "price": ask_price,
+                            "size": sell_size,
+                        }
+                    )
+                    mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
+                    logger.info(
+                        f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
+                        f"Exposure {current_exposure:.2f}"
+                    )
 
             # --- Line 2: BUY side (build position / take liquidity when safe) ---
             if not is_extreme_long and not self.exit_mode:
@@ -631,13 +645,19 @@ class QuotingEngine:
                             bid_price = round(max(bid_price, best_bid_price - 0.01), 2)
                             bid_price = max(0.01, min(0.99, bid_price))
 
-                        max_buy = max(0.01, round(best_ask_price - self.tick_size, 2))
+                        max_buy = round(best_ask_price - self.tick_size, 2)
                         if bid_price > max_buy:
                             logger.warning(
-                                f"[{self.token_id[:6]}] 触发价格极值保护: BUY {bid_price} > best_ask-tick {max_buy}, "
-                                f"已强制修正价格以避免 crosses the book"
+                                f"[{self.token_id[:6]}] 触发价格极值保护: BUY {bid_price} > best_ask-tick {max_buy}"
                             )
                             bid_price = max_buy
+                        
+                        if bid_price < 0.01:
+                            logger.warning(
+                                f"[{self.token_id[:6]}] BUY price dropped below 0.01 (best_ask={best_ask_price}). "
+                                "Skipping order to avoid crossing book."
+                            )
+                            continue
 
                         if bid_price in seen_bid_prices:
                             continue
