@@ -174,7 +174,7 @@ def _parse_liquidity(m: dict) -> float:
 
 
 def _within_event_horizon(end_date: Optional[datetime], hours: float) -> bool:
-    """True if end_date is within `hours` of now (resolution imminent)."""
+    """True if end_date is within `hours` of now OR HAS ALREADY PASSED."""
     if end_date is None:
         return False
     try:
@@ -182,7 +182,7 @@ def _within_event_horizon(end_date: Optional[datetime], hours: float) -> bool:
         if end_date.tzinfo is None:
             end_date = end_date.replace(tzinfo=timezone.utc)
         delta_hours = (end_date - now).total_seconds() / 3600.0
-        return 0 <= delta_hours <= hours
+        return delta_hours <= hours
     except Exception:
         return False
 

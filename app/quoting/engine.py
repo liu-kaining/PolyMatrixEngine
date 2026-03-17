@@ -447,7 +447,7 @@ class QuotingEngine:
                 logger.warning(
                     f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
                 )
-                await self.cancel_all_orders()
+                await self.cancel_all_orders(force_evict=True)
                 self.last_grid_reset_time = time.time()
                 return  # Skip this tick to let the next tick cleanly rebuild the grid
 
@@ -885,7 +885,7 @@ class QuotingEngine:
                     "size": float(order_req["size"]),
                 }
 
-    async def cancel_all_orders(self):
+    async def cancel_all_orders(self, force_evict: bool = False):
         """Cancel current active grid and ensure no orphan orders remain."""
         if not self.active_orders:
             # Still update notional to 0 just to be sure
@@ -899,8 +899,8 @@ class QuotingEngine:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for order_id, success in zip(order_ids, results):
-            if success is True:
-                del self.active_orders[order_id]
+            if success is True or force_evict:
+                self.active_orders.pop(order_id, None)
             else:
                 # Downgraded from CRITICAL: OMS already handles matched-order scenarios
                 # at INFO level. Remaining failures are transient network / circuit-breaker.
