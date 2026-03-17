@@ -205,11 +205,16 @@ class RiskMonitor:
                     db_inv.yes_exposure = actual["yes"]
                     db_inv.no_exposure = actual["no"]
 
-                    # Zero-out phantom capital if exposure is completely closed
+                    # Zero-out or proportionally adjust phantom capital
                     if actual["yes"] <= 0.001:
                         db_inv.yes_capital_used = 0.0
+                    elif db_yes > 1e-9:
+                        db_inv.yes_capital_used = float(db_inv.yes_capital_used) * (actual["yes"] / db_yes)
+
                     if actual["no"] <= 0.001:
                         db_inv.no_capital_used = 0.0
+                    elif db_no > 1e-9:
+                        db_inv.no_capital_used = float(db_inv.no_capital_used) * (actual["no"] / db_no)
 
                     logger.info(f"Local ledger overwritten with on-chain data for {cid[:8]}")
 

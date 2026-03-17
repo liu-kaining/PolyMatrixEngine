@@ -474,6 +474,17 @@ class QuotingEngine:
                 + float(snap.get("pending_yes_buy_notional", 0.0))
                 + float(snap.get("pending_no_buy_notional", 0.0))
             )
+            
+            actual_capital_used = (
+                float(snap.get("yes_capital_used", 0.0))
+                + float(snap.get("no_capital_used", 0.0))
+            )
+            my_pending_notional = (
+                float(snap.get("pending_yes_buy_notional", 0.0))
+                if self.is_yes_token
+                else float(snap.get("pending_no_buy_notional", 0.0))
+            )
+            local_used_dollars_excluding_me = local_used_dollars - my_pending_notional
 
             # [Graceful Exit] State Machine
             if self.exit_mode:
@@ -553,7 +564,7 @@ class QuotingEngine:
             # Two-way quoting: extreme line (dollars) and exit flags
             max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
             extreme_threshold_dollars = max_exposure_per_market * 0.9
-            is_extreme_long = local_used_dollars >= extreme_threshold_dollars
+            is_extreme_long = actual_capital_used >= extreme_threshold_dollars
             force_taker_exit = self.exit_mode and current_exposure > 1.0
             cross_token_locked = opposite_exposure_for_logic >= self.liquidate_threshold
             own_side = "YES" if self.is_yes_token else "NO"
@@ -696,7 +707,7 @@ class QuotingEngine:
             global_other_markets_dollars = await inventory_state.get_global_used_dollars_excluding(self.condition_id)
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
-                local_used_dollars=local_used_dollars,
+                local_used_dollars_excluding_me=local_used_dollars_excluding_me,
                 global_other_markets_dollars=global_other_markets_dollars,
             )
 
@@ -720,7 +731,7 @@ class QuotingEngine:
     def _apply_balance_precheck(
         self,
         orders_payload: List[dict],
-        local_used_dollars: float,
+        local_used_dollars_excluding_me: float,
         global_other_markets_dollars: float,
     ) -> List[dict]:
         """
@@ -733,8 +744,8 @@ class QuotingEngine:
         max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
         global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
 
-        local_available = max(0.0, max_exposure_per_market - local_used_dollars)
-        global_used = global_other_markets_dollars + local_used_dollars
+        local_available = max(0.0, max_exposure_per_market - local_used_dollars_excluding_me)
+        global_used = global_other_markets_dollars + local_used_dollars_excluding_me
         global_available = max(0.0, global_max_budget - global_used)
         available = min(local_available, global_available)
 
@@ -751,7 +762,7 @@ class QuotingEngine:
 
         logger.warning(
             f"[{self.token_id[:6]}] 本地资金预检: BUY 总名义=${total_buy_notional:.2f} > "
-            f"可用预算=${available:.2f} (local_used_dollars=${local_used_dollars:.2f}, global_used=${global_used:.2f}). "
+            f"可用预算=${available:.2f} (local_used_dollars=${local_used_dollars_excluding_me:.2f}, global_used=${global_used:.2f}). "
             f"正在自动缩减挂单."
         )
 
