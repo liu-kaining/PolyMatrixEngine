@@ -246,9 +246,30 @@ async def _radar_scan() -> List[dict]:
                         continue
                     tags = _parse_tags(m)
                     liquidity = _parse_liquidity(m)
+                    # V6.3: hard filter for deep pools only
+                    if liquidity < 20000.0:
+                        continue
                     rate = (r_rate or 0.0)
                     daily_roi = rate / r_min if r_min > 0 else 0.0
-                    score = daily_roi * math.log10(liquidity + 1.0)
+                    base_score = daily_roi * math.log10(liquidity)
+
+                    now_utc = datetime.now(timezone.utc)
+                    end_utc = (
+                        end_date.replace(tzinfo=timezone.utc)
+                        if end_date is not None and end_date.tzinfo is None
+                        else end_date
+                    )
+                    days_left = (end_utc - now_utc).total_seconds() / 86400.0 if end_utc else 9999.0
+
+                    # V6.3: time decay penalty to avoid long-term dead markets
+                    if days_left > 180:
+                        time_decay = 0.01
+                    elif days_left > 90:
+                        time_decay = 0.5
+                    else:
+                        time_decay = 1.0
+
+                    score = base_score * time_decay
                     seen.add(cid)
                     all_markets.append({
                         "condition_id": cid,
