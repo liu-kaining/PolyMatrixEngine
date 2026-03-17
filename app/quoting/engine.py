@@ -78,6 +78,7 @@ class QuotingEngine:
         self.suspended = False # Internal flag for Kill Switch
         self.exit_mode = False   # Graceful exit: stop BUY, unwind inventory, then shut down
         self._shutdown_requested = False  # Set when exposure cleared so run() can break
+        self.last_grid_reset_time = time.time()
 
         # Rewards Farming: loaded once from Redis on first tick
         self._rewards_loaded = False
@@ -441,6 +442,15 @@ class QuotingEngine:
         await self._load_rewards_config()
 
         async with self._trade_lock:
+            # Ghost Order TTL Hard Reset (Every 5 minutes)
+            if not self.exit_mode and time.time() - self.last_grid_reset_time > 300:
+                logger.warning(
+                    f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
+                )
+                await self.cancel_all_orders()
+                self.last_grid_reset_time = time.time()
+                return  # Skip this tick to let the next tick cleanly rebuild the grid
+
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:
                 logger.warning(f"[{self.token_id[:6]}] Market context unavailable; skip tick.")
@@ -520,19 +530,16 @@ class QuotingEngine:
                     f"[{self.token_id[:6]}] [AUTOTUNE] Market has rewards! "
                     f"MinSize: {self.rewards_min_size}, MaxSpread: {self.rewards_max_spread:.4f}."
                 )
-                target_spread = self.rewards_max_spread * 0.90
+                target_spread = self.rewards_max_spread * 0.95  # 5% safety margin
                 base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
-                
-                # If target spread is wider than base, take target_spread (safe fishing)
-                applied_spread = dynamic_spread
-                if target_spread > base_spread:
-                    applied_spread = max(dynamic_spread, target_spread)
-                    dynamic_spread = applied_spread
-                
+
+                # Force dynamic_spread to be AT LEAST base_spread, but NEVER EXCEED target_spread
+                dynamic_spread = min(max(dynamic_spread, base_spread), target_spread)
+
                 target_size_log = max(5.0, round(self.rewards_min_size * 1.05, 1))
                 logger.info(
                     f"[{self.token_id[:6]}] [AUTOTUNE] Auto-adjusting -> "
-                    f"Size: {target_size_log:.1f} | Spread: {applied_spread:.4f}."
+                    f"Size: {target_size_log:.1f} | Spread: {dynamic_spread:.4f}."
                 )
 
             # 4. Calculate optimal grid bounds based on Skewed Fair Value and Dynamic Spread
