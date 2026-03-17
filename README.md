@@ -40,6 +40,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 ## Features
 
 - **V6.3 Auto-Router (Portfolio Manager)** — Fully automated mode. Scans Gamma, ranks markets by a liquidity-aware score, and maintains a top-N portfolio. Enforces **event-horizon halts** (do not hold into binary resolution), **sector/tag concentration limits**, and a **mid-term bias** to avoid dead long-dated markets.
+- **Auto-Router scoring (V6.3)** — Hard liquidity filter (`liquidity ≥ 20k`) and time-decay penalty by days-to-resolution to avoid long-dated stagnant markets; expired markets are treated as event-horizon and avoided.
 - **Engine Supervisor** — Strict, concurrency-safe lifecycle manager. Guarantees exactly one async task per market side, preventing duplicate instances and ensuring total cleanup upon exit to avoid "ghost orders".
 - **Market Data Gateway** — Order book via Polymarket Market WebSocket + REST snapshot; local orderbook merge and top-N BBO published to Redis for engines. Includes a 30s silent-drop detection for resilient reconnects.
 - **In-Memory Inventory State** — `InventoryStateManager` single source of truth for exposure in the hot path; fills update memory immediately and enqueue async DB writes; bounded queue and drain-on-shutdown to avoid OOM and data loss.
@@ -49,9 +50,9 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 - **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Rewards Farming Ready** — Read rewards min size and max spread from Gamma; adapt size when safe, else fall back to base size; dashboard shows rewards eligibility.
-- **Ghost order hard reset** — Periodic TTL-based hard reset clears potential phantom orders after WS drops to avoid pending-notional budget lock.
+- **Ghost order hard reset** — Periodic TTL-based hard reset clears potential phantom orders after WS drops; on hard reset, failed cancels are force-evicted from the local active-order cache to free pending-notional budget.
 - **OMS + Circuit Breaker** — Orders and cancels via `py-clob-client`; transient errors trip a circuit breaker; non-transient (e.g. 400) do not; “matched orders can't be canceled” treated as success (INFO).
-- **Risk Watchdog** — Per-market exposure check; suspend + cancel all on breach; periodic Polymarket positions sync with tolerance and timestamp guard.
+- **Risk Watchdog** — Per-market kill switch based on **actual spent capital** (not pending notional); periodic Polymarket positions sync with tolerance, timestamp guard, and capital-used reconciliation to prevent phantom budget lock.
 - **Streamlit Dashboard** — Gamma screener, start/stop/liquidate, inventory & PnL, active orders, real-time engine status, logs tail.
 
 ---
@@ -232,6 +233,10 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `GAMMA_PAGE_LIMIT` | Per-page limit for Gamma list (dashboard) | `2000` |
 
 Full reference: see `.env.example` and the tables in [README-zh.md](README-zh.md) (环境变量说明).
+
+## Technical whitepaper
+
+For system design details, scoring/risk math, and audited failure-mode fixes, see `docs/TECHNICAL_WHITEPAPER_V6_3.md`.
 
 ## References
 
