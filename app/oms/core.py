@@ -180,8 +180,11 @@ class OrderManagementSystem:
                 
         # 3. State Machine: OPEN / FAILED (Session 2)
         async with AsyncSessionLocal() as session:
-            # Re-fetch the order to ensure it hasn't been modified externally
-            order = await session.get(OrderJournal, order_id)
+            # Re-fetch with row lock to avoid race with user_stream fills/cancels.
+            result = await session.execute(
+                select(OrderJournal).filter_by(order_id=order_id).with_for_update()
+            )
+            order = result.scalar_one_or_none()
             if not order:
                 return None
                 

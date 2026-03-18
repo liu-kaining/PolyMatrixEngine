@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import websockets
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
@@ -208,7 +208,7 @@ class UserStreamGateway:
                 if order_id:
                     _safe_create_task(self.handle_cancellation(order_id))
 
-    async def _resolve_market_tokens(self, session, market_id: str) -> Dict[str, str] | None:
+    async def _resolve_market_tokens(self, session, market_id: str) -> Optional[Dict[str, str]]:
         cached = self.market_tokens.get(market_id)
         if cached and cached.get("yes_token_id") and cached.get("no_token_id"):
             return cached
@@ -224,7 +224,7 @@ class UserStreamGateway:
         self.market_tokens[market_id] = tokens
         return tokens
 
-    async def _publish_order_status_event(self, market_id: str, token_id: str | None, order_id: str, status: str):
+    async def _publish_order_status_event(self, market_id: str, token_id: Optional[str], order_id: str, status: str):
         if not token_id:
             return
         await redis_client.publish(

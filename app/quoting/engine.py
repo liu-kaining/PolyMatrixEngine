@@ -502,8 +502,8 @@ class QuotingEngine:
                     return
 
                 logger.info(
-                    f"[QuotingEngine {self.condition_id[:10]}] GRACEFUL_EXIT mode. Current exposure: $%.2f. Waiting to unwind...",
-                    current_exposure,
+                    f"[QuotingEngine {self.condition_id[:10]}] GRACEFUL_EXIT mode. "
+                    f"Current exposure: ${current_exposure:.2f}. Waiting to unwind..."
                 )
 
             # Check orderbook data AFTER graceful exit dust checks
@@ -617,21 +617,26 @@ class QuotingEngine:
                         ask_price = max(0.01, ask_price)
 
                 if ask_price is not None:
-                    sell_size = min(current_exposure, max(self.base_size, 5.0))
-                    orders_payload.append(
-                        {
-                            "condition_id": self.condition_id,
-                            "token_id": self.token_id,
-                            "side": OrderSide.SELL,
-                            "price": ask_price,
-                            "size": sell_size,
-                        }
-                    )
-                    mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
-                    logger.info(
-                        f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
-                        f"Exposure {current_exposure:.2f}"
-                    )
+                    if current_exposure < 5.0:
+                        logger.debug(
+                            f"[{self.token_id[:6]}] Inventory too small to sell (${current_exposure:.2f} < $5.0). Skipping."
+                        )
+                    else:
+                        sell_size = min(current_exposure, max(self.base_size, 5.0))
+                        orders_payload.append(
+                            {
+                                "condition_id": self.condition_id,
+                                "token_id": self.token_id,
+                                "side": OrderSide.SELL,
+                                "price": ask_price,
+                                "size": sell_size,
+                            }
+                        )
+                        mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
+                        logger.info(
+                            f"[{self.token_id[:6]}] {mode_label}: Ask {ask_price} | Size {sell_size:.2f} | "
+                            f"Exposure {current_exposure:.2f}"
+                        )
 
             # --- Line 2: BUY side (build position / take liquidity when safe) ---
             if not is_extreme_long and not self.exit_mode:

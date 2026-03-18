@@ -93,9 +93,10 @@ async def lifespan(app: FastAPI):
         for order in pending_orders:
             try:
                 await oms.cancel_order(order.order_id)
+                order.status = OrderStatus.CANCELED  # Mark as canceled if successful
             except Exception as e:
                 logger.warning(f"扫地僧在尝试撤销历史 PENDING 订单 {order.order_id} 时出错: {e}")
-            order.status = OrderStatus.FAILED
+                order.status = OrderStatus.FAILED  # Only mark failed if exception occurs
             logger.warning(f"扫地僧已清理历史遗留的 PENDING 幽灵订单: {order.order_id}")
         if pending_orders:
             await session.commit()
