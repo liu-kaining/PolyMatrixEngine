@@ -449,7 +449,7 @@ class QuotingEngine:
                 )
                 await self.cancel_all_orders(force_evict=True)
                 self.last_grid_reset_time = time.time()
-                return  # Skip this tick to let the next tick cleanly rebuild the grid
+                # Removed early return: proceed to rebuild the grid in the current tick.
 
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:
