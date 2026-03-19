@@ -525,11 +525,15 @@ class QuotingEngine:
             if not self.exit_mode and self.last_anchor_mid_price is not None:
                 price_diff = abs(fair_value - self.last_anchor_mid_price)
                 if price_diff <= self.price_offset_threshold:
-                    logger.debug(
-                        f"[{self.token_id[:6]}] Tick ignored: Fair Value diff ({price_diff:.4f}) "
-                        f"<= threshold ({self.price_offset_threshold}). Skip Grid Reset."
-                    )
-                    return
+                    # After a Periodic Hard Reset, active_orders may be empty.
+                    # In that case, we must NOT early-return, otherwise the engine will
+                    # stay with no orders on the book.
+                    if len(self.active_orders) > 0:
+                        logger.debug(
+                            f"[{self.token_id[:6]}] Tick ignored: Fair Value diff ({price_diff:.4f}) "
+                            f"<= threshold ({self.price_offset_threshold}). Skip Grid Reset."
+                        )
+                        return
                     
             # Update the baseline anchor mid-price for future comparisons
             self.last_anchor_mid_price = fair_value
