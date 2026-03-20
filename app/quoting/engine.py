@@ -453,28 +453,41 @@ class QuotingEngine:
         await self._load_rewards_config()
 
         async with self._trade_lock:
+            # If Periodic Hard Reset runs and REST reconcile fails, freeze NEW BUYs for this tick only.
+            freeze_buys_post_reset_reconcile_fail = False
+
             # Ghost Order TTL Hard Reset (Every 5 minutes)
             if not self.exit_mode and time.time() - self.last_grid_reset_time > 300:
                 logger.warning(
                     f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
                 )
                 await self.cancel_all_orders(force_evict=True)
+                reconcile_ok = False
                 try:
-                    ok = await watchdog.reconcile_single_market(self.condition_id, force=True)
-                    if ok:
+                    reconcile_ok = await watchdog.reconcile_single_market(self.condition_id, force=True)
+                    if reconcile_ok:
                         logger.info(
                             f"[{self.token_id[:6]}] Post-reset REST inventory sync completed for condition."
                         )
                     else:
                         logger.warning(
                             f"[{self.token_id[:6]}] Post-reset REST sync skipped or failed; "
-                            "grid will use latest in-memory/DB snapshot — verify FUNDER_ADDRESS and ledger row."
+                            "verify FUNDER_ADDRESS and InventoryLedger row."
                         )
                 except Exception as e:
                     logger.error(
                         f"[{self.token_id[:6]}] Post-reset reconcile_single_market error: {e}",
                         exc_info=True,
                     )
+                    reconcile_ok = False
+
+                if not reconcile_ok:
+                    freeze_buys_post_reset_reconcile_fail = True
+                    logger.error(
+                        f"[{self.token_id[:6]}] FREEZE NEW BUYS (this tick only): post-reset reconciliation "
+                        "did not succeed — will not place BUY grid on uncertain inventory; SELL/unwind still allowed."
+                    )
+
                 self.last_grid_reset_time = time.time()
                 # Removed early return: proceed to rebuild the grid in the current tick.
 
@@ -679,7 +692,16 @@ class QuotingEngine:
                     f"[{self.token_id[:6]}] STRICT BUDGET CAP: MTM+pending ${strict_local_used_dollars:.2f} "
                     f">= MAX_EXPOSURE_PER_MARKET ${max_exposure_per_market:.2f} — no new BUY orders."
                 )
-            if not is_extreme_long and not self.exit_mode and not strict_budget_block_buys:
+            if freeze_buys_post_reset_reconcile_fail and not self.exit_mode:
+                logger.warning(
+                    f"[{self.token_id[:6]}] Post-reset reconcile freeze active — skipping BUY grid build."
+                )
+            if (
+                not is_extreme_long
+                and not self.exit_mode
+                and not strict_budget_block_buys
+                and not freeze_buys_post_reset_reconcile_fail
+            ):
                 if cross_token_locked:
                     logger.warning(
                         f"[{self.token_id[:6]}] CROSS-TOKEN LOCK: opposite {opposite_side} exposure "
@@ -735,13 +757,16 @@ class QuotingEngine:
                             0.0, buy_budget_remaining - effective_size * bid_price
                         )
 
-            mode = "GRACEFUL_EXIT" if self.exit_mode else (
-                "EXTREME_LIQUIDATING" if is_extreme_long else (
-                    "LOCKED_BY_OPPOSITE" if cross_token_locked else (
-                        "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
-                    )
-                )
-            )
+            if self.exit_mode:
+                mode = "GRACEFUL_EXIT"
+            elif is_extreme_long:
+                mode = "EXTREME_LIQUIDATING"
+            elif freeze_buys_post_reset_reconcile_fail:
+                mode = "POST_RESET_RECONCILE_FREEZE"
+            elif cross_token_locked:
+                mode = "LOCKED_BY_OPPOSITE"
+            else:
+                mode = "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
 
             # Rewards eligibility: check size and spread vs official requirements
             rewards_size_ok = True
@@ -783,6 +808,9 @@ class QuotingEngine:
                 f"{mode}"
             )
             # 5b. Balance pre-check: trim BUY orders if budget exceeded (all in Dollars)
+            if freeze_buys_post_reset_reconcile_fail:
+                orders_payload = [o for o in orders_payload if o["side"] != OrderSide.BUY]
+
             global_other_markets_dollars = await inventory_state.get_global_used_dollars_excluding(self.condition_id)
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
