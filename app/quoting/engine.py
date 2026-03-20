@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
 from app.oms.core import oms
+from app.risk.watchdog import watchdog
 from app.models.db_models import OrderSide, OrderStatus, OrderJournal
 
 logger = logging.getLogger(__name__)
@@ -319,12 +320,15 @@ class QuotingEngine:
                 )
         self._rewards_loaded = True
 
-    def _compute_effective_size(self, price: float) -> float:
+    def _compute_effective_size(self, price: float, max_additional_notional: Optional[float] = None) -> float:
         """
         Grid-budget-aware size calculation.
 
         If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
         Fallback logic: shrink to fit budget, or return 0.0 if below 5.0 (Polymarket min).
+
+        max_additional_notional: if set, notional for this order is capped so cumulative new BUYs
+        stay within strict per-market budget (MTM inventory + opposite-side pending already deducted).
         """
         auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
         max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
@@ -359,6 +363,13 @@ class QuotingEngine:
                 f"to fit per-order notional budget ({budget_per_order:.2f} @ price {price:.2f})."
             )
             target_size = shrunk_size
+
+        # 3b. Strict remaining notional (MTM + pending-aware budget from caller)
+        if max_additional_notional is not None and price > 0:
+            cap = max(0.0, float(max_additional_notional))
+            max_shares = cap / price
+            if target_size > max_shares:
+                target_size = max_shares
 
         # 4. Rewards-mode guardrail: avoid charity quoting when shrunk below rewards_min_size.
         if auto_tune and self.rewards_min_size > 0 and target_size < self.rewards_min_size:
@@ -448,6 +459,22 @@ class QuotingEngine:
                     f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
                 )
                 await self.cancel_all_orders(force_evict=True)
+                try:
+                    ok = await watchdog.reconcile_single_market(self.condition_id, force=True)
+                    if ok:
+                        logger.info(
+                            f"[{self.token_id[:6]}] Post-reset REST inventory sync completed for condition."
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] Post-reset REST sync skipped or failed; "
+                            "grid will use latest in-memory/DB snapshot — verify FUNDER_ADDRESS and ledger row."
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.token_id[:6]}] Post-reset reconcile_single_market error: {e}",
+                        exc_info=True,
+                    )
                 self.last_grid_reset_time = time.time()
                 # Removed early return: proceed to rebuild the grid in the current tick.
 
@@ -467,14 +494,7 @@ class QuotingEngine:
             # Dust immunity: treat exposure < 1.0 as 0 for mode decisions (is_long, cross_token_locked)
             current_exposure_for_logic = self._dust_filter(current_exposure)
             opposite_exposure_for_logic = self._dust_filter(opposite_exposure)
-            # Local used dollars (for risk/极端熔断): capital_used + pending notional
-            local_used_dollars = (
-                float(snap.get("yes_capital_used", 0.0))
-                + float(snap.get("no_capital_used", 0.0))
-                + float(snap.get("pending_yes_buy_notional", 0.0))
-                + float(snap.get("pending_no_buy_notional", 0.0))
-            )
-            
+
             actual_capital_used = (
                 float(snap.get("yes_capital_used", 0.0))
                 + float(snap.get("no_capital_used", 0.0))
@@ -484,7 +504,6 @@ class QuotingEngine:
                 if self.is_yes_token
                 else float(snap.get("pending_no_buy_notional", 0.0))
             )
-            local_used_dollars_excluding_me = local_used_dollars - my_pending_notional
 
             # [Graceful Exit] State Machine
             if self.exit_mode:
@@ -520,7 +539,18 @@ class QuotingEngine:
             if unified is None:
                 return
             fair_value, dynamic_spread, fv_yes = unified
-            
+
+            # Strict per-market "used" budget: MTM inventory + all active BUY notional (bulletproof vs stale capital_used).
+            fv_y_anchor = max(0.01, min(0.99, float(fv_yes)))
+            held_inventory_value = yes_exposure * fv_y_anchor + no_exposure * (1.0 - fv_y_anchor)
+            pending_yes_n = float(snap.get("pending_yes_buy_notional", 0.0))
+            pending_no_n = float(snap.get("pending_no_buy_notional", 0.0))
+            strict_local_used_dollars = held_inventory_value + pending_yes_n + pending_no_n
+            strict_local_used_excluding_me = strict_local_used_dollars - my_pending_notional
+            max_exposure_per_market_cfg = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            # Balance precheck: MTM inventory + opposite side's pending BUYs (this side's pending excluded — we replace our own quotes).
+            local_used_dollars_excluding_me = strict_local_used_excluding_me
+
             # 3. Debounce / Throttle Mechanism Check (Bypassed if exiting)
             if not self.exit_mode and self.last_anchor_mid_price is not None:
                 price_diff = abs(fair_value - self.last_anchor_mid_price)
@@ -566,7 +596,7 @@ class QuotingEngine:
             orders_payload: List[dict] = []
 
             # Two-way quoting: extreme line (dollars) and exit flags
-            max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            max_exposure_per_market = max_exposure_per_market_cfg
             extreme_threshold_dollars = max_exposure_per_market * 0.9
             my_capital_used = (
                 float(snap.get("yes_capital_used", 0.0))
@@ -598,7 +628,7 @@ class QuotingEngine:
                         )
                     else:
                         logger.warning(
-                            f"[{self.token_id[:6]}] EXTREME INVENTORY (local_used_dollars ${local_used_dollars:.2f} >= ${extreme_threshold_dollars:.2f}). "
+                            f"[{self.token_id[:6]}] EXTREME INVENTORY (strict_used ${strict_local_used_dollars:.2f} >= ${extreme_threshold_dollars:.2f}). "
                             "Entering EXTREME TAKER LIQUIDATION."
                         )
                     ask_price = max(0.01, min(0.99, round(best_bid_price - 0.02, 2)))
@@ -643,7 +673,13 @@ class QuotingEngine:
                         )
 
             # --- Line 2: BUY side (build position / take liquidity when safe) ---
-            if not is_extreme_long and not self.exit_mode:
+            strict_budget_block_buys = strict_local_used_dollars >= max_exposure_per_market - 1e-6
+            if strict_budget_block_buys and not self.exit_mode:
+                logger.warning(
+                    f"[{self.token_id[:6]}] STRICT BUDGET CAP: MTM+pending ${strict_local_used_dollars:.2f} "
+                    f">= MAX_EXPOSURE_PER_MARKET ${max_exposure_per_market:.2f} — no new BUY orders."
+                )
+            if not is_extreme_long and not self.exit_mode and not strict_budget_block_buys:
                 if cross_token_locked:
                     logger.warning(
                         f"[{self.token_id[:6]}] CROSS-TOKEN LOCK: opposite {opposite_side} exposure "
@@ -653,6 +689,9 @@ class QuotingEngine:
                 else:
                     one_tick_below = getattr(settings, "QUOTE_BID_ONE_TICK_BELOW_TOUCH", True)
                     seen_bid_prices: set = set()
+                    buy_budget_remaining = max(
+                        0.0, max_exposure_per_market - strict_local_used_excluding_me
+                    )
                     for i in range(self.grid_levels):
                         raw = round(bid_1 - (i * self.tick_size), 2)
                         bid_price = max(0.01, min(0.99, raw))
@@ -678,7 +717,9 @@ class QuotingEngine:
                             continue
                         seen_bid_prices.add(bid_price)
 
-                        effective_size = self._compute_effective_size(bid_price)
+                        effective_size = self._compute_effective_size(
+                            bid_price, max_additional_notional=buy_budget_remaining
+                        )
                         if effective_size <= 0:
                             continue
                         orders_payload.append(
@@ -689,6 +730,9 @@ class QuotingEngine:
                                 "price": bid_price,
                                 "size": effective_size,
                             }
+                        )
+                        buy_budget_remaining = max(
+                            0.0, buy_budget_remaining - effective_size * bid_price
                         )
 
             mode = "GRACEFUL_EXIT" if self.exit_mode else (

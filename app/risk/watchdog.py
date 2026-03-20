@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import httpx
+from typing import Dict, Optional
 from sqlalchemy.future import select
 
 from app.db.session import AsyncSessionLocal
@@ -13,10 +14,40 @@ from app.core.inventory_state import inventory_state
 
 logger = logging.getLogger(__name__)
 
+def _norm_cid(cid: Optional[str]) -> Optional[str]:
+    if not cid or not isinstance(cid, str):
+        return None
+    s = cid.strip()
+    if s.startswith("0x"):
+        return s.lower()
+    return s
+
+
+def _build_actual_inventory_from_positions(positions: list) -> Dict[str, Dict[str, float]]:
+    """Group Polymarket Data API positions by normalized conditionId -> {yes, no} sizes."""
+    actual_inventory: Dict[str, Dict[str, float]] = {}
+    for p in positions:
+        cid = p.get("conditionId")
+        if not cid:
+            continue
+        key = _norm_cid(cid)
+        if key is None:
+            continue
+        if key not in actual_inventory:
+            actual_inventory[key] = {"yes": 0.0, "no": 0.0}
+        outcome_idx = p.get("outcomeIndex")
+        size = float(p.get("size", 0.0))
+        if outcome_idx == 0 or str(p.get("outcome")).upper() == "YES":
+            actual_inventory[key]["yes"] += size
+        else:
+            actual_inventory[key]["no"] += size
+    return actual_inventory
+
+
 class RiskMonitor:
     def __init__(self):
         self.max_exposure = settings.MAX_EXPOSURE_PER_MARKET
-        self.reconciliation_interval = 300 # 5 minutes
+        self.reconciliation_interval = int(getattr(settings, "RECONCILIATION_INTERVAL_SEC", 60))
         self.exposure_tolerance = settings.EXPOSURE_TOLERANCE
         self.reconciliation_buffer_seconds = float(
             getattr(settings, "RECONCILIATION_BUFFER_SECONDS", 8.0)
@@ -120,6 +151,106 @@ class RiskMonitor:
             except Exception as e:
                 logger.error(f"Reconciliation loop error: {e}")
 
+    async def reconcile_single_market(self, condition_id: str, *, force: bool = False) -> bool:
+        """
+        REST sync for one condition_id (e.g. after Periodic Hard Reset).
+        When force=True, skip RECONCILIATION_BUFFER_SECONDS guard so WS drops cannot block truth.
+        """
+        if not settings.FUNDER_ADDRESS:
+            logger.warning("reconcile_single_market: FUNDER_ADDRESS not set; skip.")
+            return False
+        url = f"https://data-api.polymarket.com/positions?user={settings.FUNDER_ADDRESS}"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=15.0)
+                if resp.status_code != 200:
+                    logger.error(f"reconcile_single_market: positions HTTP {resp.status_code}")
+                    return False
+                positions = resp.json()
+        except Exception as e:
+            logger.error(f"reconcile_single_market: fetch failed: {e}")
+            return False
+        if not isinstance(positions, list):
+            logger.error(f"reconcile_single_market: bad positions type {type(positions)}")
+            return False
+
+        actual_inventory = _build_actual_inventory_from_positions(positions)
+        key = _norm_cid(condition_id)
+        actual = actual_inventory.get(key, {"yes": 0.0, "no": 0.0}) if key else {"yes": 0.0, "no": 0.0}
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(InventoryLedger)
+                .filter(InventoryLedger.market_id == condition_id)
+                .with_for_update()
+            )
+            db_inv = result.scalar_one_or_none()
+            if not db_inv:
+                logger.warning(
+                    "reconcile_single_market: no InventoryLedger row for %s; cannot sync",
+                    condition_id[:12],
+                )
+                return False
+
+            db_yes = float(db_inv.yes_exposure)
+            db_no = float(db_inv.no_exposure)
+            diff_yes = abs(db_yes - actual["yes"])
+            diff_no = abs(db_no - actual["no"])
+
+            if diff_yes <= self.exposure_tolerance and diff_no <= self.exposure_tolerance:
+                # Memory can still be wrong (WS drops) while DB/API agree — re-push truth.
+                if force:
+                    await inventory_state.apply_reconciliation_snapshot(
+                        market_id=condition_id,
+                        yes_exposure=actual["yes"],
+                        no_exposure=actual["no"],
+                        yes_capital_used=float(db_inv.yes_capital_used),
+                        no_capital_used=float(db_inv.no_capital_used),
+                    )
+                return True
+
+            if not force:
+                last_local_fill_ts = await inventory_state.get_last_local_fill_timestamp(condition_id)
+                if (
+                    last_local_fill_ts > 0
+                    and (time.time() - last_local_fill_ts) < self.reconciliation_buffer_seconds
+                ):
+                    logger.info(
+                        "reconcile_single_market: skipped (recent local fill, not force) %s",
+                        condition_id[:12],
+                    )
+                    return False
+
+            logger.warning(
+                "reconcile_single_market: overwriting ledger for %s API YES=%.4f NO=%.4f (was YES=%.4f NO=%.4f) force=%s",
+                condition_id[:12],
+                actual["yes"],
+                actual["no"],
+                db_yes,
+                db_no,
+                force,
+            )
+            db_inv.yes_exposure = actual["yes"]
+            db_inv.no_exposure = actual["no"]
+            if actual["yes"] <= 0.001:
+                db_inv.yes_capital_used = 0.0
+            elif db_yes > 1e-9:
+                db_inv.yes_capital_used = float(db_inv.yes_capital_used) * (actual["yes"] / db_yes)
+            if actual["no"] <= 0.001:
+                db_inv.no_capital_used = 0.0
+            elif db_no > 1e-9:
+                db_inv.no_capital_used = float(db_inv.no_capital_used) * (actual["no"] / db_no)
+
+            await inventory_state.apply_reconciliation_snapshot(
+                market_id=condition_id,
+                yes_exposure=actual["yes"],
+                no_exposure=actual["no"],
+                yes_capital_used=float(db_inv.yes_capital_used),
+                no_capital_used=float(db_inv.no_capital_used),
+            )
+            await session.commit()
+        return True
+
     async def reconcile_positions(self):
         # 1. Fetch real on-chain positions
         url = f"https://data-api.polymarket.com/positions?user={settings.FUNDER_ADDRESS}"
@@ -135,34 +266,8 @@ class RiskMonitor:
         if not isinstance(positions, list):
             logger.error(f"Unexpected positions format: {type(positions)}")
             return
-            
-        # Normalize conditionId for lookup (API may return different casing than DB)
-        def _norm_cid(cid: str | None) -> str | None:
-            if not cid or not isinstance(cid, str):
-                return None
-            s = cid.strip()
-            if s.startswith("0x"):
-                return s.lower()
-            return s
 
-        # Group actual positions by conditionId
-        actual_inventory = {}
-        for p in positions:
-            cid = p.get("conditionId")
-            if not cid:
-                continue
-            key = _norm_cid(cid)
-            if key is None:
-                continue
-            if key not in actual_inventory:
-                actual_inventory[key] = {"yes": 0.0, "no": 0.0}
-            # Usually outcomeIndex 0 is YES, 1 is NO for binary
-            outcome_idx = p.get("outcomeIndex")
-            size = float(p.get("size", 0.0))
-            if outcome_idx == 0 or str(p.get("outcome")).upper() == "YES":
-                actual_inventory[key]["yes"] += size
-            else:
-                actual_inventory[key]["no"] += size
+        actual_inventory = _build_actual_inventory_from_positions(positions)
 
         # 2. Compare with DB Ledger (row-level lock to prevent dirty writes from concurrent handle_fill)
         async with AsyncSessionLocal() as session:
@@ -173,7 +278,11 @@ class RiskMonitor:
             for db_inv in db_inventories:
                 cid = db_inv.market_id
                 key = _norm_cid(cid)
-                actual = actual_inventory.get(key, {"yes": 0.0, "no": 0.0}) if key else {"yes": 0.0, "no": 0.0}
+                actual = (
+                    actual_inventory.get(key, {"yes": 0.0, "no": 0.0})
+                    if key
+                    else {"yes": 0.0, "no": 0.0}
+                )
                 
                 db_yes = float(db_inv.yes_exposure)
                 db_no = float(db_inv.no_exposure)

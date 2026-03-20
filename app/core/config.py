@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     GLOBAL_MAX_BUDGET: float = 1000.0     # 绝对的资金红线 (风控红线)
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
     RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills
+    RECONCILIATION_INTERVAL_SEC: int = 60  # Periodic REST positions sync (watchdog); lower = less drift
     BASE_ORDER_SIZE: float = 10.0         # 兜底（Fallback）默认值
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     QUOTE_BASE_SPREAD: float = 0.02       # 兜底（Fallback）默认值
