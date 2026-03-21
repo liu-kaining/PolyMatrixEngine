@@ -5,6 +5,8 @@
 **Institutional-grade automated market-making and liquidity engine for [Polymarket](https://polymarket.com).**  
 Async architecture, memory-first state, diff quoting, and battle-tested risk controls—built to earn maker rebates and liquidity rewards without blowing up. *Python Web3 trading at its ceiling.*
 
+**Latest hardening (v6.3.3+):** after each **Periodic Hard Reset**, the engine **forces** a Polymarket **Data API** positions sync; if that reconcile **fails**, the current tick **freezes all new BUYs** (SELL / unwind still allowed). Per-market exposure is also capped using **strict MTM (mark-to-market) inventory value + pending BUY notional**, not cost-basis alone. Background REST reconciliation defaults to **every 60s** (`RECONCILIATION_INTERVAL_SEC`).
+
 ---
 
 ## Why PolyMatrix Engine?
@@ -15,9 +17,9 @@ PolyMatrix Engine is not a hobby script. It is a **proprietary-style (prop) trad
 
 - **Diff quoting, not “cancel all then post”.** Only orders that no longer match the target grid are cancelled; missing levels are created. Your resting orders keep their place in the queue and you burn far less API rate limit.
 
-- **Reconciliation with a time guard.** A configurable buffer after the last local fill prevents the watchdog from overwriting your book with stale REST data, so you never get “just filled, then wiped by delayed API”.
+- **Reconciliation with a time guard — plus post-reset truth.** Periodic full-book reconcile uses Polymarket **Data API** positions with a buffer after local fills to avoid stale overwrites. Separately, after **Periodic Hard Reset** the quoting engine **always** calls `reconcile_single_market(..., force=True)` before rebuilding bids; on **failure/timeout** it enters **BUY freeze** for that tick only (`POST_RESET_RECONCILE_FREEZE`).
 
-- **Capital protection by design.** Before sending orders, the engine checks that total BUY notional fits within your exposure budget and can auto-shrink or drop levels. Maker prices are clamped so you never cross the book and accidentally pay taker cost.
+- **Capital protection by design.** Before sending orders, the engine checks BUY notional against **`MAX_EXPOSURE_PER_MARKET`** and **`GLOBAL_MAX_BUDGET`** using **MTM inventory + active pending BUYs** (strict path), and can auto-shrink or drop levels. Maker prices are clamped so you never cross the book and accidentally pay taker cost.
 
 Suitable for **funds and teams** that want a pluggable, auditable engine to run on Polymarket—whether for liquidity rewards, structured market-making, or as the execution layer for higher-level alpha.
 
@@ -30,7 +32,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 | **Auto-Router (V6.3)** | Background portfolio manager with strict risk controls. Scans Gamma for high-yield opportunities, enforces event-horizon halts and sector limits, and biases selection toward deep-liquidity mid-term markets. |
 | **Performance** | Memory-first inventory; zero Postgres reads in the tick loop; `EngineSupervisor` task registry; async persist queue with bounded size and graceful drain on shutdown. |
 | **Execution** | Diff quoting (keep/cancel/create by signature); preserves time priority and cuts API churn. Fail-closed resilient WS with heartbeat dropping detection. |
-| **Risk** | Global max budget (`GLOBAL_MAX_BUDGET`) enforcing across all engines. Per-market kill switch, circuit breaker, reconciliation with timestamp guard, and balance precheck. |
+| **Risk** | Global max budget (`GLOBAL_MAX_BUDGET`). Per-market kill switch on **capital_used**, circuit breaker, **Data API** reconciliation (default **60s** loop + **forced** sync after hard reset), **BUY freeze** if post-reset reconcile fails, **strict MTM** per-market budget, timestamp guard on stale REST overwrites, and balance precheck. |
 | **Maker discipline** | Crosses-the-book guard (SELL ≥ best_bid + tick, BUY ≤ best_ask - tick); no accidental taker flow. |
 | **Rewards** | Gamma-driven rewards params (min size, max spread); adaptive sizing with a safety fuse so grid budget is never exceeded. |
 | **Ops** | Streamlit dashboard (screener, exposure, logs, emergency stop/liquidate); FastAPI control plane; full .env configuration. |
@@ -46,62 +48,81 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 - **In-Memory Inventory State** — `InventoryStateManager` single source of truth for exposure in the hot path; fills update memory immediately and enqueue async DB writes; bounded queue and drain-on-shutdown to avoid OOM and data loss.
 - **Unified Pricing (AlphaModel)** — Single anchor from YES book (mid + OBI skew); NO side derived; dynamic spread and inventory-aware state machine (QUOTING / GRACEFUL_EXIT / LIQUIDATING / LOCKED_BY_OPPOSITE).
 - **Diff Quoting** — Compare current active orders to desired grid by (side, price, size); cancel only stale, create only missing; preserves time priority and reduces CLOB traffic.
-- **Balance Precheck** — Before placing a batch, check total BUY notional against BOTH `MAX_EXPOSURE_PER_MARKET` and `GLOBAL_MAX_BUDGET`. Auto-shrinks or drops levels to absolutely prevent hitting capital ceilings.
+- **Balance Precheck** — Before placing a batch, check total BUY notional against BOTH `MAX_EXPOSURE_PER_MARKET` and `GLOBAL_MAX_BUDGET`, using the same **strict MTM + pending** basis as the quoting loop. Auto-shrinks or drops levels to prevent breaching capital ceilings.
 - **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Rewards Farming Ready** — Read rewards min size and max spread from Gamma; adapt size when safe, else fall back to base size; dashboard shows rewards eligibility.
-- **Ghost order hard reset** — Periodic TTL-based hard reset clears potential phantom orders after WS drops; on hard reset, failed cancels are force-evicted from the local active-order cache to free pending-notional budget.
+- **Ghost order hard reset + forced REST sync** — Every **~5 minutes**, a TTL **Periodic Hard Reset** clears potential phantom orders after WS drops; failed cancels are **force-evicted** from the local active-order cache. **Immediately after**, the engine calls **`watchdog.reconcile_single_market(condition_id, force=True)`** against Polymarket **Data API** so inventory matches chain truth before any new grid math. If reconcile **returns false** or raises, that tick **skips all new BUYs** and strips BUYs before precheck (**semi-shock**); mode **`POST_RESET_RECONCILE_FREEZE`** is published.
+- **Strict MTM budgeting** — Per-market “used” budget for new BUYs is **`MTM(held YES/NO @ fair value) + pending_yes_buy_notional + pending_no_buy_notional`**. At or above **`MAX_EXPOSURE_PER_MARKET`**, new BUY size is forced to **zero**; grid loop tracks remaining notional so cumulative new bids cannot breach the cap.
+- **Faster reconciliation loop** — Watchdog background positions sync interval is **`RECONCILIATION_INTERVAL_SEC`** (default **60** seconds), reducing drift between local state and API when WS is flaky.
 - **OMS + Circuit Breaker** — Orders and cancels via `py-clob-client`; transient errors trip a circuit breaker; non-transient (e.g. 400) do not; “matched orders can't be canceled” treated as success (INFO).
-- **Risk Watchdog** — Per-market kill switch based on **actual spent capital** (not pending notional); periodic Polymarket positions sync with tolerance, timestamp guard, and capital-used reconciliation to prevent phantom budget lock.
+- **Risk Watchdog** — Per-market kill switch based on **actual spent capital** (`yes_capital_used` + `no_capital_used`), not pending notional. **`reconcile_positions()`** vs Data API on a timer; **`reconcile_single_market()`** for one condition (used by engine after hard reset). Tolerance + timestamp guard + proportional **capital_used** adjustment on overwrite.
 - **Streamlit Dashboard** — Gamma screener, start/stop/liquidate, inventory & PnL, active orders, real-time engine status, logs tail.
 
 ---
 
 ## Architecture Overview
 
+**External services (Polymarket + infra)**
+
+```
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────────────────────┐
+  │ Market WS    │ │ User WS      │ │ CLOB REST    │ │ Gamma API    │ │ Data API                │
+  │ (orderbook)  │ │ fills/cancels│ │ orders       │ │ markets/meta │ │ GET /positions?user=…   │
+  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └────────────┬────────────┘
+         │                │                │                │                       │
+         ▼                ▼                ▼                ▼                       ▼
+   gateway.py      user_stream.py     oms/core.py    auto_router.py         risk/watchdog.py
+   (local book)    (journal+inv)      (place/cancel) (optional portfolio)   reconcile_*()
+```
+
+**In-process control & data plane**
+
 ```
                           ┌─────────────────────────────────────┐
-                          │       dashboard (Streamlit)          │
-                          │  Screener | Control | Risk | Logs    │
-                          └──────────────────┬───────────────────┘
+                          │       dashboard (Streamlit)         │
+                          │  Screener | Control | Risk | Logs   │
+                          └──────────────────┬──────────────────┘
                                               │ HTTP
                                               ▼
                           ┌─────────────────────────────────────┐
-                          │           app/main.py (FastAPI)     │
-                          │  /markets/{id}/start|stop|liquidate │
-                          │  /markets/status | /orders/active   │
-                          └──────────────────┬───────────────────┘
+                          │        app/main.py (FastAPI)         │
+                          │  start|stop|liquidate | status       │
+                          │  + optional Auto-Router task         │
+                          └──────────────────┬──────────────────┘
                                               │
-         ┌───────────────────────────────────┼───────────────────────────────────┐
-         │                                   │                                   │
-         ▼                                   ▼                                   ▼
+         ┌────────────────────────────────────┼────────────────────────────────────┐
+         │                                    │                                    │
+         ▼                                    ▼                                    ▼
 ┌─────────────────────┐           ┌─────────────────────────┐           ┌─────────────────────┐
 │ market_data/gateway │           │ core/inventory_state    │           │ oms/core            │
-│ WS + REST → Local   │── tick ──▶│ Memory-first inventory  │           │ place/cancel +      │
-│ Orderbook → Redis   │           │ Async persist queue     │           │ CircuitBreaker       │
+│ WS+REST → local OB  │── tick ──▶│ Memory-first inventory  │           │ CLOB + circuit brk. │
+│ → Redis ob/tick     │           │ Async persist queue     │           │                     │
 └─────────────────────┘           └───────────┬─────────────┘           └──────────┬──────────┘
          │                                    │                                    │
-         │ tick:{token}                       │ get_snapshot()                     │ create/cancel
-         │                                    │ (no DB in loop)                    │
+         │ tick:{token}                       │ get_snapshot() (no DB in tick)     │ orders
+         │ ob:{token}                         │ pending BUY notional per side      │
          ▼                                    ▼                                    ▲
 ┌─────────────────────┐           ┌─────────────────────────┐                     │
-│ quoting/engine      │           │ risk/watchdog            │                     │
-│ • AlphaModel, FV    │           │ • Exposure check        │─────────────────────┘
-│ • Diff quoting      │──────────▶│ • Reconcile + buffer    │   cancel_market_orders
-│ • Balance precheck  │ control   │ • suspend pub           │
-│ • Cross-book guard  │           └─────────────────────────┘
+│ quoting/engine      │◀─────────▶│ risk/watchdog           │─────────────────────┘
+│ • unified FV, MTM   │ reconcile │ • ~1s exposure check    │   kill: cancel+suspend
+│ • hard reset →      │ Data API  │ • periodic reconcile    │
+│   reconcile_single  │           │   (RECONCILIATION_…     │
+│ • BUY freeze if     │           │    INTERVAL_SEC)        │
+│   reconcile fails   │           │ • timestamp guard       │
+│ • diff quoting →OMS │           └─────────────────────────┘
 └─────────────────────┘
          │
-         │ order_status (FILLED/CANCELED from user_stream)
+         │ order_status:{condition}:{token}
          ▼
 ┌─────────────────────┐
 │ market_data/        │
-│ user_stream         │ → handle_fill → inventory_state.apply_fill → queue persist
-│ (User WS)           │ → handle_cancel → order_status pub
+│ user_stream         │ → apply_fill → inventory_state (+ persist queue)
+│                     │ → order_status pub → engine active_orders
 └─────────────────────┘
 ```
 
-**Data flow (short):** Market WS and User WS feed gateway and user_stream. Gateway publishes **ticks** to Redis. Engines subscribe to **tick** and **control**; they read **inventory from memory only** (InventoryStateManager), compute fair value and grid, then **diff-quote** (cancel stale, create missing) via OMS. Fills update **inventory in memory** and enqueue DB persist. Watchdog monitors exposure and reconciles with Polymarket REST, **skipping overwrite** when a local fill is within the buffer window.
+**Data flow (short):** Gateway and user stream consume **Market** and **User** WebSockets. Gateway publishes **ticks** and orderbook KV to **Redis**. Each **QuotingEngine** subscribes to **tick**, **control**, and **order_status**; on every tick it reads **`inventory_state.get_snapshot()`** only (no Postgres in the hot path), computes fair value and grid, enforces **strict MTM + pending** budget and crosses-book guards, then **diff-quotes** via **OMS**. Fills hit **memory first**, then a bounded async persist queue. **Watchdog** runs **per-second** exposure checks against **capital_used** and a **periodic Data API reconciliation** (default **60s**); the **quoting engine** triggers **`reconcile_single_market(..., force=True)`** immediately after **Periodic Hard Reset**. If that call **fails**, the engine **does not** place new **BUY** orders for that tick. Routine reconciliation still **skips overwrite** shortly after a local fill (**`RECONCILIATION_BUFFER_SECONDS`**) to avoid stale API wiping fresh fills.
 
 ---
 
@@ -137,9 +158,10 @@ We **do not** implement the full reward formula (order scoring, sampling, epoch 
 | `app/core/inventory_state.py` | **In-memory inventory state.** Single source of truth for exposure on the hot path; async bounded queue for DB persist; graceful drain on shutdown. |
 | `app/market_data/gateway.py` | Local orderbook from Market WS + REST; publishes snapshots to Redis `tick:{token}` / `ob:{token}`. |
 | `app/market_data/user_stream.py` | User WS: trade/cancel events; updates OrderJournal and **inventory_state** (memory + enqueue persist); publishes order_status for engine active-order cleanup. |
-| `app/quoting/engine.py` | QuotingEngine: subscribes to tick + control + order_status; **reads inventory from memory**; AlphaModel + grid; **diff quoting** (sync_orders_diff); balance precheck; crosses-the-book guard; rewards-aware sizing. |
+| `app/quoting/engine.py` | QuotingEngine: tick + control + order_status; **memory-only** inventory; unified FV; **strict MTM + pending** BUY budget; **Periodic Hard Reset** → **`reconcile_single_market(force=True)`**; **BUY freeze** on reconcile failure; **diff quoting**; balance precheck; crosses-the-book guard; rewards-aware sizing. |
 | `app/oms/core.py` | OMS: py-clob-client, CircuitBreaker, place/cancel, “matched can’t cancel” as success. |
-| `app/risk/watchdog.py` | Exposure check; reconciliation with Polymarket positions API; **timestamp guard** (skip overwrite shortly after local fill). |
+| `app/risk/watchdog.py` | **~1s** exposure check vs **capital_used**; **`reconcile_positions()`** + **`reconcile_single_market()`** vs **Data API**; **`RECONCILIATION_INTERVAL_SEC`** loop; **timestamp guard** after local fills; kill switch → cancel + suspend. |
+| `app/core/auto_router.py` | Optional **V6.3** portfolio manager: Gamma scan, scoring, sector/event-horizon limits, start/stop markets. |
 | `app/models/` | OrderJournal, InventoryLedger, MarketMeta. |
 | `app/core/` | Config, Redis, DB session. |
 | `dashboard/` | Streamlit: Gamma screener, start/stop/liquidate, inventory & risk, active orders, engine status, logs. |
@@ -225,6 +247,7 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `MAX_EXPOSURE_PER_MARKET` | Cap per market (USDC); watchdog kill switch | e.g. `50.0` |
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | Seconds after last local fill to skip REST overwrite | `8.0` |
+| `RECONCILIATION_INTERVAL_SEC` | Watchdog periodic **Data API** positions sync interval | `60` |
 | `BASE_ORDER_SIZE` | Size per order (min 5) | e.g. `5.0` |
 | `GRID_LEVELS` | Grid levels per side | `2` |
 | `QUOTE_BASE_SPREAD` | Spread around fair value | `0.02` |
