@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
     RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills
     RECONCILIATION_INTERVAL_SEC: int = 60  # Periodic REST positions sync (watchdog); lower = less drift
+    # V6.4: Periodic Hard Reset — wallet-wide CLOB cancel_all + settle sleep before local cleanup
+    HARD_RESET_CLOB_CANCEL_ALL_ENABLED: bool = True
+    HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC: float = 3.0  # Let matching engine release USDC before new quotes
+    HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC: float = 45.0
+    HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC: float = 20.0
+    # Skip wallet-level cancel_all if another engine just ran it (two engines per market).
+    HARD_RESET_CLOB_WALLET_DEDUP_SEC: float = 15.0
     BASE_ORDER_SIZE: float = 10.0         # 兜底（Fallback）默认值
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     QUOTE_BASE_SPREAD: float = 0.02       # 兜底（Fallback）默认值

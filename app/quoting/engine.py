@@ -461,6 +461,20 @@ class QuotingEngine:
                 logger.warning(
                     f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
                 )
+                # V6.4: Wallet-wide CLOB cancel_all FIRST (kills exchange-side ghosts), then settle sleep,
+                # then local OMS cleanup + REST inventory reconcile.
+                hard_reset_usdc_balance_label = "unknown"
+                try:
+                    hr = await oms.physical_clob_cancel_all_for_hard_reset()
+                    hard_reset_usdc_balance_label = str(
+                        hr.get("usdc_balance_label", "unknown")
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.token_id[:6]}] [HARD RESET] physical_clob_cancel_all_for_hard_reset error: {e}",
+                        exc_info=True,
+                    )
+
                 await self.cancel_all_orders(force_evict=True)
                 reconcile_ok = False
                 try:
@@ -487,6 +501,11 @@ class QuotingEngine:
                         f"[{self.token_id[:6]}] FREEZE NEW BUYS (this tick only): post-reset reconciliation "
                         "did not succeed — will not place BUY grid on uncertain inventory; SELL/unwind still allowed."
                     )
+
+                logger.info(
+                    f"[{self.token_id[:6]}] [HARD RESET] Local state synced. "
+                    f"Fresh USDC balance available: ${hard_reset_usdc_balance_label}. Resuming quoting."
+                )
 
                 self.last_grid_reset_time = time.time()
                 # Removed early return: proceed to rebuild the grid in the current tick.

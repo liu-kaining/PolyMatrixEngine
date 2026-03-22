@@ -5,7 +5,7 @@
 **Institutional-grade automated market-making and liquidity engine for [Polymarket](https://polymarket.com).**  
 Async architecture, memory-first state, diff quoting, and battle-tested risk controls—built to earn maker rebates and liquidity rewards without blowing up. *Python Web3 trading at its ceiling.*
 
-**Latest hardening (v6.3.3+):** after each **Periodic Hard Reset**, the engine **forces** a Polymarket **Data API** positions sync; if that reconcile **fails**, the current tick **freezes all new BUYs** (SELL / unwind still allowed). Per-market exposure is also capped using **strict MTM (mark-to-market) inventory value + pending BUY notional**, not cost-basis alone. Background REST reconciliation defaults to **every 60s** (`RECONCILIATION_INTERVAL_SEC`).
+**Latest hardening (v6.3.3+ / v6.4):** on each **Periodic Hard Reset**, the engine first calls the CLOB **`cancel_all`** (wallet-wide) via **`oms.physical_clob_cancel_all_for_hard_reset()`**, then **`asyncio.sleep`** (`HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC`, default **3s**) so USDC locks release, then **local** `cancel_all_orders` + **Data API** reconcile. If reconcile **fails**, the tick **freezes new BUYs**. Per-market exposure uses **strict MTM + pending BUY notional**. Background reconciliation defaults to **60s** (`RECONCILIATION_INTERVAL_SEC`).
 
 ---
 
@@ -52,7 +52,7 @@ Suitable for **funds and teams** that want a pluggable, auditable engine to run 
 - **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Rewards Farming Ready** — Read rewards min size and max spread from Gamma; adapt size when safe, else fall back to base size; dashboard shows rewards eligibility.
-- **Ghost order hard reset + forced REST sync** — Every **~5 minutes**, a TTL **Periodic Hard Reset** clears potential phantom orders after WS drops; failed cancels are **force-evicted** from the local active-order cache. **Immediately after**, the engine calls **`watchdog.reconcile_single_market(condition_id, force=True)`** against Polymarket **Data API** so inventory matches chain truth before any new grid math. If reconcile **returns false** or raises, that tick **skips all new BUYs** and strips BUYs before precheck (**semi-shock**); mode **`POST_RESET_RECONCILE_FREEZE`** is published.
+- **Ghost order hard reset + CLOB Cancel-All (v6.4)** — Every **~5 minutes**, **Periodic Hard Reset** runs **`client.cancel_all()`** (wallet-wide; fallback: `get_orders` + `cancel_orders`) with **try/except + timeout**, then **mandatory sleep** (`HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC`) and optional **`get_balance_allowance`** for logging. Then **local** `cancel_all_orders(force_evict)` and **`reconcile_single_market(force=True)`**. If reconcile **fails**, that tick **skips new BUYs** (**`POST_RESET_RECONCILE_FREEZE`**).
 - **Strict MTM budgeting** — Per-market “used” budget for new BUYs is **`MTM(held YES/NO @ fair value) + pending_yes_buy_notional + pending_no_buy_notional`**. At or above **`MAX_EXPOSURE_PER_MARKET`**, new BUY size is forced to **zero**; grid loop tracks remaining notional so cumulative new bids cannot breach the cap.
 - **Faster reconciliation loop** — Watchdog background positions sync interval is **`RECONCILIATION_INTERVAL_SEC`** (default **60** seconds), reducing drift between local state and API when WS is flaky.
 - **OMS + Circuit Breaker** — Orders and cancels via `py-clob-client`; transient errors trip a circuit breaker; non-transient (e.g. 400) do not; “matched orders can't be canceled” treated as success (INFO).
@@ -159,7 +159,7 @@ We **do not** implement the full reward formula (order scoring, sampling, epoch 
 | `app/market_data/gateway.py` | Local orderbook from Market WS + REST; publishes snapshots to Redis `tick:{token}` / `ob:{token}`. |
 | `app/market_data/user_stream.py` | User WS: trade/cancel events; updates OrderJournal and **inventory_state** (memory + enqueue persist); publishes order_status for engine active-order cleanup. |
 | `app/quoting/engine.py` | QuotingEngine: tick + control + order_status; **memory-only** inventory; unified FV; **strict MTM + pending** BUY budget; **Periodic Hard Reset** → **`reconcile_single_market(force=True)`**; **BUY freeze** on reconcile failure; **diff quoting**; balance precheck; crosses-the-book guard; rewards-aware sizing. |
-| `app/oms/core.py` | OMS: py-clob-client, CircuitBreaker, place/cancel, “matched can’t cancel” as success. |
+| `app/oms/core.py` | OMS: py-clob-client, CircuitBreaker, place/cancel, “matched can’t cancel” as success; **`physical_clob_cancel_all_for_hard_reset()`** (v6.4 wallet **cancel_all** + settle sleep + balance log). |
 | `app/risk/watchdog.py` | **~1s** exposure check vs **capital_used**; **`reconcile_positions()`** + **`reconcile_single_market()`** vs **Data API**; **`RECONCILIATION_INTERVAL_SEC`** loop; **timestamp guard** after local fills; kill switch → cancel + suspend. |
 | `app/core/auto_router.py` | Optional **V6.3** portfolio manager: Gamma scan, scoring, sector/event-horizon limits, start/stop markets. |
 | `app/models/` | OrderJournal, InventoryLedger, MarketMeta. |
@@ -248,6 +248,11 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | Seconds after last local fill to skip REST overwrite | `8.0` |
 | `RECONCILIATION_INTERVAL_SEC` | Watchdog periodic **Data API** positions sync interval | `60` |
+| `HARD_RESET_CLOB_CANCEL_ALL_ENABLED` | On periodic hard reset, call CLOB **cancel_all** before local cleanup | `True` |
+| `HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC` | Sleep after cancel_all for USDC release | `3.0` |
+| `HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC` | Timeout for **cancel_all** thread call | `45.0` |
+| `HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC` | Timeout for **get_balance_allowance** after sleep | `20.0` |
+| `HARD_RESET_CLOB_WALLET_DEDUP_SEC` | Skip duplicate wallet **cancel_all** if another engine ran within N s (YES+NO engines) | `15.0` |
 | `BASE_ORDER_SIZE` | Size per order (min 5) | e.g. `5.0` |
 | `GRID_LEVELS` | Grid levels per side | `2` |
 | `QUOTE_BASE_SPREAD` | Spread around fair value | `0.02` |

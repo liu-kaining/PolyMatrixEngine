@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+import time
+from typing import Any, Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -13,6 +14,10 @@ from app.db.session import AsyncSessionLocal
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Process-wide: YES/NO engines share one wallet — avoid double cancel_all + double sleep same second.
+_last_wallet_cancel_all_monotonic: float = 0.0
+
 
 def _is_non_transient_error(e: Exception) -> bool:
     """403 geoblock / 400 balance: retrying won't help; don't count toward circuit breaker."""
@@ -330,5 +335,144 @@ class OrderManagementSystem:
             
         logger.info(f"KILL SWITCH SUCCESS: {success_count}/{len(active_orders)} orders canceled for {condition_id}")
         return True
+
+    @staticmethod
+    def _format_collateral_balance(bal: Any) -> str:
+        """Best-effort stringify of CLOB get_balance_allowance response."""
+        if bal is None:
+            return "unknown"
+        if isinstance(bal, dict):
+            for k in ("balance", "available", "availableBalance", "allowance", "collateral"):
+                v = bal.get(k)
+                if v is not None and v != "":
+                    return str(v)
+            return str(bal)
+        return str(bal)
+
+    def _sync_clob_cancel_all_wallet(self) -> Any:
+        """
+        Synchronous: cancel every open order for this API key on the CLOB (ghost-order purge).
+        Prefer client.cancel_all(); fall back to get_orders + cancel_orders if unavailable.
+        """
+        self.client.assert_level_2_auth()
+        if hasattr(self.client, "cancel_all") and callable(getattr(self.client, "cancel_all")):
+            return self.client.cancel_all()
+        # Older py-clob-client fallback
+        orders: List[dict] = self.client.get_orders() or []
+        ids: List[str] = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            oid = o.get("id") or o.get("orderID") or o.get("order_id")
+            if oid:
+                ids.append(str(oid))
+        if not ids:
+            return {"canceled": [], "not_canceled": {}, "note": "no open orders from get_orders"}
+        if hasattr(self.client, "cancel_orders") and callable(getattr(self.client, "cancel_orders")):
+            return self.client.cancel_orders(ids)
+        last = None
+        for oid in ids:
+            last = self.client.cancel(oid)
+        return last
+
+    async def physical_clob_cancel_all_for_hard_reset(self) -> Dict[str, Any]:
+        """
+        V6.4 — Wallet-wide physical cancel on Polymarket CLOB, then sleep for balance release.
+        Safe for the event loop: blocking HTTP runs in a thread. Never raises; logs errors.
+
+        Returns:
+            dict with keys: cancel_all_ok (Optional[bool]), usdc_balance_label (str), skipped (bool)
+        """
+        global _last_wallet_cancel_all_monotonic
+
+        result: Dict[str, Any] = {
+            "cancel_all_ok": None,
+            "usdc_balance_label": "unknown",
+            "skipped": False,
+        }
+
+        sleep_sec = float(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC", 3.0))
+        cancel_timeout = float(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC", 45.0))
+        bal_timeout = float(getattr(settings, "HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC", 20.0))
+        enabled = bool(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_ENABLED", True))
+
+        dedup_sec = float(getattr(settings, "HARD_RESET_CLOB_WALLET_DEDUP_SEC", 15.0))
+        now_m = time.monotonic()
+        if (
+            dedup_sec > 0
+            and _last_wallet_cancel_all_monotonic > 0
+            and (now_m - _last_wallet_cancel_all_monotonic) < dedup_sec
+        ):
+            logger.info(
+                "[HARD RESET] Wallet Cancel-All dedup: another engine ran within "
+                f"{dedup_sec:.0f}s — skipping repeat (ghost purge already triggered)."
+            )
+            result["skipped"] = True
+            result["dedup"] = True
+            return result
+
+        logger.info("[HARD RESET] Initiating physical CLOB Cancel-All to clear Ghost Orders...")
+
+        if not enabled:
+            logger.info("[HARD RESET] CLOB Cancel-All disabled via HARD_RESET_CLOB_CANCEL_ALL_ENABLED=false.")
+            result["skipped"] = True
+            logger.info(
+                f"[HARD RESET] Cancel-All skipped (disabled). Sleeping {sleep_sec:.1f}s before local cleanup..."
+            )
+            await asyncio.sleep(sleep_sec)
+            _last_wallet_cancel_all_monotonic = time.monotonic()
+            return result
+
+        if not self.client or not self.live_trading_enabled:
+            logger.info(
+                "[HARD RESET] Skipping CLOB Cancel-All (dry-run or ClobClient not initialized). "
+                "Sleeping before local cleanup anyway."
+            )
+            result["skipped"] = True
+            await asyncio.sleep(sleep_sec)
+            _last_wallet_cancel_all_monotonic = time.monotonic()
+            return result
+
+        try:
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(self._sync_clob_cancel_all_wallet),
+                timeout=cancel_timeout,
+            )
+            result["cancel_all_ok"] = True
+            logger.info(f"[HARD RESET] CLOB Cancel-All completed. API response (truncated): {str(raw)[:500]}")
+        except asyncio.TimeoutError:
+            result["cancel_all_ok"] = False
+            logger.error(
+                f"[HARD RESET] CLOB Cancel-All timed out after {cancel_timeout:.1f}s — continuing with sleep."
+            )
+        except Exception as e:
+            result["cancel_all_ok"] = False
+            logger.error(f"[HARD RESET] CLOB Cancel-All failed — continuing: {e}", exc_info=True)
+
+        logger.info(
+            f"[HARD RESET] Cancel-All sent. Sleeping for {sleep_sec:.1f}s to await balance release..."
+        )
+        await asyncio.sleep(sleep_sec)
+
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal = await asyncio.wait_for(
+                asyncio.to_thread(self.client.get_balance_allowance, params),
+                timeout=bal_timeout,
+            )
+            label = self._format_collateral_balance(bal)
+            result["usdc_balance_label"] = label
+            logger.info(f"[HARD RESET] CLOB collateral balance read: {label}")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[HARD RESET] get_balance_allowance timed out after {bal_timeout:.1f}s — balance unknown."
+            )
+        except Exception as e:
+            logger.warning(f"[HARD RESET] Could not fetch USDC collateral balance: {e}")
+
+        _last_wallet_cancel_all_monotonic = time.monotonic()
+        return result
 
 oms = OrderManagementSystem()
