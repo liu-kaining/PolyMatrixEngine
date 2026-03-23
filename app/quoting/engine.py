@@ -177,10 +177,17 @@ class QuotingEngine:
                     payload = o.payload or {}
                     if payload.get("token_id") != self.token_id:
                         continue
+                    created_ts = time.time()
+                    if getattr(o, "created_at", None) is not None:
+                        try:
+                            created_ts = float(o.created_at.timestamp())
+                        except Exception:
+                            created_ts = time.time()
                     self.active_orders[o.order_id] = {
                         "side": o.side.value,
                         "price": float(o.price),
                         "size": float(o.size),
+                        "created_ts": created_ts,
                     }
         if not ok:
             return False
@@ -852,7 +859,7 @@ class QuotingEngine:
             logger.info("=========================================================================")
             
             # 6. Diff Quoting: keep unchanged orders, cancel stale, create missing
-            await self.sync_orders_diff(orders_payload)
+            await self.sync_orders_diff(orders_payload, fair_value=fair_value)
 
     def _apply_balance_precheck(
         self,
@@ -956,7 +963,43 @@ class QuotingEngine:
             notional=total_buy_notional
         )
 
-    async def sync_orders_diff(self, desired_orders: List[dict]):
+    def _is_within_rewards_spread(self, price: float, fair_value: Optional[float]) -> bool:
+        """
+        Keep-live guard:
+        if order price is still within rewards max spread around FV, prefer not to churn.
+        """
+        if fair_value is None:
+            return False
+        rewards_max_spread = float(getattr(self, "rewards_max_spread", 0.0) or 0.0)
+        if rewards_max_spread <= 0:
+            return False
+        # rewards_max_spread is full spread; price distance is half-spread distance from FV.
+        return abs(float(price) - float(fair_value)) <= (rewards_max_spread / 2.0)
+
+    def _consume_compatible_desired_order(
+        self,
+        desired_by_sig: Dict[Tuple[str, float, float], List[dict]],
+        side: str,
+        price: float,
+        price_offset_threshold: float,
+    ) -> None:
+        """
+        When we keep a stale order for anti-churn reasons, consume one compatible desired order
+        so we don't create a near-duplicate replacement in the same tick.
+        """
+        for sig in list(desired_by_sig.keys()):
+            sig_side, sig_price, _sig_size = sig
+            if str(sig_side).upper() != str(side).upper():
+                continue
+            if abs(float(sig_price) - float(price)) <= price_offset_threshold:
+                bucket = desired_by_sig.get(sig) or []
+                if bucket:
+                    bucket.pop()
+                if not bucket:
+                    desired_by_sig.pop(sig, None)
+                return
+
+    async def sync_orders_diff(self, desired_orders: List[dict], fair_value: Optional[float] = None):
         desired_by_sig: Dict[Tuple[str, float, float], List[dict]] = defaultdict(list)
         for o in desired_orders:
             sig = self._order_signature(o["side"].value, o["price"], o["size"])
@@ -964,6 +1007,16 @@ class QuotingEngine:
 
         # 1) Keep exact matches to preserve time-priority.
         to_cancel: List[str] = []
+        kept_for_lifetime = 0
+        kept_for_price_offset = 0
+        kept_for_rewards_band = 0
+        now_ts = time.time()
+        reconciliation_buffer_seconds = float(
+            getattr(settings, "RECONCILIATION_BUFFER_SECONDS", 8.0)
+        )
+        price_offset_threshold = float(
+            getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.01)
+        )
         for order_id, meta in list(self.active_orders.items()):
             sig = self._order_signature(
                 str(meta.get("side", "")),
@@ -976,9 +1029,54 @@ class QuotingEngine:
                 if not bucket:
                     desired_by_sig.pop(sig, None)
             else:
+                # Anti-churn gates for non-exact replacement:
+                # 1) minimum life-time, 2) FV price offset, 3) rewards-band keep-alive.
+                created_ts = float(meta.get("created_ts", now_ts))
+                if "created_ts" not in meta:
+                    # Older cache entries: initialize to "now" to avoid immediate churn.
+                    meta["created_ts"] = now_ts
+                    created_ts = now_ts
+                age_sec = max(0.0, now_ts - created_ts)
+                order_price = float(meta.get("price", 0.0))
+                side = str(meta.get("side", ""))
+                price_diff_from_fv = (
+                    abs(order_price - float(fair_value)) if fair_value is not None else float("inf")
+                )
+                keep_rewards = (not self.exit_mode) and self._is_within_rewards_spread(
+                    order_price, fair_value
+                )
+
+                if age_sec < reconciliation_buffer_seconds:
+                    kept_for_lifetime += 1
+                    self._consume_compatible_desired_order(
+                        desired_by_sig, side, order_price, price_offset_threshold
+                    )
+                    continue
+                if fair_value is not None and price_diff_from_fv <= price_offset_threshold:
+                    kept_for_price_offset += 1
+                    self._consume_compatible_desired_order(
+                        desired_by_sig, side, order_price, price_offset_threshold
+                    )
+                    continue
+                if keep_rewards:
+                    kept_for_rewards_band += 1
+                    self._consume_compatible_desired_order(
+                        desired_by_sig, side, order_price, price_offset_threshold
+                    )
+                    continue
+
                 to_cancel.append(order_id)
 
         # 2) Cancel only stale orders.
+        if kept_for_lifetime or kept_for_price_offset or kept_for_rewards_band:
+            logger.info(
+                f"[{self.token_id[:6]}] Diff quoting anti-churn keep: "
+                f"lifetime={kept_for_lifetime}, "
+                f"price_offset={kept_for_price_offset}, "
+                f"rewards_band={kept_for_rewards_band} "
+                f"(buffer={reconciliation_buffer_seconds:.2f}s, "
+                f"offset={price_offset_threshold:.4f})"
+            )
         if to_cancel:
             logger.info(f"[{self.token_id[:6]}] Diff quoting: cancel stale={len(to_cancel)}")
             tasks = [oms.cancel_order(oid) for oid in to_cancel]
@@ -1020,6 +1118,7 @@ class QuotingEngine:
                     "side": order_req["side"].value,
                     "price": float(order_req["price"]),
                     "size": float(order_req["size"]),
+                    "created_ts": time.time(),
                 }
 
     async def cancel_all_orders(self, force_evict: bool = False):
