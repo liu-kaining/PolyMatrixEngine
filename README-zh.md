@@ -201,7 +201,7 @@ cd PolyMatrixEngine
 ```bash
 cp .env.example .env
 # 编辑 .env：PK、FUNDER_ADDRESS、LIVE_TRADING_ENABLED、
-# BASE_ORDER_SIZE、GRID_LEVELS、MAX_EXPOSURE_PER_MARKET 等。
+# BASE_ORDER_SIZE（每单份额，非 USDC）、GRID_LEVELS、MAX_EXPOSURE_PER_MARKET 等。
 ```
 
 3. **启动**
@@ -245,7 +245,7 @@ docker compose logs -f api
 | `HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC` | **cancel_all** 线程调用超时 | `45.0` |
 | `HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC` | **get_balance_allowance** 超时 | `20.0` |
 | `HARD_RESET_CLOB_WALLET_DEDUP_SEC` | 双引擎去重：N 秒内不重复全钱包 cancel_all | `15.0` |
-| `BASE_ORDER_SIZE` | 每笔订单 size（最小 5） | 如 `5.0` |
+| `BASE_ORDER_SIZE` | 每笔订单 **份额**（CLOB 的 `size`，非 USDC）；最小 **5** 份 | 如 `10.0` |
 | `GRID_LEVELS` | 每侧网格档数 | `2` |
 | `QUOTE_BASE_SPREAD` | 相对 fair value 的价差 | `0.02` |
 | `AUTO_TUNE_FOR_REWARDS` | 为 true 时，在风控范围内按 Gamma 奖励最小规模与最大点差自适应 size/spread | `True` |
@@ -310,7 +310,7 @@ docker compose logs -f api
 
 | 变量 | 含义 | 示例/默认 |
 |------|------|-----------|
-| `BASE_ORDER_SIZE` | 每笔订单 size（USDC） | `5.0` |
+| `BASE_ORDER_SIZE` | 每笔订单 **份额**（非 USDC；BUY 名义≈价×份额） | `10.0` |
 | `GRID_LEVELS` | 每侧网格层数 | `2` |
 | `QUOTE_BASE_SPREAD` | 报价边距 | `0.02` |
 | `QUOTE_PRICE_OFFSET_THRESHOLD` | 触发网格刷新的价格移动 | `0.01` |

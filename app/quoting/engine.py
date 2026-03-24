@@ -57,8 +57,8 @@ class QuotingEngine:
         # Configurable via .env → GRID_LEVELS
         self.grid_levels = int(getattr(settings, "GRID_LEVELS", 1))
         self.tick_size = 0.01  # $0.01 per share offset
-        # Per-order notional size in USDC, configurable via .env (BASE_ORDER_SIZE)
-        # Polymarket requires minimum order size 5, enforce that here.
+        # Per-order size in OUTCOME SHARES (CLOB `OrderArgs.size`), from .env BASE_ORDER_SIZE.
+        # Not USDC: BUY notional ≈ price × size. Polymarket min order size is 5 shares.
         self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
         # Panic threshold: exposure >= this triggers unwind. base_size * 2.0 = hold 2 orders before defense.
         self.liquidate_threshold = self.base_size * 2.0
@@ -329,7 +329,7 @@ class QuotingEngine:
 
     def _compute_effective_size(self, price: float, max_additional_notional: Optional[float] = None) -> float:
         """
-        Grid-budget-aware size calculation.
+        Grid-budget-aware size calculation (return value = CLOB order size in **outcome shares**).
 
         If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
         Fallback logic: shrink to fit budget, or return 0.0 if below 5.0 (Polymarket min).

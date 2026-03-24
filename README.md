@@ -201,7 +201,7 @@ cd PolyMatrixEngine
 ```bash
 cp .env.example .env
 # Edit .env: PK, FUNDER_ADDRESS, LIVE_TRADING_ENABLED,
-# BASE_ORDER_SIZE, GRID_LEVELS, MAX_EXPOSURE_PER_MARKET, etc.
+# BASE_ORDER_SIZE (shares per order, not USDC), GRID_LEVELS, MAX_EXPOSURE_PER_MARKET, etc.
 ```
 
 3. **Start**
@@ -253,7 +253,7 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC` | Timeout for **cancel_all** thread call | `45.0` |
 | `HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC` | Timeout for **get_balance_allowance** after sleep | `20.0` |
 | `HARD_RESET_CLOB_WALLET_DEDUP_SEC` | Skip duplicate wallet **cancel_all** if another engine ran within N s (YES+NO engines) | `15.0` |
-| `BASE_ORDER_SIZE` | Size per order (min 5) | e.g. `5.0` |
+| `BASE_ORDER_SIZE` | Order **size in outcome shares** (CLOB `size`, not USDC); min **5** shares | e.g. `10.0` |
 | `GRID_LEVELS` | Grid levels per side | `2` |
 | `QUOTE_BASE_SPREAD` | Spread around fair value | `0.02` |
 | `AUTO_TUNE_FOR_REWARDS` | When true, size/spread adapt to Gamma rewards min size and max spread (within risk limits) | `True` |

@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC: float = 20.0
     # Skip wallet-level cancel_all if another engine just ran it (two engines per market).
     HARD_RESET_CLOB_WALLET_DEDUP_SEC: float = 15.0
-    BASE_ORDER_SIZE: float = 10.0         # 兜底（Fallback）默认值
+    BASE_ORDER_SIZE: float = 10.0         # Default order size in OUTCOME SHARES (not USDC); min 5 per CLOB
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     QUOTE_BASE_SPREAD: float = 0.02       # 兜底（Fallback）默认值
     QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.01   # Refresh grid when mid moves this much; larger = orders sit longer, more chance to get filled
