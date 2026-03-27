@@ -1,5 +1,6 @@
 """
-Auto-Router (V6.2): Portfolio Manager — Event horizon, sector limits, volatility penalty.
+Auto-Router (V7.0): Portfolio Manager — reward pool floor, high-reward / low-competition scoring,
+event horizon, sector limits.
 Runs as a background asyncio task when AUTO_ROUTER_ENABLED=True.
 """
 import asyncio
@@ -237,6 +238,10 @@ async def _radar_scan() -> List[dict]:
                     if not _is_binary_yes_no(m):
                         continue
                     r_min, _r_spread, r_rate = _parse_rewards(m)
+                    min_pool = float(getattr(settings, "AUTO_ROUTER_MIN_REWARD_POOL", 50.0))
+                    rate = float(r_rate or 0.0)
+                    if rate < min_pool:
+                        continue
                     if r_min is None or r_min <= 0:
                         continue
                     if r_min > base_order_size:
@@ -249,9 +254,9 @@ async def _radar_scan() -> List[dict]:
                     # V6.3: hard filter for deep pools only
                     if liquidity < 20000.0:
                         continue
-                    rate = (r_rate or 0.0)
                     daily_roi = rate / r_min if r_min > 0 else 0.0
-                    base_score = daily_roi * math.log10(liquidity)
+                    # High absolute pool (rate) × ROI per share, penalize crowded books (liquidity)
+                    base_score = daily_roi * rate * (10000.0 / max(float(liquidity), 1.0))
 
                     now_utc = datetime.now(timezone.utc)
                     end_utc = (

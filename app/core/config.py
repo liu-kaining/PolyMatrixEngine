@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     AUTO_ROUTER_MAX_MARKETS: int = 4
     AUTO_ROUTER_SCAN_INTERVAL_SEC: int = 3600
     AUTO_ROUTER_MIN_HOLD_HOURS: float = 12.0  # Min hours before evicting (for rewards threshold)
+    # V7.0 Auto-Router: minimum daily reward pool (USD); markets below are skipped entirely
+    AUTO_ROUTER_MIN_REWARD_POOL: float = 50.0
+
+    # V7.1 Official Builder API credentials for Polymarket order attribution
+    POLY_BUILDER_API_KEY: str = ""
+    POLY_BUILDER_SECRET: str = ""
+    POLY_BUILDER_PASSPHRASE: str = ""
 
     # V6.2 Sector & Event Horizon risk controls
     MAX_EXPOSURE_PER_SECTOR: float = 300.0   # Max USD per category/tag (prevent over-concentration)

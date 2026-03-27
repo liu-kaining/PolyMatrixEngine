@@ -292,6 +292,10 @@ docker compose logs -f api
 | `AUTO_ROUTER_MAX_MARKETS` | 路由器最大同时运作市场数 | `4` |
 | `AUTO_ROUTER_SCAN_INTERVAL_SEC` | 路由器扫描 Gamma 的间隔秒数 | `3600` |
 | `AUTO_ROUTER_MIN_HOLD_HOURS` | 定力锁：掉出 Top N 后最少持有小时数（事件地平线驱逐会绕过） | `12.0` |
+| `AUTO_ROUTER_MIN_REWARD_POOL` | **V7.0** — 日奖励池（USD）低于此值的 Gamma 市场直接跳过 | `50.0` |
+| `POLY_BUILDER_API_KEY` | **V7.1** — 官方 Builder API Key，用于订单归因头 | `""` |
+| `POLY_BUILDER_SECRET` | **V7.1** — 官方 Builder Secret，用于 HMAC 归因签名 | `""` |
+| `POLY_BUILDER_PASSPHRASE` | **V7.1** — 官方 Builder Passphrase，用于归因头 | `""` |
 | `EVENT_HORIZON_HOURS` | 临近结算/已过期市场的避险窗口 | `24.0` |
 | `MAX_EXPOSURE_PER_SECTOR` | 单赛道/标签最大允许敞口（USDC） | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | 单赛道/标签最大同时做市名额 | `2` |

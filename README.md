@@ -240,6 +240,10 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `AUTO_ROUTER_MAX_MARKETS` | Max concurrent markets managed by the router | `4` |
 | `AUTO_ROUTER_SCAN_INTERVAL_SEC` | Time between Gamma API scans for rebalancing | `3600` |
 | `AUTO_ROUTER_MIN_HOLD_HOURS` | Min-hold before evicting dropped markets (event-horizon bypasses this) | `12.0` |
+| `AUTO_ROUTER_MIN_REWARD_POOL` | **V7.0** — skip Gamma markets whose daily reward pool (USD) is below this | `50.0` |
+| `POLY_BUILDER_API_KEY` | **V7.1** — official Builder API key for order attribution headers | `""` |
+| `POLY_BUILDER_SECRET` | **V7.1** — official Builder secret for HMAC attribution signing | `""` |
+| `POLY_BUILDER_PASSPHRASE` | **V7.1** — official Builder passphrase for attribution headers | `""` |
 | `EVENT_HORIZON_HOURS` | Markets resolving within this window (or already expired) are avoided/evicted | `24.0` |
 | `MAX_EXPOSURE_PER_SECTOR` | Max USD exposure allowed per tag/sector across active markets | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | Max active markets allowed per tag/sector | `2` |

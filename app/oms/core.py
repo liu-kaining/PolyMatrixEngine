@@ -6,8 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, RequestArgs
+from py_clob_client.clob_types import OrderArgs, RequestArgs
 from py_clob_client.headers.headers import create_level_2_headers
+from py_builder_signing_sdk import BuilderApiKeyCreds, BuilderConfig
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
@@ -86,6 +87,25 @@ class OrderManagementSystem:
         
         if key and funder:
             try:
+                builder_config = None
+                builder_api_key = str(getattr(settings, "POLY_BUILDER_API_KEY", "") or "").strip()
+                builder_secret = str(getattr(settings, "POLY_BUILDER_SECRET", "") or "").strip()
+                builder_passphrase = str(getattr(settings, "POLY_BUILDER_PASSPHRASE", "") or "").strip()
+                if builder_api_key and builder_secret and builder_passphrase:
+                    builder_config = BuilderConfig(
+                        local_builder_creds=BuilderApiKeyCreds(
+                            key=builder_api_key,
+                            secret=builder_secret,
+                            passphrase=builder_passphrase,
+                        )
+                    )
+                    logger.info("BuilderConfig enabled for official Polymarket volume attribution.")
+                elif builder_api_key or builder_secret or builder_passphrase:
+                    logger.warning(
+                        "Incomplete POLY_BUILDER_* credentials; BuilderConfig disabled. "
+                        "Set POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE together."
+                    )
+
                 # 2 is typically the signature_type for POLY_PROXY / POLYMORPHIC (proxy wallets)
                 # Ensure the funder address is correct.
                 self.client = ClobClient(
@@ -93,7 +113,8 @@ class OrderManagementSystem:
                     key=key, 
                     chain_id=chain_id, 
                     signature_type=2, # POLY_PROXY signature type for gasless transactions
-                    funder=funder
+                    funder=funder,
+                    builder_config=builder_config,
                 )
                 
                 # Derive or set API creds (standard for proxy wallets in py-clob-client)
