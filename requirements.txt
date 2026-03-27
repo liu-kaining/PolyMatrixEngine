@@ -10,6 +10,7 @@ websockets
 python-dotenv
 web3
 py-clob-client
+py-builder-signing-sdk
 httpx
 streamlit
 pandas
