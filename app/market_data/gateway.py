@@ -4,7 +4,7 @@ import logging
 import time
 import httpx
 import websockets
-from typing import List, Set, Dict, Optional
+from typing import List, Set, Dict, Optional, Literal
 from app.core.config import settings
 from app.core.redis import redis_client
 
@@ -154,17 +154,18 @@ class MarketDataGateway:
 
                     self.ping_task = asyncio.create_task(self._heartbeat())
 
-                    if self.subscribed_markets:
-                        await self._resubscribe()
+                    # Always register on the market channel (even assets_ids=[]). If we skip this
+                    # while AUTO_ROUTER finds no targets, the server often drops the socket ~10s idle.
+                    await self._send_market_subscribe(mode="initial")
 
                     await self._listen()
                     raise RuntimeError("Market WS listen loop exited unexpectedly without exception.")
 
             except websockets.exceptions.ConnectionClosed as e:
-                logger.exception(
-                    "Market WS connection closed. code=%s reason=%s clean=%s",
+                logger.warning(
+                    "Market WS connection closed. code=%s reason=%r clean=%s",
                     getattr(e, "code", None),
-                    getattr(e, "reason", ""),
+                    getattr(e, "reason", "") or "",
                     isinstance(e, websockets.exceptions.ConnectionClosedOK),
                 )
             except Exception as e:
@@ -187,47 +188,50 @@ class MarketDataGateway:
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
     async def _heartbeat(self):
+        """Polymarket expects text PING ~every 10s; send one immediately so we don't sit idle
+        until the first sleep (RFC ping_interval is 20s here, too late for ~10s server idle cuts)."""
         try:
             while True:
-                await asyncio.sleep(10)
                 if self.ws is not None and not getattr(self.ws, "closed", False):
-                    await self.ws.send("PING")
-                    logger.debug("Sent PING")
+                    try:
+                        await self.ws.send("PING")
+                        logger.debug("Sent PING")
+                    except Exception:
+                        pass
+                await asyncio.sleep(10)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.exception(f"Market WS heartbeat error: {e}")
 
+    async def _send_market_subscribe(
+        self, *, mode: Literal["initial", "update"] = "initial"
+    ) -> None:
+        if self.ws is None or getattr(self.ws, "closed", False):
+            return
+        sub_msg: Dict[str, object] = {
+            "assets_ids": list(self.subscribed_markets),
+            "type": "market",
+            "custom_feature_enabled": True,
+        }
+        if mode == "update":
+            sub_msg["operation"] = "subscribe"
+        try:
+            await self.ws.send(json.dumps(sub_msg))
+            if mode == "initial":
+                logger.debug(
+                    "Market WS initial subscription sent (asset count=%s).",
+                    len(self.subscribed_markets),
+                )
+        except Exception as e:
+            logger.exception(f"Market WS subscribe send failed: {e}")
+            raise
+
     async def subscribe(self, asset_ids: List[str]):
         self.subscribed_markets.update(asset_ids)
         if self.ws is not None and not getattr(self.ws, "closed", False):
-            sub_msg = {
-                "assets_ids": list(self.subscribed_markets),
-                "type": "market",
-                "operation": "subscribe",
-                "custom_feature_enabled": True,
-            }
-            try:
-                await self.ws.send(json.dumps(sub_msg))
-                logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
-            except Exception as e:
-                logger.exception(f"Market WS subscribe send failed: {e}")
-                raise
-
-    async def _resubscribe(self):
-        if self.ws is not None and not getattr(self.ws, "closed", False) and self.subscribed_markets:
-            sub_msg = {
-                "assets_ids": list(self.subscribed_markets),
-                "type": "market",
-                "operation": "subscribe",
-                "custom_feature_enabled": True,
-            }
-            try:
-                await self.ws.send(json.dumps(sub_msg))
-                logger.debug("Resubscribed to active markets on Market WS.")
-            except Exception as e:
-                logger.exception(f"Market WS resubscribe send failed: {e}")
-                raise
+            await self._send_market_subscribe(mode="update")
+            logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
 
     async def _listen(self):
         while True:
@@ -267,11 +271,10 @@ class MarketDataGateway:
                 logger.exception("Market WS silent drop detected (30s without message). Forcing reconnect...")
                 raise
             except websockets.exceptions.ConnectionClosed as e:
-                logger.exception(
-                    "Market WS recv closed. code=%s reason=%s clean=%s",
+                logger.warning(
+                    "Market WS recv closed. code=%s reason=%r",
                     getattr(e, "code", None),
-                    getattr(e, "reason", ""),
-                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
+                    getattr(e, "reason", "") or "",
                 )
                 raise
             except Exception as e:
