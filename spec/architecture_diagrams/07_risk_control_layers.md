@@ -29,7 +29,7 @@ flowchart TB
         C1["reconciliation_loop()<br/>默认 60s 间隔"]
         C2["GET Polymarket<br/>Data API /positions"]
         C3["对比: DB vs API<br/>yes/no_exposure"]
-        C4{"差异 ><br/>EXPOSURE_TOLERANCE?"}
+        C4{"差异大于 EXPOSURE_TOLERANCE?"}
         C5["覆盖更新<br/>InventoryLedger"]
         C6["apply_reconciliation_snapshot()<br/>同步内存状态"]
         C1 --> C2 --> C3 --> C4
@@ -43,7 +43,7 @@ flowchart TB
         D3["睡眠 3s<br/>等待 USDC 释放"]
         D4["本地 cancel_all<br/>force_evict=True"]
         D5["reconcile_single_market<br/>(force=True)"]
-        D6{"对账<br/>成功?"}
+        D6{"对账成功?"}
         D7["POST_RESET_<br/>RECONCILE_FREEZE"]
         D1 --> D2 --> D3 --> D4 --> D5 --> D6
         D6 -->|Yes| D8["正常报价"]
@@ -52,10 +52,18 @@ flowchart TB
 
     subgraph Trigger["触发链路"]
         T1["任意层触发"]
-        T2["→ 撤单 + suspend"]
-        T3["→ 事件通知"]
+        T2["撤单 + suspend"]
+        T3["事件通知"]
         T1 --> T2 --> T3
     end
+
+    %% 四层 + 触发链路自上而下串联（避免并排横放）
+    A5 --> B1
+    B4 --> C1
+    C6 --> D1
+    C7 --> D1
+    D8 --> T1
+    D7 --> T1
 
     %% 样式 - 专业沉稳配色
     classDef l1 fill:#0891b2,stroke:#0e7490,color:#fff
@@ -110,7 +118,7 @@ sequenceDiagram
 
         par 并行执行
             WD->>DB: UPDATE status = 'suspended'
-            WD->>Redis: PUBLISH control:{cid}<br/>{"action": "suspend"}
+            WD->>Redis: PUBLISH control channel suspend
             WD->>OMS: cancel_market_orders(cid)
         end
 
@@ -143,17 +151,28 @@ def should_skip_reconciliation(local_timestamp: datetime) -> bool:
   'primaryBorderColor': '#334155',
   'lineColor': '#64748b'
 }}%%
-timeline
-    title 时间保护窗口
+flowchart TB
+    subgraph TW["时间保护窗口"]
+        direction TB
+        TW1["Fill 事件发生"]
+        TW2["8s 内跳过对账覆盖"]
+        TW3["防止本地成交但 API 未更新"]
+        TW1 --> TW2 --> TW3
+    end
 
-    section 保护窗口
-        Fill 事件发生
-        : 8s 内跳过对账覆盖
-        : 防止本地成交但 API 未更新
+    subgraph TR["恢复"]
+        direction TB
+        TR1["8s 后"]
+        TR2["恢复对账覆盖"]
+        TR1 --> TR2
+    end
 
-    section 恢复
-        8s 后
-        : 恢复对账覆盖
+    TW3 --> TR1
+
+    classDef tw fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef tr fill:#059669,stroke:#047857,color:#fff
+    class TW1,TW2,TW3 tw
+    class TR1,TR2 tr
 ```
 
 ---

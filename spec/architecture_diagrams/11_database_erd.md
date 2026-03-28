@@ -14,54 +14,54 @@ erDiagram
     INVENTORY_LEDGER }o--|| FUNDING_ADDRESS : "N:1"
 
     MARKET_META {
-        string condition_id PK "条件ID (Polymarket)"
+        string condition_id PK "条件ID Polymarket"
         string token_id_yes "YES 代币 ID"
         string token_id_no "NO 代币 ID"
         string market_question "市场问题"
-        string status "状态: pending/active/suspended/completed"
-        timestamp start_time "开始时间"
-        timestamp end_date "结算时间"
+        string status "状态 pending active suspended completed"
+        datetime start_time "开始时间"
+        datetime end_date "结算时间"
         float liquidity "流动性"
-        jsonb tags "标签数组"
-        timestamp created_at "创建时间"
-        timestamp updated_at "更新时间"
+        string tags "标签 JSON"
+        datetime created_at "创建时间"
+        datetime updated_at "更新时间"
     }
 
     INVENTORY_LEDGER {
-        string condition_id PK,FK "条件ID"
+        string condition_id PK "条件ID 外键市场"
         string funding_address PK "钱包地址"
         float yes_exposure "YES 持仓份额"
         float no_exposure "NO 持仓份额"
-        decimal yes_capital_used "YES 占用资金(USD)"
-        decimal no_capital_used "NO 占用资金(USD)"
-        decimal realized_pnl "已实现盈亏"
-        timestamp last_reconcile_at "上次对账时间"
-        timestamp updated_at "更新时间"
+        float yes_capital_used "YES 占用资金 USD"
+        float no_capital_used "NO 占用资金 USD"
+        float realized_pnl "已实现盈亏"
+        datetime last_reconcile_at "上次对账时间"
+        datetime updated_at "更新时间"
     }
 
     ORDER_JOURNAL {
-        string order_id PK "订单ID (Polymarket)"
+        string order_id PK "订单ID Polymarket"
         string condition_id FK "条件ID"
         string token_id "代币ID"
-        string side "方向: BUY/SELL"
-        decimal price "价格"
-        decimal size "数量"
-        decimal filled_size "成交数量"
-        string status "状态: pending/open/filled/partial/cancelled"
-        string order_type "类型: GTC/IOC/FOK"
+        string side "方向 BUY SELL"
+        float price "价格"
+        float size "数量"
+        float filled_size "成交数量"
+        string status "状态 pending open filled partial cancelled"
+        string order_type "类型 GTC IOC FOK"
         string signature "订单签名"
-        timestamp created_at "创建时间"
-        timestamp updated_at "更新时间"
+        datetime created_at "创建时间"
+        datetime updated_at "更新时间"
     }
 
     REWARDS_CONFIG {
-        string condition_id PK,FK "条件ID"
-        decimal annual_roi "年化收益"
-        decimal rate "利率"
-        decimal min_size "最小订单 size"
-        decimal spread "价差"
+        string condition_id PK "条件ID 外键市场"
+        float annual_roi "年化收益"
+        float rate "利率"
+        float min_size "最小订单 size"
+        float spread "价差"
         boolean active "是否激活"
-        timestamp fetched_at "获取时间"
+        datetime fetched_at "获取时间"
     }
 
     FUNDING_ADDRESS {
@@ -69,7 +69,7 @@ erDiagram
         string api_key "API Key"
         string api_secret "API Secret"
         boolean is_builder "是否使用 Builder API"
-        timestamp created_at "创建时间"
+        datetime created_at "创建时间"
     }
 ```
 
@@ -83,34 +83,34 @@ erDiagram
   'lineColor': '#64748b'
 }}%%
 flowchart TB
-    subgraph MARKET_META["MARKET_META (市场元数据)"]
-        M1["condition_id (PK)"]
-        M2["token_id_yes / token_id_no"]
-        M3["status / end_date"]
+    subgraph MARKET_META["MARKET_META 市场元数据"]
+        M1["condition_id PK"]
+        M2["token_id_yes token_id_no"]
+        M3["status end_date"]
     end
 
-    subgraph INVENTORY_LEDGER["INVENTORY_LEDGER (库存台账)"]
-        I1["condition_id (PK,FK)"]
-        I2["funding_address (PK)"]
-        I3["yes/no_exposure"]
-        I4["yes/no_capital_used"]
+    subgraph INVENTORY_LEDGER["INVENTORY_LEDGER 库存台账"]
+        I1["condition_id PK FK"]
+        I2["funding_address PK"]
+        I3["yes no exposure"]
+        I4["yes no capital_used"]
     end
 
-    subgraph ORDER_JOURNAL["ORDER_JOURNAL (订单日志)"]
-        O1["order_id (PK)"]
-        O2["condition_id (FK)"]
-        O3["side / price / size"]
-        O4["filled_size / status"]
+    subgraph ORDER_JOURNAL["ORDER_JOURNAL 订单日志"]
+        O1["order_id PK"]
+        O2["condition_id FK"]
+        O3["side price size"]
+        O4["filled_size status"]
     end
 
-    subgraph REWARDS_CONFIG["REWARDS_CONFIG (激励配置)"]
-        R1["condition_id (PK,FK)"]
-        R2["annual_roi / rate"]
+    subgraph REWARDS_CONFIG["REWARDS_CONFIG 激励配置"]
+        R1["condition_id PK FK"]
+        R2["annual_roi rate"]
     end
 
-    subgraph FUNDING_ADDRESS["FUNDING_ADDRESS (钱包)"]
-        F1["address (PK)"]
-        F2["api_key / api_secret"]
+    subgraph FUNDING_ADDRESS["FUNDING_ADDRESS 钱包"]
+        F1["address PK"]
+        F2["api_key api_secret"]
     end
 
     MARKET_META -->|"1:N"| INVENTORY_LEDGER
@@ -124,11 +124,11 @@ flowchart TB
     classDef rewards fill:#d97706,stroke:#b45309,color:#fff
     classDef funding fill:#059669,stroke:#047857,color:#fff
 
-    class MARKET_META,market
-    class INVENTORY_LEDGER,ledger
-    class ORDER_JOURNAL,order
-    class REWARDS_CONFIG,rewards
-    class FUNDING_ADDRESS,funding
+    class MARKET_META market
+    class INVENTORY_LEDGER ledger
+    class ORDER_JOURNAL order
+    class REWARDS_CONFIG rewards
+    class FUNDING_ADDRESS funding
 ```
 
 ## 库存计算口径
