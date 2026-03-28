@@ -8,7 +8,8 @@ from sqlalchemy.future import select
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, RequestArgs
 from py_clob_client.headers.headers import create_level_2_headers
-from py_builder_signing_sdk import BuilderApiKeyCreds, BuilderConfig
+from py_builder_signing_sdk.config import BuilderConfig
+from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
