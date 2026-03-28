@@ -1,6 +1,8 @@
 import asyncio
+import inspect
 import logging
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -8,8 +10,6 @@ from sqlalchemy.future import select
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, RequestArgs
 from py_clob_client.headers.headers import create_level_2_headers
-from py_builder_signing_sdk.config import BuilderConfig
-from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
@@ -19,6 +19,40 @@ logger = logging.getLogger(__name__)
 
 # Process-wide: YES/NO engines share one wallet — avoid double cancel_all + double sleep same second.
 _last_wallet_cancel_all_monotonic: float = 0.0
+
+
+def _try_build_polymarket_builder_config(
+    api_key: str,
+    secret: str,
+    passphrase: str,
+) -> Optional[Any]:
+    """
+    Lazy-load Polymarket builder signing SDK so missing/empty package __init__ or old layouts
+    never break app import. Uses a SimpleNamespace for creds (same duck-typing as BuilderApiKeyCreds).
+    """
+    BuilderConfig = None
+    try:
+        mod = __import__("py_builder_signing_sdk.config", fromlist=["BuilderConfig"])
+        BuilderConfig = getattr(mod, "BuilderConfig", None)
+    except Exception:
+        pass
+    if BuilderConfig is None:
+        try:
+            root = __import__("py_builder_signing_sdk", fromlist=["BuilderConfig"])
+            BuilderConfig = getattr(root, "BuilderConfig", None)
+        except Exception:
+            BuilderConfig = None
+    if BuilderConfig is None:
+        logger.warning(
+            "py_builder_signing_sdk has no BuilderConfig; Polymarket builder attribution disabled."
+        )
+        return None
+    creds = SimpleNamespace(key=api_key, secret=secret, passphrase=passphrase)
+    try:
+        return BuilderConfig(local_builder_creds=creds)
+    except Exception as e:
+        logger.warning("BuilderConfig init failed; builder attribution disabled: %s", e)
+        return None
 
 
 def _is_non_transient_error(e: Exception) -> bool:
@@ -93,14 +127,15 @@ class OrderManagementSystem:
                 builder_secret = str(getattr(settings, "POLY_BUILDER_SECRET", "") or "").strip()
                 builder_passphrase = str(getattr(settings, "POLY_BUILDER_PASSPHRASE", "") or "").strip()
                 if builder_api_key and builder_secret and builder_passphrase:
-                    builder_config = BuilderConfig(
-                        local_builder_creds=BuilderApiKeyCreds(
-                            key=builder_api_key,
-                            secret=builder_secret,
-                            passphrase=builder_passphrase,
-                        )
+                    builder_config = _try_build_polymarket_builder_config(
+                        builder_api_key,
+                        builder_secret,
+                        builder_passphrase,
                     )
-                    logger.info("BuilderConfig enabled for official Polymarket volume attribution.")
+                    if builder_config is not None:
+                        logger.info(
+                            "BuilderConfig enabled for official Polymarket volume attribution."
+                        )
                 elif builder_api_key or builder_secret or builder_passphrase:
                     logger.warning(
                         "Incomplete POLY_BUILDER_* credentials; BuilderConfig disabled. "
@@ -109,14 +144,19 @@ class OrderManagementSystem:
 
                 # 2 is typically the signature_type for POLY_PROXY / POLYMORPHIC (proxy wallets)
                 # Ensure the funder address is correct.
-                self.client = ClobClient(
-                    host, 
-                    key=key, 
-                    chain_id=chain_id, 
-                    signature_type=2, # POLY_PROXY signature type for gasless transactions
-                    funder=funder,
-                    builder_config=builder_config,
-                )
+                clob_kw: Dict[str, Any] = {
+                    "key": key,
+                    "chain_id": chain_id,
+                    "signature_type": 2,
+                    "funder": funder,
+                }
+                if "builder_config" in inspect.signature(ClobClient.__init__).parameters:
+                    clob_kw["builder_config"] = builder_config
+                elif builder_config is not None:
+                    logger.warning(
+                        "Installed py-clob-client has no builder_config; upgrade for builder attribution."
+                    )
+                self.client = ClobClient(host, **clob_kw)
                 
                 # Derive or set API creds (standard for proxy wallets in py-clob-client)
                 creds = self.client.create_or_derive_api_creds()
