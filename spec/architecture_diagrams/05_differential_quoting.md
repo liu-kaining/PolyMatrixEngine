@@ -11,9 +11,9 @@ sequenceDiagram
     participant Engine as QuotingEngine
     participant OMS as OMS Core
     participant CLOB as Polymarket CLOB
-    participant Active as Active Orders
+    participant Active as "Active Orders"
 
-    Note over Engine: Tick 触发 (tick:{token})
+    Note over Engine: Tick 触发 (tick token)
 
     Engine->>Active: 1. 签名当前挂单<br/>sig = (side, price, size)
 
@@ -23,7 +23,7 @@ sequenceDiagram
         Engine->>Engine: 3a. 精确匹配检查
         alt 精确匹配
             Engine->>Active: 保留订单
-            Note right: 精确命中<br/>sig ∈ desired
+            Note right of Active: 精确命中<br/>sig 属于 desired
         else 非精确匹配
             Engine->>Engine: 3b. 三重保护检查
 
@@ -72,7 +72,7 @@ sequenceDiagram
   'lineColor': '#64748b'
 }}%%
 flowchart LR
-    subgraph Naive["全量重报价 (Naive)"]
+    subgraph Naive["全量重报价 Naive"]
         A1["每次 tick 撤掉全部订单"]
         A2["重新挂全部档位"]
         A3["成交后立即被触发撤单"]
@@ -81,7 +81,7 @@ flowchart LR
         A6["容易被其他做市商探测"]
     end
 
-    subgraph Differential["差分报价 (PolyMatrix)"]
+    subgraph Differential["差分报价 PolyMatrix"]
         B1["只撤不一致订单"]
         B2["只补缺失档位"]
         B3["三重保护机制抗干扰"]
@@ -90,12 +90,12 @@ flowchart LR
         B6["时间优先策略"]
     end
 
-    A1 -->|❌| B1
-    A2 -->|❌| B2
-    A3 -->|❌| B3
-    A4 -->|❌| B4
-    A5 -->|❌| B5
-    A6 -->|❌| B6
+    A1 -->|vs| B1
+    A2 -->|vs| B2
+    A3 -->|vs| B3
+    A4 -->|vs| B4
+    A5 -->|vs| B5
+    A6 -->|vs| B6
 
     classDef naive fill:#dc2626,stroke:#b91c1c,color:#fff
     classDef good fill:#059669,stroke:#047857,color:#fff
@@ -140,12 +140,12 @@ flowchart TB
     end
 
     subgraph Process["匹配处理"]
-        C{"遍历 Active<br/>Orders"}
-        D["生成订单签名<br/>sig = (side, price, size)"]
-        E{"sig ∈<br/>Desired?"}
+        C["遍历 Active Orders"]
+        D["生成订单签名<br/>sig = side price size"]
+        E{"sig 在 Desired 中?"}
         F["精确匹配<br/>保留订单"]
         G["三重保护检查<br/>(8s / 0.005 / band)"]
-        H{"任一保护<br/>触发?"}
+        H{"任一保护触发?"}
         I["保留订单<br/>(保护)"]
         J["标记撤单<br/>(to_cancel)"]
     end
