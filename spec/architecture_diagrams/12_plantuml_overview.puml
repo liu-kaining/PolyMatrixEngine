@@ -1,0 +1,138 @@
+' PolyMatrix Engine - 系统整体架构图
+' PlantUML 格式 - 可导出高清 PNG/SVG
+
+@startuml PolyMatrix_Architecture
+
+!define RECTANGLE class
+
+skinparam componentStyle rectangle
+
+skinparam backgroundColor #1a1a2e
+skinparam defaultTextColor #eaeaea
+skinparam shadowing false
+skinparam roundcorner 15
+
+skinparam component {
+    BackgroundColor #16213e
+    BorderColor #0f3460
+    ArrowColor #e94560
+    FontColor #eaeaea
+}
+
+skinparam database {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #eaeaea
+}
+
+skinparam queue {
+    BackgroundColor #533483
+    BorderColor #e94560
+    FontColor #eaeaea
+}
+
+title **PolyMatrix Engine V6.4 - 系统架构图**
+
+package "客户端层" <<Rectangle>> #16213e {
+    [FastAPI 控制面] as API
+    [Streamlit 驾驶舱] as Dashboard
+}
+
+package "数据面 (Data Plane)" <<Rectangle>> #16213e {
+    [Market WebSocket] as MarketWS
+    [User WebSocket] as UserWS
+    [REST Snapshot] as REST
+    [Gamma API] as GammaAPI
+    database "Redis" as Redis #533483
+    queue "tick:{token}" as TickQ
+    queue "ob:{token}" as OBQ
+    queue "control:{cid}" as CtrlQ
+    queue "order_status" as OrderStatusQ
+}
+
+package "核心引擎层 (Core Engine)" <<Rectangle>> #16213e {
+    package "QuotingEngine × 2" <<Rectangle>> #1a1a2e {
+        [AlphaModel] as Alpha
+        [Grid Generator] as Grid
+        [Diff Quoter] as DiffQuote
+    }
+
+    package "风控平面" <<Rectangle>> #1a1a2e {
+        [Watchdog] as Watchdog
+        [Kill Switch] as KillSwitch
+        [Reconciler] as Reconcile
+    }
+
+    package "库存管理层" <<Rectangle>> #1a1a2e {
+        [InventoryStateManager] as InvState #4ecdc4
+    }
+
+    package "自动路由" <<Rectangle>> #1a1a2e {
+        [Portfolio Manager] as PortfolioMgr
+        [评分引擎] as Scorer
+        [重平衡器] as Rebalancer
+    }
+}
+
+package "执行平面 (Execution)" <<Rectangle>> #16213e {
+    [OMS Core] as OMS
+    [CircuitBreaker] as CB
+    [CLOB Client] as CLOB
+    [Builder API] as Builder
+}
+
+package "数据层" <<Rectangle>> #16213e {
+    database "PostgreSQL" as PG #0f3460
+    database "Redis KV" as RedisKV #533483
+}
+
+' 连接关系
+API --> Dashboard
+API --> Watchdog
+API --> PortfolioMgr
+
+MarketWS --> TickQ
+MarketWS --> OBQ
+
+TickQ --> Alpha
+OBQ --> Alpha
+
+GammaAPI --> PortfolioMgr
+GammaAPI --> Alpha
+
+Alpha --> Grid
+Grid --> DiffQuote
+DiffQuote --> OMS
+
+Watchdog --> InvState
+Watchdog --> KillSwitch
+KillSwitch --> OMS
+Reconcile --> PG
+
+InvState --> OMS
+InvState --> PG
+
+PortfolioMgr --> Lifecycle
+
+OMS --> CLOB
+OMS --> CB
+CB --> CLOB
+OMS --> Builder
+
+CLOB --> MarketWS
+CLOB --> UserWS
+
+' 图例
+legend right
+|= 组件类型 |= 颜色 |
+| <back:#16213e> 控制面 </back> | #667eea |
+| <back:#16213e> 数据面 </back> | #4ecdc4 |
+| <back:#16213e> 引擎层 </back> | #ff6b6b |
+| <back:#16213e> 风控层 </back> | #f093fb |
+| <back:#0f3460> 数据库 </back> | #0f3460 |
+| <back:#533483> 消息队列 </back> | #533483 |
+endlegend
+
+footer **PolyMatrix Engine | 准机构级自动化做市引擎**
+
+@enduml
