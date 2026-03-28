@@ -1,13 +1,19 @@
 # 自动路由与组合管理
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
-    subgraph Trigger["触发机制 ⏰"]
+    subgraph Trigger["触发机制"]
         A["定时扫描<br/>默认 5 分钟"]
         B["Gamma API<br/>批量查询"]
     end
 
-    subgraph Filter["过滤阶段 🎯"]
+    subgraph Filter["过滤阶段"]
         C{"rewards<br/>存在?"}
         D{"流动性<br/>≥ $20,000?"}
         E{"非体育<br/>非黑名单?"}
@@ -23,7 +29,7 @@ flowchart TB
         F -->|No| DROP4["丢弃: 已结算"]
     end
 
-    subgraph Score["评分阶段 🏆"]
+    subgraph Score["评分阶段"]
         H["daily_roi<br/>日收益"]
         I["rate<br/>年化利率"]
         J["liquidity<br/>流动性评分"]
@@ -31,13 +37,13 @@ flowchart TB
         L["总分 =<br/>ROI × rate ×<br/>(10000/liquidity)<br/>× time_decay"]
     end
 
-    subgraph Select["选择阶段 🎯"]
+    subgraph Select["选择阶段"]
         M{"Top N?<br/>评分排名"}
         N{"赛道限额<br/>MAX_SLOTS<br/>MAX_EXPOSURE?"}
         O["市场列表<br/>Selected Markets"]
     end
 
-    subgraph Rebalance["重平衡阶段 ⚖️"]
+    subgraph Rebalance["重平衡阶段"]
         P{"市场已活跃?"}
         Q{"掉出 Top N?"}
         R{"满足<br/>min_hold_hours?"}
@@ -45,7 +51,7 @@ flowchart TB
         T["启动<br/>新市场"]
     end
 
-    subgraph Execute["执行阶段 🚀"]
+    subgraph Execute["执行阶段"]
         U["MarketLifecycle<br/>start_market_making"]
         V["QuotingEngine<br/>× 2 (YES/NO)"]
         W["Redis PubSub<br/>tick:, control:"]
@@ -80,10 +86,10 @@ flowchart TB
     U --> V
     V --> W
 
-    classDef filter fill:#ffe66d,stroke:#333
-    classDef score fill:#4ecdc4,stroke:#333
-    classDef select fill:#95e1d3,stroke:#333
-    classDef exec fill:#ff6b6b,color:#fff
+    classDef filter fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef score fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef select fill:#475569,stroke:#334155,color:#fff
+    classDef exec fill:#dc2626,stroke:#b91c1c,color:#fff
 
     class C,D,E,F,G filter
     class H,I,J,K,L score
@@ -119,47 +125,81 @@ def score_market(
 
 ## 赛道隔离规则
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              赛道隔离参数                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  MAX_SLOTS_PER_SECTOR          │  单标签最多 N 个市场                        │
-│  例: "sports:nba" ≤ 3          │                                           │
-│                                 │                                           │
-│  MAX_EXPOSURE_PER_SECTOR       │  单标签最大敞口                            │
-│  例: "sports" ≤ $300           │                                           │
-│                                 │                                           │
-│  SECTOR_TAG_BLACKLIST          │  黑名单标签                                │
-│  例: ["sports:esports"]        │  排除特定领域                              │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| MAX_SLOTS_PER_SECTOR | 单标签最多 N 个市场 | sports:nba ≤ 3 |
+| MAX_EXPOSURE_PER_SECTOR | 单标签最大敞口 | sports ≤ $300 |
+| SECTOR_TAG_BLACKLIST | 黑名单标签 | sports:esports |
 
-## 重平衡决策
+## 重平衡决策表
 
 ```mermaid
-decision_table
-    ┌─────────────────────┬─────────────────────┬─────────────────────┐
-    │       条件          │       动作          │        备注         │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 评分进入 Top N      │ 启动做市            │ 新市场激活          │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 评分掉出 Top N      │ 检查 min_hold       │ 需满足持有时间      │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 掉出 + 已达 min_hold│ graceful_exit       │ 优雅退出            │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 掉出 + 未达 min_hold│ 保留 + 暂停新买单   │ 等待满足条件        │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 事件地平线到达      │ graceful_exit       │ 绕过 min_hold       │
-    ├─────────────────────┼─────────────────────┼─────────────────────┤
-    │ 赛道满 + 新市场更优  │ 驱逐最低分市场      │ 赛道再平衡          │
-    └─────────────────────┴─────────────────────┴─────────────────────┘
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart TB
+    subgraph Conditions["条件"]
+        C1["评分进入 Top N"]
+        C2["评分掉出 Top N"]
+        C3["掉出 + 已达 min_hold"]
+        C4["掉出 + 未达 min_hold"]
+        C5["事件地平线到达"]
+        C6["赛道满 + 新市场更优"]
+    end
+
+    subgraph Actions["动作"]
+        A1["启动做市"]
+        A2["检查 min_hold"]
+        A3["graceful_exit"]
+        A4["保留 + 暂停新买单"]
+        A5["graceful_exit"]
+        A6["驱逐最低分市场"]
+    end
+
+    subgraph Notes["备注"]
+        N1["新市场激活"]
+        N2["需满足持有时间"]
+        N3["优雅退出"]
+        N4["等待满足条件"]
+        N5["绕过 min_hold"]
+        N6["赛道再平衡"]
+    end
+
+    C1 --> A1
+    C2 --> A2
+    C3 --> A3
+    C4 --> A4
+    C5 --> A5
+    C6 --> A6
+
+    A1 --> N1
+    A2 --> N2
+    A3 --> N3
+    A4 --> N4
+    A5 --> N5
+    A6 --> N6
+
+    classDef cond fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef action fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef note fill:#059669,stroke:#047857,color:#fff
+
+    class C1,C2,C3,C4,C5,C6 cond
+    class A1,A2,A3,A4,A5,A6 action
+    class N1,N2,N3,N4,N5,N6 note
 ```
 
 ## 生命周期状态流转
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 stateDiagram-v2
     [*] --> CANDIDATE: 发现市场
     CANDIDATE --> FILTERING: 通过初步筛选

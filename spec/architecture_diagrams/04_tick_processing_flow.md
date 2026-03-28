@@ -1,8 +1,14 @@
 # Tick 处理流程
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
-    subgraph Trigger["触发阶段 ⚡"]
+    subgraph Trigger["触发阶段"]
         A["Redis PubSub<br/>tick:{token_id}"]
     end
 
@@ -13,21 +19,21 @@ flowchart TB
         C -->|No| E["使用默认参数"]
     end
 
-    subgraph FairValue["统一定价 Oracle 💎"]
+    subgraph FairValue["统一定价 Oracle"]
         F["_get_unified_fair_value()<br/>计算 YES 锚点 FV"]
         G["FV_yes = clamp<br/>(mid + OBI × 0.015<br/>, 0.01, 0.99)"]
         H["发布到 Redis<br/>fv_anchor:{cid}"]
         I["NO 侧派生<br/>FV_no = 1 - FV_yes"]
     end
 
-    subgraph BudgetCheck["严格 MTM 预算检查 💰"]
+    subgraph BudgetCheck["严格 MTM 预算检查"]
         J["获取 InventorySnapshot<br/>yes/no_exposure<br/>pending_buy_notional"]
         K["held_value =<br/>yes_exp × FV_yes +<br/>no_exp × FV_no"]
         L["strict_used =<br/>held_value +<br/>pending_yes_n + pending_no_n"]
         M{"strict_used <<br/>GLOBAL_MAX_BUDGET?"}
     end
 
-    subgraph GridGen["网格生成 📊"]
+    subgraph GridGen["网格生成"]
         N{"持仓 > 5.0?"}
         N -->|Yes| O["Maker Unwind<br/>SELL 侧卖单"]
         N -->|No| P["网格档位生成"]
@@ -37,7 +43,7 @@ flowchart TB
         R -->|No| T["Normal Maker"]
     end
 
-    subgraph BalancePrecheck["余额预检 💎"]
+    subgraph BalancePrecheck["余额预检"]
         U["_apply_balance_precheck()<br/>余额是否足够?"]
         V{"余额不足?"}
         V -->|Yes| W["缩档<br/>砍掉最低档"]
@@ -45,7 +51,7 @@ flowchart TB
         W --> X
     end
 
-    subgraph DiffQuote["差分报价 🔄"]
+    subgraph DiffQuote["差分报价"]
         Y["sync_orders_diff()<br/>精确匹配保留"]
         Z["非精确订单检查:<br/>1. Lifetime > 8s?<br/>2. Price offset < threshold?<br/>3. Within rewards band?"]
         AA["保留 / 撤单 决策"]
@@ -53,7 +59,7 @@ flowchart TB
         AC["to_create<br/>待发订单"]
     end
 
-    subgraph Execution["执行层面 📦"]
+    subgraph Execution["执行层面"]
         AE["并发撤单<br/>asyncio.gather"]
         AF["并发发单<br/>place_orders"]
         AG["更新<br/>active_orders"]
@@ -90,13 +96,13 @@ flowchart TB
     AC --> AF
     AF --> AG
 
-    %% 样式
-    classDef trigger fill:#ff6b6b,color:#fff
-    classDef config fill:#4ecdc4,stroke:#333
-    classDef fv fill:#ffe66d,stroke:#333
-    classDef risk fill:#f093fb,stroke:#333
-    classDef grid fill:#95e1d3,stroke:#333
-    classDef exec fill:#a8edea,stroke:#333
+    %% 样式 - 专业沉稳配色
+    classDef trigger fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef config fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef fv fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef risk fill:#d97706,stroke:#b45309,color:#fff
+    classDef grid fill:#059669,stroke:#047857,color:#fff
+    classDef exec fill:#475569,stroke:#334155,color:#fff
 
     class A trigger
     class B,C,D,E config
@@ -109,15 +115,27 @@ flowchart TB
 
 ## 热路径关键指标
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Tick 处理性能目标                            │
-├─────────────────────────────────────────────────────────────────────┤
-│  🏃 端到端延迟:     < 10ms (无 DB 读取)                             │
-│  📊 内存读取:       InventoryStateManager (热路径零 DB)            │
-│  🔄 并发发单:       asyncio.gather (所有档位并发)                   │
-│  📝 异步持久化:     有界队列 maxsize=1000, 关闭时排空               │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart LR
+    subgraph Metrics["性能指标"]
+        A["端到端延迟<br/>< 10ms"]
+        B["内存读取<br/>InventoryStateManager"]
+        C["并发发单<br/>asyncio.gather"]
+        D["异步持久化<br/>maxsize=1000"]
+    end
+
+    A -->|"热路径零DB"| B
+    B -->|"批量并发"| C
+    C -->|"有界队列"| D
+
+    classDef metric fill:#1e3a5f,stroke:#334155,color:#fff
+    class A,B,C,D metric
 ```
 
 ## 差分报价核心逻辑

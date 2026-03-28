@@ -1,6 +1,12 @@
 # Watchdog 监控机制
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
     subgraph Init["Watchdog 启动"]
         A["RiskMonitor.run()"]
@@ -8,14 +14,14 @@ flowchart TB
         C["进入主循环<br/>while True"]
     end
 
-    subgraph MainLoop["主监控循环 ⚡"]
+    subgraph MainLoop["主监控循环"]
         D["await asyncio.sleep(1)<br/>每秒心跳"]
         E["check_exposure()<br/>暴露检查"]
         F{"暴露 ><br/>MAX_EXPOSURE?"}
         G["trigger_kill_switch()<br/>硬熔断"]
     end
 
-    subgraph Reconcile["对账循环 🔍"]
+    subgraph Reconcile["对账循环"]
         H["await asyncio.sleep(60)<br/>60s 间隔"]
         I["reconcile_positions()<br/>批量对账"]
         J["获取活跃市场列表<br/>get_active_router_markets()"]
@@ -33,7 +39,7 @@ flowchart TB
         S["apply_reconciliation_snapshot()<br/>同步内存"]
     end
 
-    subgraph HardReset["硬重置强制对账 🔧"]
+    subgraph HardReset["硬重置强制对账"]
         T["每 5 分钟<br/>hard_reset_cycle"]
         U["physical_clob_cancel_all()<br/>全钱包撤单"]
         V["睡眠 3s"]
@@ -72,10 +78,10 @@ flowchart TB
     Y -->|No| Z
     Z --> C
 
-    classDef init fill:#667eea,color:#fff
-    classDef main fill:#ff6b6b,color:#fff
-    classDef reconcile fill:#4ecdc4,stroke:#333
-    classDef reset fill:#f093fb,stroke:#333
+    classDef init fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef main fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef reconcile fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef reset fill:#d97706,stroke:#b45309,color:#fff
 
     class A,B init
     class D,E,F,G main
@@ -155,41 +161,44 @@ async def reconcile_single_market(self, condition_id: str, force: bool = False):
 
 ## 监控时间线
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Watchdog 时间线                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ◄─────────────── 1 秒 ─────────────────►                                    │
-│  ┌────────────────────────────────────────┐                                │
-│  │ check_exposure()                       │                                │
-│  │  • 遍历所有活跃市场                      │                                │
-│  │  • 比较 capital_used vs 阈值            │                                │
-│  │  • 超限 → trigger_kill_switch          │                                │
-│  └────────────────────────────────────────┘                                │
-│                                                                             │
-│  ◄─────────────── 60 秒 ─────────────────►                                   │
-│  ┌────────────────────────────────────────┐                                │
-│  │ reconciliation_loop()                   │                                │
-│  │  • 遍历所有活跃市场                      │                                │
-│  │  • 调用 Polymarket Data API             │                                │
-│  │  • 差异 > tolerance → 覆盖更新          │                                │
-│  └────────────────────────────────────────┘                                │
-│                                                                             │
-│  ◄─────────────── 5 分钟 ─────────────────►                                  │
-│  ┌────────────────────────────────────────┐                                │
-│  │ hard_reset_cycle()                      │                                │
-│  │  • CLOB cancel_all                      │                                │
-│  │  • 本地状态清理                          │                                │
-│  │  • 强制对账                              │                                │
-│  └────────────────────────────────────────┘                                │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+timeline
+    title Watchdog 时间线
+
+    section 1秒检查
+        check_exposure()
+        : 遍历所有活跃市场
+        : 比较 capital_used vs 阈值
+        : 超限 → trigger_kill_switch
+
+    section 60秒对账
+        reconciliation_loop()
+        : 遍历所有活跃市场
+        : 调用 Polymarket Data API
+        : 差异 > tolerance → 覆盖更新
+
+    section 5分钟硬重置
+        hard_reset_cycle()
+        : CLOB cancel_all
+        : 本地状态清理
+        : 强制对账
 ```
 
 ## 熔断器状态
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 stateDiagram-v2
     [*] --> CLOSED: 初始化
     CLOSED --> OPEN: 5 次连续失败

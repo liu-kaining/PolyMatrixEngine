@@ -4,15 +4,15 @@
 @startuml Quoting_State_Machine
 
 skinparam state {
-    BackgroundColor #16213e
-    BorderColor #0f3460
-    FontColor #eaeaea
-    ArrowColor #e94560
+    BackgroundColor 16213E
+    BorderColor 0F3460
+    FontColor EAEaea
+    ArrowColor DC2626
+    AttributeFontColor EAEaea
+    AttributeBackgroundColor 1a1a2e
 }
 
 title **QuotingEngine 状态机**
-
-scale 1.2
 
 state QUOTING {
     [*] --> NORMAL
@@ -31,15 +31,13 @@ LIQUIDATING --> QUOTING : 平仓完成
 QUOTING --> GRACEFUL_EXIT : 事件地平线 / 赛道退出
 GRACEFUL_EXIT --> QUOTING : 重返市场
 GRACEFUL_EXIT --> POST_RESET_RECONCILE_FREEZE : 对账失败
+GRACEFUL_EXIT --> [*] : 完全退出
 
 QUOTING --> SUSPENDED : kill_switch / API暂停
 SUSPENDED --> QUOTING : API恢复
 
 POST_RESET_RECONCILE_FREEZE --> QUOTING : 对账成功
 POST_RESET_RECONCILE_FREEZE --> SUSPENDED : 对账持续失败
-
-GRACEFUL_EXIT --> [*] : 完全退出
-LIQUIDATING --> [*] : 平仓完成退出
 
 note right of QUOTING
 **核心状态:**

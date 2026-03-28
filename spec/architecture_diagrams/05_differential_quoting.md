@@ -1,6 +1,12 @@
 # 差分报价机制详解
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 sequenceDiagram
     participant Engine as QuotingEngine
     participant OMS as OMS Core
@@ -58,28 +64,44 @@ sequenceDiagram
 
 ## 差分报价 vs 全量重报价
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         全量重报价 (Naive)                           │
-├─────────────────────────────────────────────────────────────────────┤
-│  ❌ 每次 tick 撤掉全部订单                                           │
-│  ❌ 重新挂全部档位                                                   │
-│  ❌ 成交后立即被价格变动触发撤单                                      │
-│  ❌ 浪费 CLOB gas                                                    │
-│  ❌ 订单簿深度不稳定                                                 │
-│  ❌ 容易被其他做市商探测                                              │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart LR
+    subgraph Naive["全量重报价 (Naive)"]
+        A1["每次 tick 撤掉全部订单"]
+        A2["重新挂全部档位"]
+        A3["成交后立即被触发撤单"]
+        A4["浪费 CLOB gas"]
+        A5["订单簿深度不稳定"]
+        A6["容易被其他做市商探测"]
+    end
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                         差分报价 (PolyMatrix)                       │
-├─────────────────────────────────────────────────────────────────────┤
-│  ✅ 只撤不一致订单，精确匹配保留                                      │
-│  ✅ 只补缺失档位                                                     │
-│  ✅ 三重保护机制抗干扰                                               │
-│  ✅ 最小化 CLOB gas 消耗                                             │
-│  ✅ 订单簿深度稳定                                                   │
-│  ✅ 时间优先策略                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+    subgraph Differential["差分报价 (PolyMatrix)"]
+        B1["只撤不一致订单"]
+        B2["只补缺失档位"]
+        B3["三重保护机制抗干扰"]
+        B4["最小化 CLOB gas 消耗"]
+        B5["订单簿深度稳定"]
+        B6["时间优先策略"]
+    end
+
+    A1 -->|❌| B1
+    A2 -->|❌| B2
+    A3 -->|❌| B3
+    A4 -->|❌| B4
+    A5 -->|❌| B5
+    A6 -->|❌| B6
+
+    classDef naive fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef good fill:#059669,stroke:#047857,color:#fff
+
+    class A1,A2,A3,A4,A5,A6 naive
+    class B1,B2,B3,B4,B5,B6 good
 ```
 
 ## 订单签名匹配
@@ -105,6 +127,12 @@ def _bucket_key(side, price, size) -> tuple:
 ## 匹配流程图
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
     subgraph Input["输入"]
         A["Active Orders<br/>当前挂单集合"]
@@ -139,6 +167,14 @@ flowchart TB
     F --> L
     J --> K
     I --> L
+
+    classDef input fill:#475569,stroke:#334155,color:#fff
+    classDef process fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef output fill:#7c3aed,stroke:#6d28d9,color:#fff
+
+    class A,B input
+    class C,D,E,F,G,H,I,J process
+    class K,L output
 ```
 
 ## 性能对比

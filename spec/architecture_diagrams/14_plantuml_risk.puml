@@ -4,37 +4,38 @@
 @startuml Risk_Control_Layers
 
 skinparam rectangle {
-    BackgroundColor #16213e
-    BorderColor #0f3460
-    FontColor #eaeaea
+    BackgroundColor 16213E
+    BorderColor 0F3460
+    FontColor EAEaea
+    RoundCorner 10
 }
 
 skinparam note {
-    BackgroundColor #1a1a2e
-    BorderColor #4ecdc4
-    FontColor #eaeaea
+    BackgroundColor 1a1a2e
+    BorderColor 0891B2
+    FontColor EAEaea
 }
 
 title **PolyMatrix Engine - 多层风控体系**
 
-package "第一层: 报价前预检" <<Rectangle>> #2d4a22 {
+package "第一层: 报价前预检" #2d4a22 {
     note "MAX_EXPOSURE_PER_MARKET = $50\nGLOBAL_MAX_BUDGET = $1000\nMTM 持仓 + pending BUY" as L1
 }
 
-package "第二层: Watchdog 硬熔断" <<Rectangle>> #4a2222 {
+package "第二层: Watchdog 硬熔断" #4a2222 {
     rectangle "每秒检查\nexposure > MAX?" as L2A
     rectangle "trigger_kill_switch()\n撤单 + suspend + Redis" as L2B
     L2A --> L2B
 }
 
-package "第三层: REST 周期对账" <<Rectangle>> #224a4a {
+package "第三层: REST 周期对账" #224a4a {
     rectangle "60s 间隔\nreconciliation_loop()" as L3A
     rectangle "GET /positions\nPolymarket Data API" as L3B
     rectangle "差异 > tolerance?\n覆盖 InventoryLedger" as L3C
     L3A --> L3B --> L3C
 }
 
-package "第四层: 硬重置强制对账" <<Rectangle>> #4a224a {
+package "第四层: 硬重置强制对账" #4a224a {
     rectangle "每 5 分钟\nhard_reset_cycle()" as L4A
     rectangle "CLOB cancel_all\n全钱包撤单" as L4B
     rectangle "reconcile(force=True)\n绕过时间保护" as L4C

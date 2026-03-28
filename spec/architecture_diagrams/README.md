@@ -6,23 +6,38 @@
 
 ```
 spec/architecture_diagrams/
-├── 00_INDEX.md                 # 图集索引 (本文档)
-├── 01_system_overview.md       # 系统整体架构图 (Mermaid)
-├── 02_module_relationships.md  # 核心模块关系图 (Mermaid)
-├── 03_quoting_state_machine.md # 做市引擎状态机 (Mermaid)
-├── 04_tick_processing_flow.md # Tick 处理流程 (Mermaid)
-├── 05_differential_quoting.md  # 差分报价机制详解 (Mermaid)
-├── 06_fill_processing_flow.md  # 成交处理流程 (Mermaid)
-├── 07_risk_control_layers.md   # 多层风控体系 (Mermaid)
-├── 08_watchdog_mechanism.md    # Watchdog 监控机制 (Mermaid)
-├── 09_auto_router.md           # 自动路由与组合管理 (Mermaid)
-├── 10_hard_reset_flow.md       # 硬重置流程 (Mermaid)
-├── 11_database_erd.md           # 数据库实体关系 (Mermaid)
+├── 00_INDEX.md                 # 图集索引
+├── 01_system_overview.md       # 系统整体架构图
+├── 02_module_relationships.md  # 核心模块关系图
+├── 03_quoting_state_machine.md # 做市引擎状态机
+├── 04_tick_processing_flow.md # Tick 处理流程
+├── 05_differential_quoting.md  # 差分报价机制详解
+├── 06_fill_processing_flow.md  # 成交处理流程
+├── 07_risk_control_layers.md   # 多层风控体系
+├── 08_watchdog_mechanism.md    # Watchdog 监控机制
+├── 09_auto_router.md           # 自动路由与组合管理
+├── 10_hard_reset_flow.md       # 硬重置流程
+├── 11_database_erd.md          # 数据库实体关系
 ├── 12_plantuml_overview.puml   # PlantUML 架构图
 ├── 13_plantuml_state.puml      # PlantUML 状态机
 ├── 14_plantuml_risk.puml       # PlantUML 风控图
-└── 15_ascii_overview.txt       # ASCII 概览图
+├── 15_system_overview.md       # 系统概览 (Mermaid)
+└── README.md                   # 使用指南
 ```
+
+## 🎨 专业配色方案
+
+所有 Mermaid 图使用统一的专业沉稳配色：
+
+| 用途 | 颜色 | Hex |
+|------|------|-----|
+| 主色调 | 深蓝 | `#1e3a5f` |
+| 数据面 | 青色 | `#0891b2` |
+| 核心引擎 | 紫色 | `#7c3aed` |
+| 风控 | 红色 | `#dc2626` |
+| 执行 | 绿色 | `#059669` |
+| 路由 | 橙色 | `#d97706` |
+| 基础设施 | 灰色 | `#64748b` |
 
 ## 🎯 技术亮点速览
 
@@ -81,7 +96,7 @@ Score = daily_roi × rate × (10000/liquidity) × time_decay
 brew install plantuml  # macOS
 
 # 生成 PNG
-plantuml -Tpng 12_plantuml_overview.puml
+plantuml -Tpng -dpi 300 12_plantuml_overview.puml
 
 # 生成 SVG
 plantuml -Tsvg 12_plantuml_overview.puml
@@ -89,43 +104,21 @@ plantuml -Tsvg 12_plantuml_overview.puml
 
 ## 🚀 使用建议
 
-### 1. 技术大会分享
+### 技术大会分享
 - **推荐**: 使用 `01_system_overview.md` 作为主架构图
-- **备选**: `15_ascii_overview.txt` 用于快速口头描述
+- **概览**: `15_system_overview.md` 快速了解全貌
 
-### 2. 详细技术讲解
+### 详细技术讲解
 - **入场**: `01_system_overview` + `02_module_relationships`
 - **核心**: `03_quoting_state_machine` + `04_tick_processing_flow` + `05_differential_quoting`
 - **差异化**: `06_fill_processing_flow` (内存优先设计)
 - **风控**: `07_risk_control_layers` + `08_watchdog_mechanism`
 - **高级**: `09_auto_router` + `10_hard_reset_flow`
 
-### 3. 面试/技术评估
+### 面试/技术评估
 - **架构**: `01_system_overview` + `02_module_relationships`
 - **数据库**: `11_database_erd`
-- **ASCII**: `15_ascii_overview.txt` 快速概览
-
-## 🎨 设计规范
-
-### 配色方案
-```
-背景:        #1a1a2e (深蓝黑)
-主色调:      #0f3460 (深海蓝)
-强调色:      #e94560 (玫红)
-成功:        #4ecdc4 (青绿)
-警告:        #ffe66d (明黄)
-信息:        #667eea (紫蓝)
-```
-
-### 组件标记
-```
-⚡ 高性能热点路径
-💎 核心算法/设计
-🛡️ 风控相关
-🤖 自动化/智能
-🔧 运维/重置
-📊 数据流
-```
+- **概览**: `15_system_overview.md` 快速概览
 
 ## 📝 导出为 PPT
 
@@ -136,13 +129,8 @@ plantuml -Tsvg 12_plantuml_overview.puml
 
 ### 方式二: PlantUML → 高清图
 ```bash
-plantuml -Tpng -dpi 300 12_plantuml_overview.puml
+plantuml -Tpng -dpi 300 spec/architecture_diagrams/12_plantuml_overview.puml
 ```
-
-### 方式三: ASCII 图
-1. 复制 `15_ascii_overview.txt` 内容
-2. 粘贴到 PPT 文本框
-3. 使用等宽字体 (Consolas / Source Code Pro)
 
 ---
 

@@ -1,13 +1,21 @@
 # 系统整体架构图
 
 ```mermaid
-graph TB
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b',
+  'secondaryColor': '#0891b2',
+  'tertiaryColor': '#f1f5f9'
+}}%%
+flowchart TB
     subgraph Client["客户端层"]
-        Dashboard["Streamlit 驾驶舱<br/>(监控 + 控制)"]
-        API["FastAPI 控制面<br/>(启动/停止/风控)"]
+        Dashboard["Streamlit 驾驶舱<br/>监控 + 控制"]
+        API["FastAPI 控制面<br/>启动/停止/风控"]
     end
 
-    subgraph DataPlane["数据面 ⚡"]
+    subgraph DataPlane["数据面"]
         subgraph MarketData["市场数据层"]
             MarketWS["Market WebSocket<br/>Polymarket 订单簿"]
             REST["REST API<br/>快照获取"]
@@ -25,14 +33,14 @@ graph TB
         MarketWS --> ob
     end
 
-    subgraph Core["核心引擎层 🎯"]
-        subgraph QuotingEngine["QuotingEngine × 2<br/>(YES + NO)"]
+    subgraph Core["核心引擎层"]
+        subgraph QuotingEngine["QuotingEngine × 2<br/>YES + NO"]
             AlphaModel["AlphaModel<br/>统一定价 Oracle"]
             Grid["网格生成器<br/>动态 Spread"]
             DiffQuote["差分报价器<br/>抗干扰"]
         end
 
-        subgraph RiskPlane["风控平面 🛡️"]
+        subgraph RiskPlane["风控平面"]
             Watchdog["RiskMonitor<br/>Watchdog"]
             KillSwitch["Kill Switch<br/>硬熔断"]
             Reconciler["对账引擎<br/>REST 校验"]
@@ -43,19 +51,19 @@ graph TB
         end
     end
 
-    subgraph ExecutionPlane["执行平面 📦"]
+    subgraph ExecutionPlane["执行平面"]
         OMS["OMS<br/>订单状态机"]
         CircuitBreaker["CircuitBreaker<br/>熔断器"]
         CLOB["Polymarket CLOB<br/>py-clob-client"]
         Builder["Builder API<br/>订单归因"]
     end
 
-    subgraph DataLayer["数据层 💾"]
+    subgraph DataLayer["数据层"]
         PostgreSQL["PostgreSQL<br/>InventoryLedger<br/>OrderJournal<br/>MarketMeta"]
         RedisKV["Redis KV<br/>状态缓存"]
     end
 
-    subgraph AutoRouter["自动路由 🤖"]
+    subgraph AutoRouter["自动路由"]
         Router["PortfolioManager<br/>组合管理器"]
         Scorer["评分引擎<br/>ROI × 流动性 × 时间"]
         Rebalancer["重平衡器<br/>赛道隔离"]
@@ -85,14 +93,21 @@ graph TB
     AutoRouter -->|start/stop<br/>market| Core
     Router -->|filter| Gamma
 
-    classDef highlight fill:#ff6b6b,stroke:#333,stroke-width:2px
-    classDef engine fill:#4ecdc4,stroke:#333,stroke-width:2px
-    classDef risk fill:#ffe66d,stroke:#333,stroke-width:2px
-    classDef data fill:#95e1d3,stroke:#333,stroke-width:2px
+    %% 样式定义 - 专业沉稳配色
+    classDef highlight fill:#1e3a5f,stroke:#334155,stroke-width:2px,color:#fff
+    classDef engine fill:#0891b2,stroke:#0e7490,stroke-width:2px,color:#fff
+    classDef risk fill:#dc2626,stroke:#b91c1c,stroke-width:2px,color:#fff
+    classDef data fill:#059669,stroke:#047857,stroke-width:2px,color:#fff
+    classDef execution fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
+    classDef storage fill:#475569,stroke:#334155,stroke-width:2px,color:#fff
+    classDef auto fill:#d97706,stroke:#b45309,stroke-width:2px,color:#fff
 
     class QuotingEngine,AlphaModel,Grid,DiffQuote engine
     class Watchdog,KillSwitch,Reconciler risk
     class InvState,PostgreSQL,RedisKV data
+    class OMS,CircuitBreaker,CLOB,Builder execution
+    class MarketWS,REST,Gamma,tick,ob,control,order_status storage
+    class Router,Scorer,Rebalancer auto
 ```
 
 ## 架构说明

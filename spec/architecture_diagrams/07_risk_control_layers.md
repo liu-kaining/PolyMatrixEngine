@@ -1,8 +1,14 @@
 # 多层风控体系
 
 ```mermaid
-graph TB
-    subgraph L1["第一层: 报价前预检 🚦"]
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart TB
+    subgraph L1["第一层: 报价前预检"]
         A1["QuotingEngine<br/>on_tick()"]
         A2["MAX_EXPOSURE_PER_MARKET<br/>单市场敞口红线: $50"]
         A3["GLOBAL_MAX_BUDGET<br/>全局资金红线: $1000"]
@@ -11,15 +17,15 @@ graph TB
         A1 --> A2 --> A3 --> A4 --> A5
     end
 
-    subgraph L2["第二层: Watchdog 硬熔断 ⚡"]
+    subgraph L2["第二层: Watchdog 硬熔断"]
         B1["RiskMonitor<br/>每秒检查"]
         B2["check_exposure()<br/>capital_used 监控"]
-        B3["单市场超限?<br/>→ trigger_kill_switch()"]
+        B3["单市场超限?<br/>trigger_kill_switch()"]
         B4["trigger_kill_switch():<br/>1. DB: status → suspended<br/>2. Redis: control:{cid}<br/>3. OMS: cancel_market_orders()"]
         B1 --> B2 --> B3 --> B4
     end
 
-    subgraph L3["第三层: REST 周期对账 🔍"]
+    subgraph L3["第三层: REST 周期对账"]
         C1["reconciliation_loop()<br/>默认 60s 间隔"]
         C2["GET Polymarket<br/>Data API /positions"]
         C3["对比: DB vs API<br/>yes/no_exposure"]
@@ -31,7 +37,7 @@ graph TB
         C4 -->|No| C7["跳过"]
     end
 
-    subgraph L4["第四层: 硬重置强制对账 🔧"]
+    subgraph L4["第四层: 硬重置强制对账"]
         D1["每 5 分钟<br/>硬重置周期"]
         D2["cancel_all_for_hard_reset()<br/>全钱包 CLOB cancel_all"]
         D3["睡眠 3s<br/>等待 USDC 释放"]
@@ -51,12 +57,12 @@ graph TB
         T1 --> T2 --> T3
     end
 
-    %% 样式
-    classDef l1 fill:#ffe66d,stroke:#333
-    classDef l2 fill:#ff6b6b,color:#fff
-    classDef l3 fill:#4ecdc4,stroke:#333
-    classDef l4 fill:#f093fb,stroke:#333
-    classDef trigger fill:#a8edea,stroke:#333
+    %% 样式 - 专业沉稳配色
+    classDef l1 fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef l2 fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef l3 fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef l4 fill:#d97706,stroke:#b45309,color:#fff
+    classDef trigger fill:#475569,stroke:#334155,color:#fff
 
     class A1,A2,A3,A4,A5 l1
     class B1,B2,B3,B4 l2
@@ -67,39 +73,25 @@ graph TB
 
 ## 风控参数矩阵
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            风控参数一览表                                     │
-├──────────────────┬────────────────┬─────────────────────────────────────────┤
-│      参数        │     默认值      │                 说明                    │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ MAX_EXPOSURE_    │    $50         │  单市场敞口红线                          │
-│ PER_MARKET       │                │  超过 → kill_switch                      │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ GLOBAL_MAX_      │    $1000       │  全局资金红线                            │
-│ BUDGET           │                │  仅日志警告，不全局熔断                   │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ EXPOSURE_        │    0.01        │  对账覆盖阈值                            │
-│ TOLERANCE        │                │  差异 > 1% → 覆盖                        │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ RECONCILIATION_  │    8s          │  本地成交后保护窗口                       │
-│ BUFFER_SECONDS   │                │  8s 内跳过对账覆盖                       │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ RECONCILIATION_  │    60s         │  Watchdog 对账间隔                       │
-│ INTERVAL_SEC     │                │                                         │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ HARD_RESET_      │    3s          │  硬重置后等待 USDC 释放                  │
-│ CLOB_CANCEL_ALL_│                │                                         │
-│ SLEEP_SEC        │                │                                         │
-├──────────────────┼────────────────┼─────────────────────────────────────────┤
-│ EVENT_HORIZON_   │    24h         │  事件地平线窗口                          │
-│ HOURS            │                │  结算前 24h → graceful_exit              │
-└──────────────────┴────────────────┴─────────────────────────────────────────┘
-```
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| MAX_EXPOSURE_PER_MARKET | $50 | 单市场敞口红线<br/>超过 → kill_switch |
+| GLOBAL_MAX_BUDGET | $1000 | 全局资金红线<br/>仅日志警告，不全局熔断 |
+| EXPOSURE_TOLERANCE | 0.01 | 对账覆盖阈值<br/>差异 > 1% → 覆盖 |
+| RECONCILIATION_BUFFER_SECONDS | 8s | 本地成交后保护窗口<br/>8s 内跳过对账覆盖 |
+| RECONCILIATION_INTERVAL_SEC | 60s | Watchdog 对账间隔 |
+| HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC | 3s | 硬重置后等待 USDC 释放 |
+| EVENT_HORIZON_HOURS | 24h | 事件地平线窗口<br/>结算前 24h → graceful_exit |
 
 ## 熔断链路
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 sequenceDiagram
     participant WD as Watchdog
     participant Inv as InventoryState
@@ -144,17 +136,24 @@ def should_skip_reconciliation(local_timestamp: datetime) -> bool:
     return elapsed < RECONCILIATION_BUFFER_SECONDS
 ```
 
-```
-Timeline:
-────────────────────────────────────────────────────────────────►
-    ↑
-  Fill
-  事件
-    │                    │                    │
-    │◄── 8s 保护窗口 ────►│                    │
-    │                    │                    │
-    └─ 跳过对账覆盖 ──────┘                    │
-                                             └─ 恢复对账覆盖
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+timeline
+    title 时间保护窗口
+
+    section 保护窗口
+        Fill 事件发生
+        : 8s 内跳过对账覆盖
+        : 防止本地成交但 API 未更新
+
+    section 恢复
+        8s 后
+        : 恢复对账覆盖
 ```
 
 ---

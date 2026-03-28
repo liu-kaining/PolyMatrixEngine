@@ -1,54 +1,79 @@
 # QuotingEngine 状态机
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 stateDiagram-v2
     [*] --> QUOTING: start_market_making
 
-    %% 正常报价状态
-    state QUOTING {
-        [*] --> NORMAL: 正常模式
-        NORMAL --> QUOTING_BIDS_ONLY: 只报价 BUY
-        QUOTING_BIDS_ONLY --> NORMAL: 恢复双向
-    }
+    %% 主状态
+    QUOTING --> LOCKED_BY_OPPOSITE: 对侧暴露 > 阈值
+    QUOTING --> LIQUIDATING: 手动平仓 / 止损
+    QUOTING --> GRACEFUL_EXIT: 赛道退出 / 事件地平线
+    QUOTING --> SUSPENDED: kill_switch / API暂停
+
+    %% 子状态: 正常报价模式内
+    note right of QUOTING
+        正常报价模式:
+        - NORMAL: 双向报价
+        - QUOTING_BIDS_ONLY: 只报价 BUY (NO侧锁止)
+    end note
 
     %% 风险触发状态
-    QUOTING --> LOCKED_BY_OPPOSITE: 对侧暴露 > 阈值
     LOCKED_BY_OPPOSITE --> QUOTING: 对侧平仓完成
+    LOCKED_BY_OPPOSITE --> QUOTING: 对侧持仓下降
 
-    QUOTING --> LIQUIDATING: 手动平仓 / 止损
+    %% 平仓状态
     LIQUIDATING --> EXTREME_LIQUIDATING: 极端行情
-    EXTREME_LIQUIDATING --> LIQUIDATING: 回归正常
     LIQUIDATING --> QUOTING: 平仓完成
+    EXTREME_LIQUIDATING --> LIQUIDATING: 回归正常
+    EXTREME_LIQUIDATING --> QUOTING: 平仓完成
 
     %% 退出状态
-    QUOTING --> GRACEFUL_EXIT: 赛道退出 / 事件地平线
     GRACEFUL_EXIT --> QUOTING: 重返市场
     GRACEFUL_EXIT --> POST_RESET_RECONCILE_FREEZE: 对账失败
     GRACEFUL_EXIT --> [*]: 完全退出
 
     %% 暂停状态
-    QUOTING --> SUSPENDED: kill_switch / API暂停
     SUSPENDED --> QUOTING: API恢复
 
     %% 对账冻结
     POST_RESET_RECONCILE_FREEZE --> QUOTING: 对账成功
     POST_RESET_RECONCILE_FREEZE --> SUSPENDED: 对账持续失败
 
-    state QUOTING {
-        [*] --> QUOTING_BIDS_ONLY: 只买单
-        QUOTING_BIDS_ONLY --> QUOTING: 恢复
-    }
+    note right of LOCKED_BY_OPPOSITE
+        对侧持仓过高
+        暂停本侧买单
+    end note
 
-    note right of QUOTING
-        主要状态:
-        - QUOTING: 正常双向报价
-        - QUOTING_BIDS_ONLY: 只买单(NO侧锁止)
-        - LOCKED_BY_OPPOSITE: 对侧暴露锁定
-        - LIQUIDATING: 平仓中
-        - EXTREME_LIQUIDATING: 极端平仓
-        - GRACEFUL_EXIT: 优雅退出
-        - SUSPENDED: 暂停
-        - POST_RESET_RECONCILE_FREEZE: 对账失败冻结
+    note right of LIQUIDATING
+        手动或自动触发
+        只开启卖单
+    end note
+
+    note right of EXTREME_LIQUIDATING
+        加速平仓
+        更激进卖单
+    end note
+
+    note right of GRACEFUL_EXIT
+        - 赛道评分掉出 Top N
+        - 事件地平线到达
+        - 只卖不买
+    end note
+
+    note right of SUSPENDED
+        全部撤单
+        禁止新单
+    end note
+
+    note right of POST_RESET_RECONCILE_FREEZE
+        禁止新 BUY
+        等待对账成功
     end note
 ```
 

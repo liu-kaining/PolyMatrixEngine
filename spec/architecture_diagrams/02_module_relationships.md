@@ -1,7 +1,13 @@
 # 核心模块关系图
 
 ```mermaid
-graph LR
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart TB
     subgraph Entry["入口层"]
         FastAPI["FastAPI<br/>main.py"]
         Streamlit["Streamlit<br/>dashboard.py"]
@@ -21,7 +27,7 @@ graph LR
     end
 
     subgraph Quoting["quoting/ 做市引擎"]
-        Engine["QuotingEngine<br/>~1150行 核心逻辑"]
+        Engine["QuotingEngine<br/>核心逻辑"]
         Alpha["AlphaModel<br/>FV 计算"]
         Grid["GridGenerator<br/>网格档位"]
         Diff["DiffQuoter<br/>差分报价"]
@@ -94,14 +100,14 @@ graph LR
     InvState -->|"async_persist"| Session
     Session --> Models
 
-    %% 样式
-    classDef entry fill:#667eea,stroke:#333,color:#fff
-    classDef data fill:#4ecdc4,stroke:#333
-    classDef core fill:#ffe66d,stroke:#333
-    classDef quoting fill:#ff6b6b,stroke:#333,color:#fff
-    classDef oms fill:#95e1d3,stroke:#333
-    classDef risk fill:#f093fb,stroke:#333
-    classDef db fill:#a8edea,stroke:#333
+    %% 样式 - 专业沉稳配色
+    classDef entry fill:#1e3a5f,stroke:#334155,color:#fff
+    classDef data fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef core fill:#475569,stroke:#334155,color:#fff
+    classDef quoting fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef oms fill:#059669,stroke:#047857,color:#fff
+    classDef risk fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef db fill:#64748b,stroke:#475569,color:#fff
 
     class Gateway,UserStream,Gamma data
     class InvState,Lifecycle,AutoRouter,Config core

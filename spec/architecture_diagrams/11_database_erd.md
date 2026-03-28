@@ -1,6 +1,12 @@
 # 数据库实体关系图
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 erDiagram
     MARKET_META ||--o{ INVENTORY_LEDGER : "1:N"
     MARKET_META ||--o{ ORDER_JOURNAL : "1:N"
@@ -69,22 +75,60 @@ erDiagram
 
 ## 表关系说明
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              数据模型关系                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│    MARKET_META (市场元数据)                                                   │
-│         │                                                                     │
-│         ├──1:N──► INVENTORY_LEDGER (库存台账)                                │
-│         │              │                                                     │
-│         │              └── 1:1 ──► FUNDING_ADDRESS (钱包)                     │
-│         │                                                                     │
-│         ├──1:N──► ORDER_JOURNAL (订单日志)                                    │
-│         │                                                                     │
-│         └──1:N──► REWARDS_CONFIG (激励配置)                                   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart TB
+    subgraph MARKET_META["MARKET_META (市场元数据)"]
+        M1["condition_id (PK)"]
+        M2["token_id_yes / token_id_no"]
+        M3["status / end_date"]
+    end
+
+    subgraph INVENTORY_LEDGER["INVENTORY_LEDGER (库存台账)"]
+        I1["condition_id (PK,FK)"]
+        I2["funding_address (PK)"]
+        I3["yes/no_exposure"]
+        I4["yes/no_capital_used"]
+    end
+
+    subgraph ORDER_JOURNAL["ORDER_JOURNAL (订单日志)"]
+        O1["order_id (PK)"]
+        O2["condition_id (FK)"]
+        O3["side / price / size"]
+        O4["filled_size / status"]
+    end
+
+    subgraph REWARDS_CONFIG["REWARDS_CONFIG (激励配置)"]
+        R1["condition_id (PK,FK)"]
+        R2["annual_roi / rate"]
+    end
+
+    subgraph FUNDING_ADDRESS["FUNDING_ADDRESS (钱包)"]
+        F1["address (PK)"]
+        F2["api_key / api_secret"]
+    end
+
+    MARKET_META -->|"1:N"| INVENTORY_LEDGER
+    MARKET_META -->|"1:N"| ORDER_JOURNAL
+    MARKET_META -->|"1:N"| REWARDS_CONFIG
+    INVENTORY_LEDGER -->|"N:1"| FUNDING_ADDRESS
+
+    classDef market fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef ledger fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef order fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef rewards fill:#d97706,stroke:#b45309,color:#fff
+    classDef funding fill:#059669,stroke:#047857,color:#fff
+
+    class MARKET_META,market
+    class INVENTORY_LEDGER,ledger
+    class ORDER_JOURNAL,order
+    class REWARDS_CONFIG,rewards
+    class FUNDING_ADDRESS,funding
 ```
 
 ## 库存计算口径
@@ -163,34 +207,34 @@ class InventoryStateManager:
 
 ## 状态同步流程
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           状态同步流程                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  成交事件                                                                   │
-│     │                                                                      │
-│     ▼                                                                      │
-│  ┌────────────────┐                                                        │
-│  │ 1. DB 同步写入  │ ← OrderJournal (同步, 保证持久化)                       │
-│  └────────┬───────┘                                                        │
-│           │                                                                 │
-│           ▼                                                                 │
-│  ┌────────────────┐                                                        │
-│  │ 2. 内存更新    │ ← InventoryStateManager (同步, 热路径)                   │
-│  └────────┬───────┘                                                        │
-│           │                                                                 │
-│           ▼                                                                 │
-│  ┌────────────────┐                                                        │
-│  │ 3. 异步队列    │ ← 有界队列 maxsize=1000                                 │
-│  └────────┬───────┘                                                        │
-│           │                                                                 │
-│           ▼                                                                 │
-│  ┌────────────────┐                                                        │
-│  │ 4. 批量 DB 写入│ ← InventoryLedger (异步, 批量)                          │
-│  └────────────────┘                                                        │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart TB
+    subgraph Step1["1. DB 同步写入"]
+        A["OrderJournal<br/>同步, 保证持久化"]
+    end
+
+    subgraph Step2["2. 内存更新"]
+        B["InventoryStateManager<br/>同步, 热路径"]
+    end
+
+    subgraph Step3["3. 异步队列"]
+        C["有界队列<br/>maxsize=1000"]
+    end
+
+    subgraph Step4["4. 批量 DB 写入"]
+        D["InventoryLedger<br/>异步, 批量"]
+    end
+
+    A --> B --> C --> D
+
+    classDef step fill:#0891b2,stroke:#0e7490,color:#fff
+    class A,B,C,D step
 ```
 
 ---

@@ -1,10 +1,16 @@
 # 成交处理流程
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
     subgraph WS["WebSocket 事件"]
         A["User WebSocket<br/>polymarket.com/ws"]
-        B["消息类型:<br/>▸ fill<br/>▸ cancel<br/>▸ cancel_all"]
+        B["消息类型:<br/>fill / cancel / cancel_all"]
     end
 
     subgraph Parse["消息解析"]
@@ -15,7 +21,7 @@ flowchart TB
         G["handle_cancel_all()<br/>全撤处理"]
     end
 
-    subgraph FillHandler["成交处理器 💎"]
+    subgraph FillHandler["成交处理器"]
         H["OMS update_order()<br/>更新 OrderJournal"]
         I["filled_size += amount<br/>status → FILLED"]
         J["apply_fill()<br/>InventoryStateManager"]
@@ -80,12 +86,12 @@ flowchart TB
     V --> W
     W --> A
 
-    %% 样式
-    classDef ws fill:#667eea,color:#fff
-    classDef handler fill:#4ecdc4,stroke:#333
-    classDef memory fill:#ffe66d,stroke:#333
-    classDef persist fill:#95e1d3,stroke:#333
-    classDef notify fill:#ff6b6b,color:#fff
+    %% 样式 - 专业沉稳配色
+    classDef ws fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef handler fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef memory fill:#475569,stroke:#334155,color:#fff
+    classDef persist fill:#059669,stroke:#047857,color:#fff
+    classDef notify fill:#dc2626,stroke:#b91c1c,color:#fff
 
     class A,B ws
     class E,F,G,H,I handler
@@ -136,22 +142,34 @@ async def handle_fill(
 
 ## 内存优先设计
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         内存优先 vs 传统方案                          │
-├─────────────────────────────────────────────────────────────────────┤
-│  传统方案:                                                           │
-│  DB 写入 ──→ 返回成功 ──→ 更新内存                                   │
-│  ❌ DB 延迟影响成交处理                                               │
-│  ❌ DB 故障导致成交丢失                                               │
-│  ❌ 热路径 DB 瓶颈                                                    │
-├─────────────────────────────────────────────────────────────────────┤
-│  内存优先方案 (PolyMatrix):                                           │
-│  内存更新 ──→ 返回成功 ──→ 异步队列 ──→ DB                             │
-│  ✅ 成交处理零延迟                                                    │
-│  ✅ 内存状态始终最新                                                  │
-│  ✅ 有界队列 + 关闭排空保证持久化                                     │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart LR
+    subgraph Traditional["传统方案"]
+        A1["DB 写入"]
+        A2["返回成功"]
+        A3["更新内存"]
+        A1 --> A2 --> A3
+    end
+
+    subgraph PolyMatrix["内存优先方案"]
+        B1["内存更新"]
+        B2["返回成功"]
+        B3["异步队列"]
+        B4["DB 持久化"]
+        B1 --> B2 --> B3 --> B4
+    end
+
+    classDef traditional fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef good fill:#059669,stroke:#047857,color:#fff
+
+    class A1,A2,A3 traditional
+    class B1,B2,B3,B4 good
 ```
 
 ## 异步持久化队列
@@ -205,6 +223,12 @@ class InventoryStateManager:
 ## 自愈重连机制
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 sequenceDiagram
     participant WS as UserStreamGateway
     participant Auth as HMAC Auth

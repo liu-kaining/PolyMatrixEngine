@@ -3,87 +3,78 @@
 
 @startuml PolyMatrix_Architecture
 
-!define RECTANGLE class
-
-skinparam componentStyle rectangle
-
-skinparam backgroundColor #1a1a2e
-skinparam defaultTextColor #eaeaea
-skinparam shadowing false
-skinparam roundcorner 15
-
-skinparam component {
-    BackgroundColor #16213e
-    BorderColor #0f3460
-    ArrowColor #e94560
-    FontColor #eaeaea
+skinparam rectangle {
+    BackgroundColor 16213E
+    BorderColor 0F3460
+    FontColor EAEaea
+    RoundCorner 15
 }
 
 skinparam database {
-    BackgroundColor #0f3460
-    BorderColor #e94560
-    FontColor #eaeaea
+    BackgroundColor 0F3460
+    BorderColor E94560
+    FontColor EAEaea
 }
 
-skinparam queue {
-    BackgroundColor #533483
-    BorderColor #e94560
-    FontColor #eaeaea
+skinparam package {
+    BackgroundColor 16213E
+    BorderColor 0F3460
+    FontColor EAEaea
 }
 
 title **PolyMatrix Engine V6.4 - 系统架构图**
 
-package "客户端层" <<Rectangle>> #16213e {
+package "客户端层" {
     [FastAPI 控制面] as API
     [Streamlit 驾驶舱] as Dashboard
 }
 
-package "数据面 (Data Plane)" <<Rectangle>> #16213e {
+package "数据面 (Data Plane)" {
     [Market WebSocket] as MarketWS
     [User WebSocket] as UserWS
     [REST Snapshot] as REST
     [Gamma API] as GammaAPI
-    database "Redis" as Redis #533483
-    queue "tick:{token}" as TickQ
-    queue "ob:{token}" as OBQ
-    queue "control:{cid}" as CtrlQ
-    queue "order_status" as OrderStatusQ
+    database "Redis" as Redis #pink
+    queue "Redis PubSub" as TickQ #pink
+    queue "Redis PubSub" as OBQ #pink
+    queue "Redis PubSub" as CtrlQ #pink
+    queue "Redis PubSub" as OrderStatusQ #pink
 }
 
-package "核心引擎层 (Core Engine)" <<Rectangle>> #16213e {
-    package "QuotingEngine × 2" <<Rectangle>> #1a1a2e {
+package "核心引擎层 (Core Engine)" {
+    package "QuotingEngine × 2" {
         [AlphaModel] as Alpha
         [Grid Generator] as Grid
         [Diff Quoter] as DiffQuote
     }
 
-    package "风控平面" <<Rectangle>> #1a1a2e {
+    package "风控平面" {
         [Watchdog] as Watchdog
         [Kill Switch] as KillSwitch
         [Reconciler] as Reconcile
     }
 
-    package "库存管理层" <<Rectangle>> #1a1a2e {
-        [InventoryStateManager] as InvState #4ecdc4
+    package "库存管理层" {
+        [InventoryStateManager] as InvState #lightblue
     }
 
-    package "自动路由" <<Rectangle>> #1a1a2e {
+    package "自动路由" {
         [Portfolio Manager] as PortfolioMgr
         [评分引擎] as Scorer
-        [重平衡器] as Rebalancer
+        [MarketLifecycle] as Lifecycle
     }
 }
 
-package "执行平面 (Execution)" <<Rectangle>> #16213e {
+package "执行平面 (Execution)" {
     [OMS Core] as OMS
     [CircuitBreaker] as CB
     [CLOB Client] as CLOB
     [Builder API] as Builder
 }
 
-package "数据层" <<Rectangle>> #16213e {
-    database "PostgreSQL" as PG #0f3460
-    database "Redis KV" as RedisKV #533483
+package "数据层" {
+    database "PostgreSQL" as PG
+    database "Redis KV" as RedisKV
 }
 
 ' 连接关系
@@ -113,6 +104,7 @@ InvState --> OMS
 InvState --> PG
 
 PortfolioMgr --> Lifecycle
+Lifecycle --> Alpha
 
 OMS --> CLOB
 OMS --> CB
@@ -122,15 +114,14 @@ OMS --> Builder
 CLOB --> MarketWS
 CLOB --> UserWS
 
-' 图例
 legend right
 |= 组件类型 |= 颜色 |
-| <back:#16213e> 控制面 </back> | #667eea |
-| <back:#16213e> 数据面 </back> | #4ecdc4 |
-| <back:#16213e> 引擎层 </back> | #ff6b6b |
-| <back:#16213e> 风控层 </back> | #f093fb |
-| <back:#0f3460> 数据库 </back> | #0f3460 |
-| <back:#533483> 消息队列 </back> | #533483 |
+| <back:#16213E> 客户端层 </back> | #0F3460 |
+| <back:#16213E> 数据面 </back> | #0891B2 |
+| <back:#16213E> 引擎层 </back> | #7C3AED |
+| <back:#16213E> 风控层 </back> | #DC2626 |
+| <back:#16213E> 执行层 </back> | #059669 |
+| <back:#16213E> 数据层 </back> | #64748B |
 endlegend
 
 footer **PolyMatrix Engine | 准机构级自动化做市引擎**

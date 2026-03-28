@@ -1,8 +1,14 @@
 # 硬重置流程 (V6.4)
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
 flowchart TB
-    subgraph Schedule["硬重置调度 ⏰"]
+    subgraph Schedule["硬重置调度"]
         A["每 5 分钟<br/>hard_reset_cycle"]
         B{"当前状态?<br/>ACTIVE / GRACEFUL_EXIT"}
         A --> B
@@ -10,7 +16,7 @@ flowchart TB
         B -->|其他| D["跳过本次"]
     end
 
-    subgraph CancelAll["全钱包撤单 🎯"]
+    subgraph CancelAll["全钱包撤单"]
         C["OMS<br/>physical_clob_cancel_all()"]
         E["CLOB HTTP POST<br/>/cancel_all"]
         F["超时: 45s"]
@@ -23,26 +29,26 @@ flowchart TB
         J --> E
     end
 
-    subgraph LocalCancel["本地状态清理 🧹"]
+    subgraph LocalCancel["本地状态清理"]
         K["cancel_all_orders()<br/>force_evict=True"]
         L["清空 active_orders"]
         M["清空 pending_buy_notional"]
         N["重置引擎状态 → SUSPENDED"]
     end
 
-    subgraph ForceReconcile["强制对账 🔍"]
+    subgraph ForceReconcile["强制对账"]
         O["reconcile_single_market<br/>(force=True)"]
         P["绕过时间保护<br/>强制覆盖"]
         Q["同步 InventoryLedger<br/>到内存"]
     end
 
-    subgraph Decision["对账决策 💡"]
+    subgraph Decision["对账决策"]
         R{"对账<br/>成功?"}
         S["POST_RESET_<br/>RECONCILE_FREEZE<br/>冻结 BUY"]
         T["引擎状态 → QUOTING<br/>恢复报价"]
     end
 
-    subgraph Recovery["恢复阶段 🚀"]
+    subgraph Recovery["恢复阶段"]
         U["订阅 Market WS<br/>tick: ob:"]
         V["订阅 User WS<br/>fills, cancels"]
         W["恢复 QuotingEngine<br/>engine_tasks"]
@@ -61,11 +67,11 @@ flowchart TB
     T --> U
     U --> V --> W
 
-    classDef schedule fill:#667eea,color:#fff
-    classDef cancel fill:#ff6b6b,color:#fff
-    classDef reconcile fill:#4ecdc4,stroke:#333
-    classDef decision fill:#ffe66d,stroke:#333
-    classDef recovery fill:#95e1d3,stroke:#333
+    classDef schedule fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef cancel fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef reconcile fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef decision fill:#d97706,stroke:#b45309,color:#fff
+    classDef recovery fill:#059669,stroke:#047857,color:#fff
 
     class A,B,D schedule
     class C,E,F,G,H,I,J cancel
@@ -138,67 +144,88 @@ async def cancel_all_orders(self, force_evict: bool = False):
 
 ## Ghost Order 防护
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Ghost Order 问题                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  传统方案问题:                                                              │
-│  1. 引擎重启后本地无订单状态                                                │
-│  2. CLOB 上仍有挂单                                                         │
-│  3. 报价时以为没单，实际有单 → 双边持仓失控                                  │
-│                                                                             │
-│  PolyMatrix V6.4 解决方案:                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  硬重置 = CLOB cancel_all + 本地状态清理 + 强制对账                    │    │
-│  │                                                                      │    │
-│  │  效果:                                                               │    │
-│  │  ✅ CLOB 无残留订单                                                   │    │
-│  │  ✅ 本地状态干净                                                      │    │
-│  │  ✅ 对账确认持仓一致                                                  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+flowchart LR
+    subgraph Problem["Ghost Order 问题"]
+        P1["引擎重启后本地无订单状态"]
+        P2["CLOB 上仍有挂单"]
+        P3["报价时以为没单<br/>实际有单 → 双边持仓失控"]
+    end
+
+    subgraph Solution["V6.4 解决方案"]
+        S1["CLOB cancel_all"]
+        S2["本地状态清理"]
+        S3["强制对账"]
+    end
+
+    subgraph Result["效果"]
+        R1["CLOB 无残留订单"]
+        R2["本地状态干净"]
+        R3["对账确认持仓一致"]
+    end
+
+    P1 --> S1
+    P2 --> S2
+    P3 --> S3
+
+    S1 --> R1
+    S2 --> R2
+    S3 --> R3
+
+    classDef problem fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef solution fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef result fill:#059669,stroke:#047857,color:#fff
+
+    class P1,P2,P3 problem
+    class S1,S2,S3 solution
+    class R1,R2,R3 result
 ```
 
 ## 重置时间线
 
-```
-◄─────────────────────────── 硬重置完整流程 ────────────────────────────►
-│
-│  T+0s      ┌────────────────────────────────────────────────────────┐
-│            │ CLOB cancel_all (超时 45s)                               │
-│            └────────────────────────────────────────────────────────┘
-│
-│  T+3s      ┌────────────────────────────────────────────────────────┐
-│            │ 睡眠等待 USDC 释放                                        │
-│            └────────────────────────────────────────────────────────┘
-│
-│  T+4s      ┌────────────────────────────────────────────────────────┐
-│            │ 本地 cancel_all_orders(force_evict=True)               │
-│            │ • 清空 active_orders                                   │
-│            │ • 清空 pending_buys                                    │
-│            │ • 引擎状态 → SUSPENDED                                 │
-│            └────────────────────────────────────────────────────────┘
-│
-│  T+5s      ┌────────────────────────────────────────────────────────┐
-│            │ reconcile_single_market(force=True)                    │
-│            │ • 绕过时间保护                                          │
-│            │ • 强制覆盖 DB                                           │
-│            │ • 同步内存状态                                          │
-│            └────────────────────────────────────────────────────────┘
-│
-│  T+6s      ┌────────────────────────────────────────────────────────┐
-│            │ 决策:                                                  │
-│            │ • 成功 → 引擎状态 → QUOTING                            │
-│            │ • 失败 → 引擎状态 → POST_RESET_RECONCILE_FREEZE        │
-│            └────────────────────────────────────────────────────────┘
-│
-│  T+7s      ┌────────────────────────────────────────────────────────┐
-│            │ 恢复: 订阅 WS, 恢复 QuotingEngine                      │
-│            └────────────────────────────────────────────────────────┘
-│
-▼ 5 分钟后重复...
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1e3a5f',
+  'primaryTextColor': '#ffffff',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#64748b'
+}}%%
+timeline
+    title 硬重置完整流程
+
+    section T+0s
+        CLOB cancel_all
+        : 超时 45s
+
+    section T+3s
+        睡眠等待 USDC 释放
+
+    section T+4s
+        本地 cancel_all_orders(force_evict=True)
+        : 清空 active_orders
+        : 清空 pending_buys
+        : 引擎状态 → SUSPENDED
+
+    section T+5s
+        reconcile_single_market(force=True)
+        : 绕过时间保护
+        : 强制覆盖 DB
+        : 同步内存状态
+
+    section T+6s
+        决策
+        : 成功 → 引擎状态 → QUOTING
+        : 失败 → 引擎状态 → POST_RESET_RECONCILE_FREEZE
+
+    section T+7s
+        恢复
+        : 订阅 WS, 恢复 QuotingEngine
 ```
 
 ## 对账失败冻结
