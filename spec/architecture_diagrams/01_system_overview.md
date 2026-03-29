@@ -1,119 +1,80 @@
 # 系统整体架构图
 
+以下为 **兼容性优先** 的 Mermaid：无 `%%{init}`、无嵌套 subgraph、无 `class`/`style`、无边标签、无 `<br/>`，避免 Cursor / VS Code / GitHub 内置解析器报错。原「彩色分层 + 嵌套分组」若需导出 PPT，可用 [mermaid.live](https://mermaid.live) 在可渲染版本上再加样式。
+
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e3a5f',
-  'primaryTextColor': '#ffffff',
-  'primaryBorderColor': '#334155',
-  'lineColor': '#64748b',
-  'secondaryColor': '#0891b2',
-  'tertiaryColor': '#f1f5f9'
-}}%%
 flowchart TB
-    subgraph Client["客户端层"]
-        Dashboard["Streamlit 驾驶舱<br/>监控 + 控制"]
-        API["FastAPI 控制面<br/>启动/停止/风控"]
+    subgraph S1["客户端层"]
+        N1["Streamlit 驾驶舱"]
+        N2["FastAPI 控制面"]
     end
-
-    subgraph DataPlane["数据面"]
-        subgraph MarketData["市场数据层"]
-            MarketWS["Market WebSocket<br/>Polymarket 订单簿"]
-            REST["REST API<br/>快照获取"]
-            Gamma["Gamma API<br/>市场元数据"]
-        end
-
-        subgraph DataBus["Redis 消息总线"]
-            tick["tick:{token}<br/>订单簿更新"]
-            ob["ob:{token}<br/>完整快照"]
-            control["control:{cid}<br/>控制指令"]
-            order_status["order_status:<br/>订单状态"]
-        end
-
-        MarketWS --> tick
-        MarketWS --> ob
+    subgraph S2["数据面"]
+        N3["Market WebSocket"]
+        N4["REST 快照"]
+        N5["Gamma API"]
+        N6["Redis PubSub tick"]
+        N7["Redis PubSub ob"]
+        N8["Redis PubSub control"]
+        N9["Redis PubSub order_status"]
     end
-
-    subgraph Core["核心引擎层"]
-        subgraph QuotingEngine["QuotingEngine × 2<br/>YES + NO (内部组件)"]
-            AlphaModel["AlphaModel<br/>内部组件: FV 计算"]
-            Grid["GridGenerator<br/>内部组件: 网格生成"]
-            DiffQuote["sync_orders_diff()<br/>内部方法: 差分报价"]
-        end
-
-        subgraph RiskPlane["风控平面"]
-            Watchdog["RiskMonitor<br/>Watchdog"]
-            KillSwitch["Kill Switch<br/>硬熔断"]
-            Reconciler["对账引擎<br/>Data API 全表对账<br/>间隔见 RECONCILIATION_INTERVAL_SEC"]
-        end
-
-        subgraph Inventory["库存管理层"]
-            InvState["InventoryStateManager<br/>内存优先 + 异步持久化"]
-        end
+    subgraph S3["核心引擎层"]
+        N10["AlphaModel FV"]
+        N11["GridGenerator"]
+        N12["sync_orders_diff"]
+        N13["Watchdog"]
+        N14["KillSwitch"]
+        N15["Reconciler"]
+        N16["InventoryStateManager"]
     end
-
-    subgraph ExecutionPlane["执行平面"]
-        OMS["OMS<br/>订单状态机"]
-        CircuitBreaker["CircuitBreaker<br/>熔断器"]
-        CLOB["Polymarket CLOB<br/>py-clob-client"]
-        Builder["Builder API<br/>订单归因"]
+    subgraph S4["执行平面"]
+        N17["OMS"]
+        N18["CircuitBreaker"]
+        N19["CLOB"]
+        N20["Builder API"]
     end
-
-    subgraph DataLayer["数据层"]
-        PostgreSQL["PostgreSQL<br/>InventoryLedger<br/>OrderJournal<br/>MarketMeta"]
-        RedisKV["Redis KV<br/>状态缓存"]
+    subgraph S5["数据层"]
+        N21["PostgreSQL"]
+        N22["Redis KV"]
     end
-
-    subgraph AutoRouter["自动路由"]
-        Router["PortfolioManager<br/>组合管理器"]
-        Scorer["评分引擎<br/>_radar_scan"]
-        Rebalancer["重平衡器<br/>赛道隔离"]
+    subgraph S6["自动路由"]
+        N23["PortfolioManager"]
+        N24["radar_scan 评分"]
+        N25["赛道重平衡"]
     end
-
-    %% 连接关系
-    Dashboard --> API
-    API -->|"生命周期管理"| Core
-    API -->|"market_lifecycle"| AutoRouter
-
-    tick --> QuotingEngine
-    ob --> QuotingEngine
-    Gamma -->|"rewards config"| QuotingEngine
-
-    QuotingEngine -.->|"直接调用<br/>oms.create_order()"| OMS
-    QuotingEngine -.->|"直接调用<br/>oms.cancel_order()"| OMS
-    OMS -->|place/cancel| CLOB
-    OMS -->|Builder签名| Builder
-
-    Watchdog -->|check_exposure<br/>(每秒)| InvState
-    Watchdog -.->|trigger_kill_switch| KillSwitch
-    Watchdog -.->|reconcile_loop<br/>(周期)| Reconciler
-    KillSwitch -.->|cancel_all| OMS
-    Reconciler -->|Polymarket<br/>Data API| PostgreSQL
-
-    InvState -->|async_persist| PostgreSQL
-
-    AutoRouter -->|start_market_making| Core
-    Router -->|Gamma查询| Gamma
-
-    %% 样式定义 - 专业沉稳配色
-    classDef highlight fill:#1e3a5f,stroke:#334155,stroke-width:2px,color:#fff
-    classDef engine fill:#0891b2,stroke:#0e7490,stroke-width:2px,color:#fff
-    classDef risk fill:#dc2626,stroke:#b91c1c,stroke-width:2px,color:#fff
-    classDef data fill:#059669,stroke:#047857,stroke-width:2px,color:#fff
-    classDef execution fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
-    classDef storage fill:#475569,stroke:#334155,stroke-width:2px,color:#fff
-    classDef auto fill:#d97706,stroke:#b45309,stroke-width:2px,color:#fff
-    classDef internalComp fill:#065f7f,stroke:#0e7490,stroke-width:1px,color:#fff
-
-    class QuotingEngine engine
-    class AlphaModel,Grid,DiffQuote internalComp
-    class Watchdog,KillSwitch,Reconciler risk
-    class InvState,PostgreSQL,RedisKV data
-    class OMS,CircuitBreaker,CLOB,Builder execution
-    class MarketWS,REST,Gamma,tick,ob,control,order_status storage
-    class Router,Scorer,Rebalancer auto
+    N1 --> N2
+    N2 --> N10
+    N2 --> N23
+    N3 --> N6
+    N3 --> N7
+    N6 --> N10
+    N7 --> N10
+    N5 --> N10
+    N10 --> N11
+    N11 --> N12
+    N12 -.-> N17
+    N17 --> N19
+    N17 --> N20
+    N13 --> N16
+    N13 -.-> N14
+    N13 -.-> N15
+    N14 -.-> N17
+    N15 --> N21
+    N16 --> N21
+    N23 --> N24
+    N24 --> N25
+    N23 --> N10
+    N23 --> N5
 ```
 
 ## 架构说明
+
+### 此前常见渲染失败原因（已在本图规避）
+
+1. **`style QuotingEngine`**：`QuotingEngine` 是 **subgraph**，不是节点；对 subgraph 做 `style` 在多数版本会直接语法错误。  
+2. **子图套子图**：三层嵌套在部分预览引擎上不稳定。  
+3. **`%%{init: ...}`**：`themeVariables` 大括号或引号稍有不匹配，整段图失败。  
+4. **`classDef` 里的 `stroke-width`**：少数解析器对带连字符的样式串不兼容。  
+5. **边标签**里的 `/`、`()`、`<br/>`：个别渲染器会误解析。
 
 ### 三层分离设计
 
