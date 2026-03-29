@@ -255,7 +255,15 @@ class RiskMonitor:
             await session.commit()
         return True
 
-    async def reconcile_positions(self):
+    async def reconcile_positions(self, *, force: bool = False):
+        """
+        Full REST reconciliation vs Data API for all ledger rows.
+        When force=True (e.g. User WS reconnect), skip RECONCILIATION_BUFFER_SECONDS so missed fills can be repaired.
+        """
+        if not settings.FUNDER_ADDRESS:
+            logger.debug("reconcile_positions: FUNDER_ADDRESS not set; skip.")
+            return
+
         # 1. Fetch real on-chain positions
         url = f"https://data-api.polymarket.com/positions?user={settings.FUNDER_ADDRESS}"
         
@@ -297,7 +305,8 @@ class RiskMonitor:
                 if diff_yes > self.exposure_tolerance or diff_no > self.exposure_tolerance:
                     last_local_fill_ts = await inventory_state.get_last_local_fill_timestamp(cid)
                     if (
-                        last_local_fill_ts > 0
+                        not force
+                        and last_local_fill_ts > 0
                         and (time.time() - last_local_fill_ts) < self.reconciliation_buffer_seconds
                     ):
                         logger.info(

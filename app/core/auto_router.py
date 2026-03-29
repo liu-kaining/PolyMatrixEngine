@@ -31,9 +31,15 @@ def _router_start_redis_key(cid: str) -> str:
     return f"router:start_time:{cid}"
 
 
+# Stale-key safety: crash before explicit delete still expires (30d).
+ROUTER_REDIS_STATE_TTL_SEC = 2592000
+
+
 async def _persist_router_start_time_to_redis(cid: str, ts: float) -> None:
     try:
-        await redis_client.set_state(_router_start_redis_key(cid), {"started_at": ts})
+        await redis_client.set_state(
+            _router_start_redis_key(cid), {"started_at": ts}, ex=ROUTER_REDIS_STATE_TTL_SEC
+        )
     except Exception as e:
         logger.warning("[AutoRouter] Redis persist start_time failed %s: %s", cid[:10], e)
 

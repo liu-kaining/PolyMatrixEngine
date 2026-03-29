@@ -8,6 +8,7 @@ from typing import Dict, Optional, Set
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
 from app.oms.core import oms
+from app.risk.watchdog import watchdog
 from app.db.session import AsyncSessionLocal
 from app.models.db_models import OrderJournal, OrderStatus
 from sqlalchemy.future import select
@@ -56,9 +57,11 @@ class UserStreamGateway:
                     self.ws = ws
                     connected_at = time.monotonic()
                     logger.info("User WS connected.")
-                    
+
                     self.ping_task = asyncio.create_task(self._heartbeat())
                     await self._authenticate()
+                    # Long reconciliation interval (e.g. 3600s): repair inventory after any WS gap.
+                    _safe_create_task(watchdog.reconcile_positions(force=True))
                     await self._listen()
                     raise RuntimeError("User WS listen loop exited unexpectedly without exception.")
                     
