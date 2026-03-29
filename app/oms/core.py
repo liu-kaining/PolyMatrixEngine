@@ -4,6 +4,8 @@ import logging
 import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -168,6 +170,23 @@ class OrderManagementSystem:
                 
         self.circuit_breaker = CircuitBreaker()
 
+        # Long-lived HTTP client for OMS-owned REST (shared pool; avoid per-call AsyncClient).
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        self._bal_allow_lock = asyncio.Lock()
+        self._bal_allow_cached_at: float = 0.0
+        self._bal_allow_cached_value: Optional[Any] = None
+        self._bal_allow_cache_valid: bool = False
+
+    async def aclose(self) -> None:
+        """Close pooled HTTP resources (call from app shutdown if desired)."""
+        try:
+            await self.http_client.aclose()
+        except Exception as e:
+            logger.debug("OMS http_client aclose: %s", e)
+
     def create_auth_headers(self, method: str, request_path: str) -> Dict[str, str]:
         """
         Build L2 HMAC-signed headers for WebSocket auth (no plaintext secret).
@@ -326,28 +345,6 @@ class OrderManagementSystem:
                     if order:
                         order.status = OrderStatus.CANCELED
                         payload = dict(order.payload) if order.payload else {}
-                        
-                        # Handle Dusting: Verify if there was any partial fill immediately prior to cancel
-                        try:
-                            # We check the API directly for size_matched
-                            # Note: self.client methods are typically synchronous HTTP calls. 
-                            # Wrapping in to_thread to prevent event loop blocking during HFT load.
-                            order_info = await asyncio.to_thread(self.client.get_order, order_id)
-                            
-                            if isinstance(order_info, dict):
-                                size_matched = float(order_info.get("size_matched", 0.0))
-                                payload["filled_size_api_check"] = size_matched
-                                
-                                # If API indicates it matched before being canceled, note it.
-                                # The user_stream WebSocket is the primary source of truth, but this is a fail-safe.
-                                if size_matched > 0 and size_matched < float(order.size):
-                                    logger.warning(f"[{order_id}] Cancelled, but API shows Partial Fill ({size_matched}/{order.size})")
-                                    payload["status_detail"] = "PARTIALLY_FILLED_AND_CANCELED"
-                                    # We don't forcefully overwrite filled_size here because user_stream 
-                                    # maintains the atomic ledger. We just keep the audit trail.
-                        except Exception as fetch_e:
-                            logger.debug(f"Could not fetch final order status for {order_id} to check dust: {fetch_e}")
-
                         payload["cancel_response"] = res
                         if already_closed:
                             payload["status_detail"] = payload.get("status_detail") or ""
@@ -397,6 +394,26 @@ class OrderManagementSystem:
             
         logger.info(f"KILL SWITCH SUCCESS: {success_count}/{len(active_orders)} orders canceled for {condition_id}")
         return True
+
+    async def get_balance_allowance_cached(self, params: Any, *, timeout: float) -> Any:
+        """
+        Collateral balance/allowance with 5s TTL and async lock so YES/NO engines share one CLOB read.
+        """
+        if not self.client:
+            return None
+        ttl = 5.0
+        async with self._bal_allow_lock:
+            now_m = time.monotonic()
+            if self._bal_allow_cache_valid and (now_m - self._bal_allow_cached_at) < ttl:
+                return self._bal_allow_cached_value
+            bal = await asyncio.wait_for(
+                asyncio.to_thread(self.client.get_balance_allowance, params),
+                timeout=timeout,
+            )
+            self._bal_allow_cached_value = bal
+            self._bal_allow_cached_at = time.monotonic()
+            self._bal_allow_cache_valid = True
+            return bal
 
     @staticmethod
     def _format_collateral_balance(bal: Any) -> str:
@@ -519,11 +536,11 @@ class OrderManagementSystem:
         try:
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 
+            async with self._bal_allow_lock:
+                self._bal_allow_cache_valid = False
+
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            bal = await asyncio.wait_for(
-                asyncio.to_thread(self.client.get_balance_allowance, params),
-                timeout=bal_timeout,
-            )
+            bal = await self.get_balance_allowance_cached(params, timeout=bal_timeout)
             label = self._format_collateral_balance(bal)
             result["usdc_balance_label"] = label
             logger.info(f"[HARD RESET] CLOB collateral balance read: {label}")

@@ -13,6 +13,12 @@ from app.models.db_models import OrderSide, OrderStatus, OrderJournal
 
 logger = logging.getLogger(__name__)
 
+# Per-condition debounce so YES/NO engines do not both run wallet cancel_all + reconcile within 15s.
+_hard_reset_condition_last_mono: Dict[str, float] = {}
+_hard_reset_condition_lock = asyncio.Lock()
+HARD_RESET_CONDITION_DEBOUNCE_SEC = 15.0
+
+
 class AlphaPricingModel:
     """Calculates baseline probability based on inputs"""
     def __init__(self):
@@ -465,57 +471,73 @@ class QuotingEngine:
 
             # Ghost Order TTL Hard Reset (Every 5 minutes)
             if not self.exit_mode and time.time() - self.last_grid_reset_time > 300:
-                logger.warning(
-                    f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
-                )
-                # V6.4: Wallet-wide CLOB cancel_all FIRST (kills exchange-side ghosts), then settle sleep,
-                # then local OMS cleanup + REST inventory reconcile.
-                hard_reset_usdc_balance_label = "unknown"
-                try:
-                    hr = await oms.physical_clob_cancel_all_for_hard_reset()
-                    hard_reset_usdc_balance_label = str(
-                        hr.get("usdc_balance_label", "unknown")
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[{self.token_id[:6]}] [HARD RESET] physical_clob_cancel_all_for_hard_reset error: {e}",
-                        exc_info=True,
-                    )
-
-                await self.cancel_all_orders(force_evict=True)
-                reconcile_ok = False
-                try:
-                    reconcile_ok = await watchdog.reconcile_single_market(self.condition_id, force=True)
-                    if reconcile_ok:
-                        logger.info(
-                            f"[{self.token_id[:6]}] Post-reset REST inventory sync completed for condition."
-                        )
+                skip_peer_reset = False
+                async with _hard_reset_condition_lock:
+                    now_mono = time.monotonic()
+                    last_mono = _hard_reset_condition_last_mono.get(self.condition_id, 0.0)
+                    if now_mono - last_mono < HARD_RESET_CONDITION_DEBOUNCE_SEC:
+                        skip_peer_reset = True
                     else:
-                        logger.warning(
-                            f"[{self.token_id[:6]}] Post-reset REST sync skipped or failed; "
-                            "verify FUNDER_ADDRESS and InventoryLedger row."
+                        _hard_reset_condition_last_mono[self.condition_id] = now_mono
+
+                if skip_peer_reset:
+                    logger.info(
+                        f"[{self.token_id[:6]}] Periodic Hard Reset skipped: same condition_id ran within "
+                        f"{HARD_RESET_CONDITION_DEBOUNCE_SEC:.0f}s (peer engine likely triggered cancel-all)."
+                    )
+                    self.last_grid_reset_time = time.time()
+                else:
+                    logger.warning(
+                        f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
+                    )
+                    # V6.4: Wallet-wide CLOB cancel_all FIRST (kills exchange-side ghosts), then settle sleep,
+                    # then local OMS cleanup + REST inventory reconcile.
+                    hard_reset_usdc_balance_label = "unknown"
+                    try:
+                        hr = await oms.physical_clob_cancel_all_for_hard_reset()
+                        hard_reset_usdc_balance_label = str(
+                            hr.get("usdc_balance_label", "unknown")
                         )
-                except Exception as e:
-                    logger.error(
-                        f"[{self.token_id[:6]}] Post-reset reconcile_single_market error: {e}",
-                        exc_info=True,
-                    )
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.token_id[:6]}] [HARD RESET] physical_clob_cancel_all_for_hard_reset error: {e}",
+                            exc_info=True,
+                        )
+
+                    await self.cancel_all_orders(force_evict=True)
                     reconcile_ok = False
+                    try:
+                        reconcile_ok = await watchdog.reconcile_single_market(self.condition_id, force=True)
+                        if reconcile_ok:
+                            logger.info(
+                                f"[{self.token_id[:6]}] Post-reset REST inventory sync completed for condition."
+                            )
+                        else:
+                            logger.warning(
+                                f"[{self.token_id[:6]}] Post-reset REST sync skipped or failed; "
+                                "verify FUNDER_ADDRESS and InventoryLedger row."
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.token_id[:6]}] Post-reset reconcile_single_market error: {e}",
+                            exc_info=True,
+                        )
+                        reconcile_ok = False
 
-                if not reconcile_ok:
-                    freeze_buys_post_reset_reconcile_fail = True
-                    logger.error(
-                        f"[{self.token_id[:6]}] FREEZE NEW BUYS (this tick only): post-reset reconciliation "
-                        "did not succeed — will not place BUY grid on uncertain inventory; SELL/unwind still allowed."
+                    if not reconcile_ok:
+                        freeze_buys_post_reset_reconcile_fail = True
+                        logger.error(
+                            f"[{self.token_id[:6]}] FREEZE NEW BUYS (this tick only): post-reset reconciliation "
+                            "did not succeed — will not place BUY grid on uncertain inventory; SELL/unwind still allowed."
+                        )
+
+                    logger.info(
+                        f"[{self.token_id[:6]}] [HARD RESET] Local state synced. "
+                        f"Fresh USDC balance available: ${hard_reset_usdc_balance_label}. Resuming quoting."
                     )
 
-                logger.info(
-                    f"[{self.token_id[:6]}] [HARD RESET] Local state synced. "
-                    f"Fresh USDC balance available: ${hard_reset_usdc_balance_label}. Resuming quoting."
-                )
-
-                self.last_grid_reset_time = time.time()
-                # Removed early return: proceed to rebuild the grid in the current tick.
+                    self.last_grid_reset_time = time.time()
+                    # Removed early return: proceed to rebuild the grid in the current tick.
 
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:

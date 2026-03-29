@@ -1,6 +1,6 @@
 """
-Auto-Router (V7.0): Portfolio Manager — reward pool floor, high-reward / low-competition scoring,
-event horizon, sector limits.
+Auto-Router (V7.2): Portfolio Manager — rewards-market radar via official CLOB rewards API,
+bonus floor, competition-aware scoring, event horizon and sector limits.
 Runs as a background asyncio task when AUTO_ROUTER_ENABLED=True.
 """
 import asyncio
@@ -26,6 +26,37 @@ market_start_times: Dict[str, float] = {}
 # Per-market metadata (endDate, tags) for event horizon and sector limits
 active_market_meta: Dict[str, dict] = {}
 
+
+def _router_start_redis_key(cid: str) -> str:
+    return f"router:start_time:{cid}"
+
+
+async def _persist_router_start_time_to_redis(cid: str, ts: float) -> None:
+    try:
+        await redis_client.set_state(_router_start_redis_key(cid), {"started_at": ts})
+    except Exception as e:
+        logger.warning("[AutoRouter] Redis persist start_time failed %s: %s", cid[:10], e)
+
+
+async def _load_router_start_time_from_redis(cid: str) -> Optional[float]:
+    try:
+        data = await redis_client.get_state(_router_start_redis_key(cid))
+        if data and "started_at" in data:
+            return float(data["started_at"])
+    except Exception as e:
+        logger.debug("[AutoRouter] Redis load start_time %s: %s", cid[:10], e)
+    return None
+
+
+async def _delete_router_start_time_redis(cid: str) -> None:
+    try:
+        client = getattr(redis_client, "client", None)
+        if client is not None:
+            await client.delete(_router_start_redis_key(cid))
+    except Exception as e:
+        logger.debug("[AutoRouter] Redis delete start_time %s: %s", cid[:10], e)
+
+
 # Global health metrics for the dashboard/API
 router_state = {
     "last_scan_ts": 0.0,
@@ -35,14 +66,13 @@ router_state = {
 }
 
 class RadarScanIncomplete(Exception):
-    """Raised when Gamma API pagination fails, forcing the router to fail-closed."""
+    """Raised when rewards radar scan fails, forcing the router to fail-closed."""
     pass
 
-# Gamma API
-GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-GAMMA_PAGE_LIMIT = 1000
-GAMMA_REQUEST_TIMEOUT = 25.0
-GAMMA_SEMAPHORE = 3
+# Official rewards API (CLOB)
+REWARDS_MARKETS_API_URL = "https://clob.polymarket.com/rewards/markets/multi"
+REWARDS_PAGE_SIZE = 500
+REWARDS_REQUEST_TIMEOUT = 25.0
 
 # Blacklist (aligned with dashboard screener)
 SPORTS_BLACKLIST = {
@@ -59,36 +89,6 @@ QUESTION_BLACKLIST = {
 }
 
 
-def _parse_rewards(m: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (rewards_min_size, rewards_max_spread, reward_rate_per_day)."""
-    r_min = None
-    try:
-        raw = m.get("rewardsMinSize")
-        if raw is not None:
-            r_min = float(raw)
-    except (ValueError, TypeError):
-        pass
-    r_spread = None
-    try:
-        raw = m.get("rewardsMaxSpread")
-        if raw is not None:
-            r_spread = float(raw) / 100.0
-    except (ValueError, TypeError):
-        pass
-    r_rate = None
-    raw = m.get("rewardsDailyRate")
-    if raw is None:
-        cr = m.get("clobRewards") or []
-        if isinstance(cr, list) and len(cr) > 0 and isinstance(cr[0], dict):
-            raw = cr[0].get("rewardsDailyRate")
-    try:
-        if raw is not None:
-            r_rate = float(raw)
-    except (ValueError, TypeError):
-        pass
-    return r_min, r_spread, r_rate
-
-
 def _blacklisted(m: dict) -> bool:
     """True if market should be excluded (sports / question keywords)."""
     tags_raw = m.get("tags")
@@ -102,8 +102,8 @@ def _blacklisted(m: dict) -> bool:
                 tags_list = [t.strip() for t in tags_raw.replace(";", ",").split(",") if t.strip()]
         elif isinstance(tags_raw, list):
             tags_list = tags_raw
-    category_raw = (m.get("category") or m.get("subCategory") or "")
-    slug = (m.get("slug") or "").lower()
+    category_raw = (m.get("category") or m.get("subCategory") or m.get("tag_slug") or "")
+    slug = (m.get("slug") or m.get("market_slug") or m.get("event_slug") or "").lower()
     question_lower = (m.get("question") or "").lower()
     haystack = " ".join([category_raw, " ".join(str(x) for x in tags_list), slug]).lower()
     if any(kw in haystack for kw in SPORTS_BLACKLIST):
@@ -111,20 +111,6 @@ def _blacklisted(m: dict) -> bool:
     if any(kw in question_lower for kw in QUESTION_BLACKLIST):
         return True
     return False
-
-
-def _is_binary_yes_no(m: dict) -> bool:
-    outcomes_raw = m.get("outcomes")
-    outcomes: List[str] = []
-    if outcomes_raw:
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = json.loads(outcomes_raw)
-            except Exception:
-                outcomes = []
-        elif isinstance(outcomes_raw, list):
-            outcomes = outcomes_raw
-    return {str(o).strip().lower() for o in outcomes} == {"yes", "no"}
 
 
 def _parse_end_date(m: dict) -> Optional[datetime]:
@@ -162,18 +148,6 @@ def _parse_tags(m: dict) -> List[str]:
     return tags_list
 
 
-def _parse_liquidity(m: dict) -> float:
-    """Parse liquidity from Gamma market dict."""
-    for key in ("liquidity", "liquidityNum", "volume", "volumeNum"):
-        raw = m.get(key)
-        if raw is not None:
-            try:
-                return float(raw)
-            except (ValueError, TypeError):
-                pass
-    return 0.0
-
-
 def _within_event_horizon(end_date: Optional[datetime], hours: float) -> bool:
     """True if end_date is within `hours` of now OR HAS ALREADY PASSED."""
     if end_date is None:
@@ -188,111 +162,173 @@ def _within_event_horizon(end_date: Optional[datetime], hours: float) -> bool:
         return False
 
 
-async def _fetch_gamma_page(
-    client: httpx.AsyncClient,
-    sem: asyncio.Semaphore,
-    offset: int,
-) -> Tuple[int, List[dict]]:
-    """Fetch one page; raises exception on failure to ensure fail-closed scan."""
-    async with sem:
-        r = await client.get(
-            GAMMA_API_URL,
-            params={"active": "true", "closed": "false", "limit": GAMMA_PAGE_LIMIT, "offset": offset},
-            timeout=GAMMA_REQUEST_TIMEOUT,
-        )
-        r.raise_for_status()
-        return (offset, r.json() or [])
+def _parse_rewards_rate_from_rewards_api(m: dict) -> float:
+    """
+    Parse daily reward rate from official rewards endpoint.
+    Priority: rewards_config[0].rate_per_day, then common fallbacks.
+    """
+    raw: Any = None
+    rc = m.get("rewards_config") or m.get("rewardsConfig") or []
+    if isinstance(rc, list) and rc and isinstance(rc[0], dict):
+        raw = rc[0].get("rate_per_day")
+    if raw is None:
+        raw = m.get("rate_per_day")
+    if raw is None:
+        raw = m.get("rewardsDailyRate")
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_rewards_min_size_from_rewards_api(m: dict) -> float:
+    raw = m.get("rewards_min_size")
+    if raw is None:
+        raw = m.get("rewardsMinSize")
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_rewards_spread_from_rewards_api(m: dict) -> Optional[float]:
+    """
+    Returns spread in price units [0,1] when possible.
+    Endpoint often returns cents-like values (e.g. 3.5), convert to 0.035.
+    """
+    raw = m.get("rewards_max_spread")
+    if raw is None:
+        raw = m.get("rewardsMaxSpread")
+    try:
+        v = float(raw)
+    except (ValueError, TypeError):
+        return None
+    if v <= 0:
+        return None
+    return v / 100.0 if v > 1.0 else v
+
+
+def _parse_competitiveness(m: dict) -> float:
+    raw = m.get("market_competitiveness")
+    if raw is None:
+        raw = m.get("competitiveness")
+    try:
+        return max(0.0, float(raw or 0.0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+async def _fetch_gamma_meta_for_conditions(condition_ids: List[str]) -> Dict[str, dict]:
+    """Batch fetch Gamma metadata with chunking (gamma_client batch call is capped to 50 ids)."""
+    result: Dict[str, dict] = {}
+    if not condition_ids:
+        return result
+    for i in range(0, len(condition_ids), 50):
+        chunk = condition_ids[i:i + 50]
+        batch = await gamma_client.get_markets_batch(chunk)
+        if batch:
+            result.update(batch)
+    return result
 
 
 async def _radar_scan() -> List[dict]:
     """
-    Fetch active markets from Gamma, filter by rewards + blacklist + event horizon,
-    score with volatility penalty (liquidity), return list with condition_id, daily_roi, end_date, tags.
+    Fetch rewards markets from official CLOB rewards API (cursor pagination),
+    apply reward/base-size/blacklist filters, score by high bonus + low competitiveness,
+    then enrich shortlisted candidates with Gamma metadata (end_date/tags) and apply event-horizon.
     """
     base_order_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
     max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)) * 5
+    top_n = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
     event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
+    min_pool = float(getattr(settings, "AUTO_ROUTER_MIN_REWARD_POOL", 50.0))
     all_markets: List[dict] = []
     seen: Set[str] = set()
-    sem = asyncio.Semaphore(GAMMA_SEMAPHORE)
 
-    async with httpx.AsyncClient(timeout=GAMMA_REQUEST_TIMEOUT) as client:
-        offset = 0
-        while len(all_markets) < max_markets:
-            offsets = [offset + i * GAMMA_PAGE_LIMIT for i in range(GAMMA_SEMAPHORE)]
-            tasks = [_fetch_gamma_page(client, sem, o) for o in offsets]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            done = False
-            for res in results:
-                if isinstance(res, Exception):
-                    raise RadarScanIncomplete(f"Gamma page task failed: {res}")
-                _off, page = res
-                if len(page) < GAMMA_PAGE_LIMIT:
-                    done = True
-                for m in page or []:
-                    cid = m.get("conditionId")
+    try:
+        async with httpx.AsyncClient(timeout=REWARDS_REQUEST_TIMEOUT) as client:
+            cursor: Optional[str] = None
+            while True:
+                params: Dict[str, Any] = {
+                    "page_size": REWARDS_PAGE_SIZE,
+                    "position": "DESC",
+                    "order_by": "rate_per_day",
+                }
+                if cursor:
+                    params["next_cursor"] = cursor
+                resp = await client.get(REWARDS_MARKETS_API_URL, params=params, timeout=REWARDS_REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                payload = resp.json() or {}
+                page = payload.get("data") or []
+                for m in page:
+                    cid = m.get("condition_id") or m.get("conditionId")
                     if not cid or cid in seen:
                         continue
                     if _blacklisted(m):
                         continue
-                    if not _is_binary_yes_no(m):
-                        continue
-                    r_min, _r_spread, r_rate = _parse_rewards(m)
-                    min_pool = float(getattr(settings, "AUTO_ROUTER_MIN_REWARD_POOL", 50.0))
-                    rate = float(r_rate or 0.0)
+
+                    rate = _parse_rewards_rate_from_rewards_api(m)
+                    r_min = _parse_rewards_min_size_from_rewards_api(m)
+                    r_spread = _parse_rewards_spread_from_rewards_api(m)
                     if rate < min_pool:
                         continue
-                    if r_min is None or r_min <= 0:
+                    if r_min <= 0:
                         continue
                     if r_min > base_order_size:
                         continue
-                    end_date = _parse_end_date(m)
-                    if _within_event_horizon(end_date, event_horizon_hours):
-                        continue
-                    tags = _parse_tags(m)
-                    liquidity = _parse_liquidity(m)
-                    # V6.3: hard filter for deep pools only
-                    if liquidity < 20000.0:
-                        continue
+
+                    comp = _parse_competitiveness(m)
                     daily_roi = rate / r_min if r_min > 0 else 0.0
-                    # High absolute pool (rate) × ROI per share, penalize crowded books (liquidity)
-                    base_score = daily_roi * rate * (10000.0 / max(float(liquidity), 1.0))
-
-                    now_utc = datetime.now(timezone.utc)
-                    end_utc = (
-                        end_date.replace(tzinfo=timezone.utc)
-                        if end_date is not None and end_date.tzinfo is None
-                        else end_date
-                    )
-                    days_left = (end_utc - now_utc).total_seconds() / 86400.0 if end_utc else 9999.0
-
-                    # V6.3: time decay penalty to avoid long-term dead markets
-                    if days_left > 180:
-                        time_decay = 0.01
-                    elif days_left > 90:
-                        time_decay = 0.5
-                    else:
-                        time_decay = 1.0
-
-                    score = base_score * time_decay
+                    # Blue-ocean preference: reward-rich + low competitiveness.
+                    # competitiveness can be very large, so use log penalty for stability.
+                    competition_penalty = max(1.0, math.log1p(max(comp, 0.0)))
+                    score = (rate * daily_roi) / competition_penalty
                     seen.add(cid)
                     all_markets.append({
                         "condition_id": cid,
                         "daily_roi": daily_roi,
                         "score": score,
                         "rewards_min_size": r_min,
+                        "rewards_max_spread": r_spread,
                         "reward_rate_per_day": rate,
-                        "end_date": end_date,
-                        "tags": tags,
-                        "liquidity": liquidity,
+                        "market_competitiveness": comp,
+                        "end_date": _parse_end_date(m),
+                        "tags": _parse_tags(m),
                     })
-            if done or len(all_markets) >= max_markets:
-                break
-            offset += GAMMA_SEMAPHORE * GAMMA_PAGE_LIMIT
 
+                cursor = payload.get("next_cursor")
+                if not cursor or cursor == "LTE=":
+                    break
+    except Exception as e:
+        raise RadarScanIncomplete(f"Rewards API scan failed: {e}") from e
+
+    if not all_markets:
+        return []
+
+    # Initial ranking from rewards + competitiveness only.
     all_markets.sort(key=lambda x: x["score"], reverse=True)
-    top_n = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
-    return all_markets[:top_n]
+    shortlist_count = max(max_markets, top_n * 10)
+    shortlisted = all_markets[:shortlist_count]
+
+    # Supplement metadata from Gamma for sector/event-horizon controls.
+    need_meta = [m["condition_id"] for m in shortlisted if m.get("condition_id")]
+    gamma_meta = await _fetch_gamma_meta_for_conditions(need_meta)
+    for m in shortlisted:
+        raw = gamma_meta.get(m["condition_id"])
+        if not raw:
+            continue
+        end_date = _parse_end_date(raw)
+        if end_date is not None:
+            m["end_date"] = end_date
+        tags = _parse_tags(raw)
+        if tags:
+            m["tags"] = tags
+
+    filtered = [
+        m for m in shortlisted if not _within_event_horizon(m.get("end_date"), event_horizon_hours)
+    ]
+    filtered.sort(key=lambda x: x["score"], reverse=True)
+    return filtered[:top_n]
 
 
 async def _get_active_markets() -> Set[str]:
@@ -323,11 +359,20 @@ async def _rebalance(
     # Build target lookup for metadata
     target_by_cid: Dict[str, dict] = {m["condition_id"]: m for m in target_markets if m.get("condition_id")}
 
-    # 🛠️ 存量盘口强制注册（防重启状态丢失）
+    # 🛠️ 存量盘口：内存缺失时从 Redis 恢复 min_hold 起点，否则写入 Redis
     for cid in active_set:
         if cid not in market_start_times:
-            market_start_times[cid] = now
-            logger.info("[AutoRouter] ⚡ 发现未记录时间的存量盘口，已初始化时间戳: %s", cid[:10])
+            ts_r = await _load_router_start_time_from_redis(cid)
+            if ts_r is not None:
+                market_start_times[cid] = ts_r
+                logger.info("[AutoRouter] Restored market start time from Redis: %s", cid[:10])
+            else:
+                market_start_times[cid] = now
+                await _persist_router_start_time_to_redis(cid, now)
+                logger.info(
+                    "[AutoRouter] ⚡ 存量盘口无 Redis 记录，已用当前时间初始化并写入 Redis: %s",
+                    cid[:10],
+                )
 
     # 0. Event Horizon Eviction (bypass min_hold — do NOT hold into binary resolution)
     need_meta = [cid for cid in active_set if cid not in active_market_meta]
@@ -353,6 +398,7 @@ async def _rebalance(
             active_set.discard(cid)
             market_start_times.pop(cid, None)
             active_market_meta.pop(cid, None)
+            await _delete_router_start_time_redis(cid)
 
     # 1. Evict: Dropped from Top N — graceful_exit only if runtime >= min_hold_sec (定力锁)
     retained_active = active_set.intersection(target_ids)
@@ -380,12 +426,14 @@ async def _rebalance(
                 active_set.discard(cid)
                 market_start_times.pop(cid, None)
                 active_market_meta.pop(cid, None)
+                await _delete_router_start_time_redis(cid)
 
     # Clean up market_start_times and active_market_meta for cids no longer active
     for cid in list(market_start_times.keys()):
         if cid not in active_set:
             del market_start_times[cid]
             active_market_meta.pop(cid, None)
+            await _delete_router_start_time_redis(cid)
 
     # 2. Compute sector exposure (USD) and slots for actually_retained
     sector_exposure: Dict[str, float] = {}
@@ -427,7 +475,9 @@ async def _rebalance(
         try:
             await start_market_making_impl(cid)
             active_set.add(cid)
-            market_start_times[cid] = time.time()
+            t_start = time.time()
+            market_start_times[cid] = t_start
+            await _persist_router_start_time_to_redis(cid, t_start)
             active_market_meta[cid] = {
                 "end_date": m.get("end_date"),
                 "tags": tags,

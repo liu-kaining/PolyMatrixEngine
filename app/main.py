@@ -132,7 +132,11 @@ async def lifespan(app: FastAPI):
     
     # 3. Drain inventory queue safely to DB before connection closes
     await inventory_state.stop()
-    
+
+    # 3.5 Close OMS httpx connection pool (avoids FD / connector leak on reload/shutdown)
+    from app.oms.core import oms
+    await oms.aclose()
+
     # 4. Disconnect Redis safely
     await redis_client.disconnect()
     

@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     GLOBAL_MAX_BUDGET: float = 1000.0     # 绝对的资金红线 (风控红线)
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
     RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills
-    RECONCILIATION_INTERVAL_SEC: int = 60  # Periodic REST positions sync (watchdog); lower = less drift
+    RECONCILIATION_INTERVAL_SEC: int = 3600  # Periodic REST positions sync (watchdog); default 1h to limit data-api load
     # V6.4: Periodic Hard Reset — wallet-wide CLOB cancel_all + settle sleep before local cleanup
     HARD_RESET_CLOB_CANCEL_ALL_ENABLED: bool = True
     HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC: float = 3.0  # Let matching engine release USDC before new quotes

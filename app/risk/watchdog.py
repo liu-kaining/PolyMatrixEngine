@@ -136,7 +136,11 @@ class RiskMonitor:
         await oms.cancel_market_orders(condition_id)
 
     async def reconciliation_loop(self):
-        """Periodically sync actual on-chain positions from Polymarket Data API"""
+        """
+        Periodically sync actual on-chain positions from Polymarket Data API.
+        Default interval is 3600s (see RECONCILIATION_INTERVAL_SEC) to avoid hammering data-api;
+        intraday risk uses in-memory inventory + User WS fills.
+        """
         if not settings.FUNDER_ADDRESS:
             logger.warning("FUNDER_ADDRESS not set. Skipping reconciliation loop.")
             return
