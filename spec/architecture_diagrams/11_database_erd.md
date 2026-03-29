@@ -10,8 +10,8 @@
   'lineColor': '#64748b'
 }}%%
 erDiagram
-    MARKET_META ||--o| INVENTORY_LEDGER : "1:1 per market"
-    MARKET_META ||--o{ ORDER_JOURNAL : "1:N orders"
+    MARKET_META ||--o| INVENTORY_LEDGER : "one ledger row per market"
+    MARKET_META ||--o{ ORDER_JOURNAL : "journal entries"
 
     MARKET_META {
         string condition_id PK
@@ -26,7 +26,7 @@ erDiagram
     }
 
     INVENTORY_LEDGER {
-        string market_id PK_FK
+        string market_id PK, FK
         numeric yes_exposure
         numeric no_exposure
         numeric yes_capital_used
@@ -38,11 +38,11 @@ erDiagram
     ORDER_JOURNAL {
         string order_id PK
         string market_id FK
-        enum side
+        string side
         numeric price
         numeric size
-        enum status
-        json payload
+        string status
+        string payload
         datetime created_at
         datetime updated_at
     }
@@ -75,8 +75,8 @@ flowchart TB
         O3["payload 含 token_id 等"]
     end
 
-    MM -->|"1:1"| IL
-    MM -->|"1:N"| OJ
+    M1 -->|"1:1"| I1
+    M1 -->|"1:N"| O2
 
     style MM fill:#0891b2,stroke:#0e7490,color:#fff
     style IL fill:#7c3aed,stroke:#6d28d9,color:#fff
