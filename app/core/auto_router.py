@@ -251,10 +251,17 @@ async def _radar_scan() -> List[dict]:
     all_markets: List[dict] = []
     seen: Set[str] = set()
 
+    logger.info(
+        "[AutoRouter] Radar scan: paginating full CLOB rewards catalog (500/page). "
+        "Quoting engines start only after this finishes — expect tens of seconds to a few minutes."
+    )
+
     try:
         async with httpx.AsyncClient(timeout=REWARDS_REQUEST_TIMEOUT) as client:
             cursor: Optional[str] = None
+            page_idx = 0
             while True:
+                page_idx += 1
                 params: Dict[str, Any] = {
                     "page_size": REWARDS_PAGE_SIZE,
                     "position": "DESC",
@@ -303,8 +310,19 @@ async def _radar_scan() -> List[dict]:
                     })
 
                 cursor = payload.get("next_cursor")
+                if page_idx == 1 or page_idx % 5 == 0:
+                    logger.info(
+                        "[AutoRouter] Radar progress: page=%d pass-filter candidates=%d (still paging…)",
+                        page_idx,
+                        len(all_markets),
+                    )
                 if not cursor or cursor == "LTE=":
                     break
+            logger.info(
+                "[AutoRouter] Radar pagination done: %d pages, %d pass-filter candidates.",
+                page_idx,
+                len(all_markets),
+            )
     except Exception as e:
         raise RadarScanIncomplete(f"Rewards API scan failed: {e}") from e
 
