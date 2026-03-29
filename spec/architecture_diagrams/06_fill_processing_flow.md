@@ -9,22 +9,21 @@
 }}%%
 flowchart TB
     subgraph WS["WebSocket 事件"]
-        A["User WebSocket<br/>polymarket.com/ws"]
-        B["消息类型:<br/>fill / cancel / cancel_all"]
+        A["User WebSocket<br/>wss://ws-subscriptions-clob.polymarket.com/ws/user"]
+        B["消息类型:<br/>trade / order"]
     end
 
     subgraph Parse["消息解析"]
         C["process_message()<br/>JSON 解析"]
-        D{"消息类型?"}
+        D{"event_type?"}
         E["handle_fill()<br/>成交处理"]
-        F["handle_cancel()<br/>撤单处理"]
-        G["handle_cancel_all()<br/>全撤处理"]
+        F["handle_cancellation()<br/>撤单处理"]
     end
 
-    subgraph FillHandler["成交处理器"]
-        H["OMS update_order()<br/>更新 OrderJournal"]
-        I["filled_size += amount<br/>status → FILLED"]
-        J["apply_fill()<br/>InventoryStateManager"]
+    subgraph FillHandler["UserStreamGateway 成交处理"]
+        H["DB 更新 OrderJournal<br/>filled_size, status"]
+        I["直接调用<br/>inventory_state.apply_fill()"]
+        J["异步队列持久化"]
     end
 
     subgraph InvUpdate["库存状态更新"]
@@ -43,12 +42,12 @@ flowchart TB
 
     subgraph Notify["状态通知"]
         S["Redis PubSub<br/>order_status:{cid}:{token}"]
-        T["QuotingEngine<br/>清理 active_orders"]
+        T["QuotingEngine 订阅<br/>清理 active_orders"]
     end
 
     subgraph Close["连接管理"]
         U{"连接正常?"}
-        V["假死探测<br/>30s 无消息"]
+        V["假死探测<br/>45s 无消息"]
         W["自愈重连<br/>重新认证"]
     end
 
@@ -56,18 +55,14 @@ flowchart TB
     A --> B
     B --> C
     C --> D
-    D -->|fill| E
-    D -->|cancel| F
-    D -->|cancel_all| G
+    D -->|trade| E
+    D -->|order| F
 
     E --> H
     F --> H
-    G --> H
 
     H --> I
-    I --> J
-
-    J --> K
+    I --> K
     K --> L
     K --> M
     K --> N
@@ -94,8 +89,8 @@ flowchart TB
     classDef notify fill:#dc2626,stroke:#b91c1c,color:#fff
 
     class A,B ws
-    class E,F,G,H,I handler
-    class J,K,L,M,N memory
+    class E,F,H handler
+    class I,J,K,L,M,N memory
     class O,P,Q,R persist
     class S,T notify
 ```
@@ -103,41 +98,37 @@ flowchart TB
 ## 成交处理核心代码
 
 ```python
-async def handle_fill(
-    self,
-    order_id: str,
-    filled_size: float,
-    fill_price: float,
-    condition_id: str,
-    token_id: str
-):
+async def handle_fill(self, order_id: str, filled_size: float, fill_price: float):
     """
-    成交处理核心逻辑
-    1. DB 持久化 (同步)
-    2. 内存更新 (同步)
-    3. 异步队列持久化
+    UserStreamGateway 成交处理核心逻辑
+    1. DB 持久化 (同步) - 更新 OrderJournal
+    2. 内存更新 (同步) - 直接调用 inventory_state.apply_fill()
+    3. 异步队列持久化 - 通过 inventory_state 内部队列
+    4. Redis PubSub 通知 QuotingEngine
     """
     # 1. DB 更新
-    async with get_db_session() as session:
+    async with AsyncSessionLocal() as session:
         order = await session.get(OrderJournal, order_id)
-        order.filled_size += filled_size
-        order.status = OrderStatus.FILLED if is_full_fill else OrderStatus.PARTIALLY_FILLED
+        # ... 更新 filled_size, status
         await session.commit()
+        market_id = order.market_id
+        side = order.side.value
+        token_id = payload.get("token_id")
 
-    # 2. 内存优先更新
-    await self.inventory_state.apply_fill(
-        condition_id=condition_id,
-        token_id=token_id,
-        side="BUY" if is_buy else "SELL",
-        size=filled_size,
-        price=fill_price
-    )
+    # 2. 内存优先更新 (直接调用，不是通过 OMS)
+    tokens = await self._resolve_market_tokens(session, market_id)
+    if tokens and token_id:
+        is_yes = token_id == tokens["yes_token_id"]
+        updated = await inventory_state.apply_fill(
+            market_id=market_id,
+            is_yes=is_yes,
+            side=side,
+            filled_size=filled_size,
+            fill_price=fill_price,
+        )
 
-    # 3. 通知引擎清理
-    await self.redis.publish(
-        f"order_status:{condition_id}:{token_id}",
-        {"order_id": order_id, "status": "filled"}
-    )
+    # 3. Redis PubSub 通知 QuotingEngine 清理 active_orders
+    await self._publish_order_status_event(market_id, token_id, order_id, "FILLED")
 ```
 
 ## 内存优先设计

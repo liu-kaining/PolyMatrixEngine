@@ -9,9 +9,9 @@
 }}%%
 sequenceDiagram
     participant Engine as QuotingEngine
-    participant OMS as OMS Core
+    participant OMS as oms (直接调用)
     participant CLOB as Polymarket CLOB
-    participant Active as "Active Orders"
+    participant Active as "Active Orders (内存)"
 
     Note over Engine: Tick 触发 (tick token)
 
@@ -47,19 +47,21 @@ sequenceDiagram
         end
     end
 
-    Engine->>OMS: 4. 发送撤单指令<br/>to_cancel = [order_ids]
+    Engine->>OMS: 4. 直接调用<br/>oms.cancel_order(order_id)
 
-    OMS->>CLOB: 5. 并发撤单<br/>asyncio.gather
+    OMS->>CLOB: 5. CLOB HTTP<br/>cancel
 
     CLOB-->>OMS: 6. 撤单确认
 
-    Engine->>OMS: 7. 发送发单指令<br/>to_create = [new_orders]
+    Engine->>OMS: 7. 直接调用<br/>oms.create_order(...)
 
-    OMS->>CLOB: 8. 并发发单<br/>asyncio.gather
+    OMS->>CLOB: 8. CLOB HTTP<br/>create_order
 
     CLOB-->>OMS: 9. 发单确认
 
-    OMS-->>Engine: 10. 更新 active_orders
+    OMS-->>Engine: 10. 返回 order_id
+
+    Engine->>Engine: 11. 更新 active_orders
 ```
 
 ## 差分报价 vs 全量重报价

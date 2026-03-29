@@ -15,7 +15,7 @@ flowchart TB
 
     subgraph MarketData["market_data/ 市场数据"]
         Gateway["MarketDataGateway<br/>WS + LocalOrderbook"]
-        UserStream["UserStreamGateway<br/>WS + 成交处理"]
+        UserStream["UserStreamGateway<br/>WS + 成交处理 + Redis PubSub"]
         Gamma["GammaAPIClient<br/>HTTP + 元数据"]
     end
 
@@ -28,10 +28,14 @@ flowchart TB
 
     subgraph Quoting["quoting/ 做市引擎"]
         Engine["QuotingEngine<br/>核心逻辑"]
-        Alpha["AlphaModel<br/>FV 计算"]
-        Grid["GridGenerator<br/>网格档位"]
-        Diff["DiffQuoter<br/>差分报价"]
+        Alpha["AlphaModel<br/>内部组件: FV 计算"]
+        Grid["GridGenerator<br/>内部组件: 网格档位"]
+        Diff["DiffQuoter<br/>内部方法: 差分报价"]
     end
+
+    Engine --> Alpha
+    Engine --> Grid
+    Engine --> Diff
 
     subgraph OMS["oms/ 订单管理"]
         OMSCore["OMS Core<br/>状态机"]
@@ -64,31 +68,31 @@ flowchart TB
     Gateway -->|"ob:{token}"| Engine
     Gateway -->|"subscribe"| UserStream
 
-    UserStream -->|"apply_fill"| InvState
-    UserStream -->|"order_status"| OMSCore
+    %% UserStream 通过 Redis PubSub 发布成交事件
+    UserStream -.->|"Redis PubSub<br/>order_status:{cid}:{token}"| Engine
+    UserStream -.->|"apply_fill() 直接调用"| InvState
 
     Gamma -->|"rewards config"| Engine
     Gamma -->|"market_info"| AutoRouter
 
-    %% 引擎内部
-    Engine -->|"FV 计算"| Alpha
-    Alpha -->|"锚点"| Grid
-    Grid -->|"网格"| Diff
-    Diff -->|"place/cancel"| OMSCore
+    %% 引擎内部 (Alpha/Grid/Diff 是内部组件)
+    Engine -->|"直接调用<br/>oms.create_order()"| OMSCore
+    Engine -->|"直接调用<br/>oms.cancel_order()"| OMSCore
 
     Engine -->|"capital_used"| Watchdog
     Engine -->|"exposure"| InvState
 
     %% OMS 执行
     OMSCore -->|"熔断检查"| Circuit
-    Circuit -->|"通过"| ClobClient
+    OMSCore -->|"CLOB HTTP"| ClobClient
     OMSCore -->|"HMAC签名"| ClobClient
 
     %% 风控
-    Watchdog -->|"监控"| InvState
-    Watchdog -->|"kill_switch"| KillSwitch
-    Watchdog -->|"reconcile"| Reconciler
-    KillSwitch -->|"cancel_all"| OMSCore
+    Watchdog -->|"监控<br/>每秒检查"| InvState
+    Watchdog -.->|"trigger_kill_switch<br/>触发时"| KillSwitch
+    Watchdog -.->|"reconcile_loop<br/>周期对账"| Reconciler
+    KillSwitch -.->|"cancel_all"| OMSCore
+    KillSwitch -.->|"suspend market"| Models
     Reconciler -->|"覆盖状态"| InvState
     Reconciler -->|"Polymarket<br/>Data API"| Models
 

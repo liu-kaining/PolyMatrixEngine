@@ -145,26 +145,26 @@ flowchart TB
         C1["评分进入 Top N"]
         C2["评分掉出 Top N"]
         C3["掉出 + 已达 min_hold"]
-        C4["掉出 + 未达 min_hold"]
+        C4["掉出 + 未达 min_hold (定力锁)"]
         C5["事件地平线到达"]
         C6["赛道满 + 新市场更优"]
     end
 
     subgraph Actions["动作"]
         A1["启动做市"]
-        A2["检查 min_hold"]
-        A3["graceful_exit"]
+        A2["保留 (定力锁)"]
+        A3["graceful_exit (不可恢复)"]
         A4["保留 + 暂停新买单"]
-        A5["graceful_exit"]
+        A5["graceful_exit (绕过 min_hold)"]
         A6["驱逐最低分市场"]
     end
 
     subgraph Notes["备注"]
         N1["新市场激活"]
-        N2["需满足持有时间"]
-        N3["优雅退出"]
-        N4["等待满足条件"]
-        N5["绕过 min_hold"]
+        N2["等待 min_hold 时间满足"]
+        N3["终态，不可恢复"]
+        N4["满足条件后触发 graceful_exit"]
+        N5["立即退出，不受 min_hold 限制"]
         N6["赛道再平衡"]
     end
 
@@ -206,19 +206,28 @@ stateDiagram-v2
     FILTERING --> SCORED: 计算评分
     SCORED --> TOP_N: 排名进入 Top N
     TOP_N --> ACTIVE: start_market_making()
-    ACTIVE --> GRACEFUL_EXIT: 掉出 Top N / 事件地平线
-    GRACEFUL_EXIT --> ACTIVE: 评分恢复
-    GRACEFUL_EXIT --> [*]: 退出完成
+    ACTIVE --> GRACEFUL_EXIT: 掉出 Top N + min_hold 已达 / 事件地平线
+    GRACEFUL_EXIT --> [*]: 退出完成 (不可恢复)
     ACTIVE --> SUSPENDED: kill_switch
-    SUSPENDED --> ACTIVE: 恢复
-    ACTIVE --> LIQUIDATING: 手动平仓
-    LIQUIDATING --> [*]: 平仓完成
+    SUSPENDED --> ACTIVE: 对账成功后恢复
 
     note right of ACTIVE
         活跃做市状态:
         - 接收 tick 触发
         - 执行差分报价
         - 接收成交更新
+    end note
+
+    note right of GRACEFUL_EXIT
+        GRACEFUL_EXIT 是终态!
+        - 一旦进入优雅退出，不能恢复
+        - 必须等待持仓清空后退出
+    end note
+
+    note right of SUSPENDED
+        kill_switch 暂停:
+        - 全部撤单
+        - 对账成功后可能恢复 ACTIVE
     end note
 ```
 

@@ -34,10 +34,10 @@ flowchart TB
     end
 
     subgraph Core["核心引擎层"]
-        subgraph QuotingEngine["QuotingEngine × 2<br/>YES + NO"]
-            AlphaModel["AlphaModel<br/>统一定价 Oracle"]
-            Grid["网格生成器<br/>动态 Spread"]
-            DiffQuote["差分报价器<br/>抗干扰"]
+        subgraph QuotingEngine["QuotingEngine × 2<br/>YES + NO (内部组件)"]
+            AlphaModel["AlphaModel<br/>内部组件: FV 计算"]
+            Grid["GridGenerator<br/>内部组件: 网格生成"]
+            DiffQuote["sync_orders_diff()<br/>内部方法: 差分报价"]
         end
 
         subgraph RiskPlane["风控平面"]
@@ -78,20 +78,22 @@ flowchart TB
     ob --> QuotingEngine
     Gamma -->|"rewards config"| QuotingEngine
 
-    QuotingEngine --> OMS
+    QuotingEngine -.->|"直接调用<br/>oms.create_order()"| OMS
+    QuotingEngine -.->|"直接调用<br/>oms.cancel_order()"| OMS
     OMS -->|place/cancel| CLOB
     OMS -->|Builder签名| Builder
 
-    Watchdog -->|check_exposure| InvState
-    Watchdog -->|kill_switch| KillSwitch
-    Watchdog -->|reconcile| Reconciler
+    Watchdog -->|check_exposure<br/>(每秒)| InvState
+    Watchdog -.->|trigger_kill_switch| KillSwitch
+    Watchdog -.->|reconcile_loop<br/>(周期)| Reconciler
+    KillSwitch -.->|cancel_all| OMS
     Reconciler -->|Polymarket<br/>Data API| PostgreSQL
 
-    InvState -->|apply_fill| Inventory
+    InvState -.->|直接调用<br/>apply_fill| Inventory
     InvState -->|async_persist| PostgreSQL
 
-    AutoRouter -->|start/stop<br/>market| Core
-    Router -->|filter| Gamma
+    AutoRouter -->|start_market_making| Core
+    Router -->|Gamma查询| Gamma
 
     %% 样式定义 - 专业沉稳配色
     classDef highlight fill:#1e3a5f,stroke:#334155,stroke-width:2px,color:#fff
@@ -102,7 +104,8 @@ flowchart TB
     classDef storage fill:#475569,stroke:#334155,stroke-width:2px,color:#fff
     classDef auto fill:#d97706,stroke:#b45309,stroke-width:2px,color:#fff
 
-    class QuotingEngine,AlphaModel,Grid,DiffQuote engine
+    class QuotingEngine engine
+    class AlphaModel,Grid,DiffQuote fill:#065f7f,stroke:#0e7490,stroke-width:1px,color:#fff
     class Watchdog,KillSwitch,Reconciler risk
     class InvState,PostgreSQL,RedisKV data
     class OMS,CircuitBreaker,CLOB,Builder execution

@@ -18,11 +18,13 @@ flowchart TB
     end
 
     subgraph L2["第二层: Watchdog 硬熔断"]
-        B1["RiskMonitor<br/>每秒检查"]
+        B1["RiskMonitor.run()<br/>每秒检查"]
         B2["check_exposure()<br/>capital_used 监控"]
-        B3["单市场超限?<br/>trigger_kill_switch()"]
+        B3{"单市场超限?<br/>actual_used > MAX_EXPOSURE?"}
         B4["trigger_kill_switch():<br/>1. DB: status → suspended<br/>2. Redis: control:{cid}<br/>3. OMS: cancel_market_orders()"]
-        B1 --> B2 --> B3 --> B4
+        B1 --> B2 --> B3
+        B3 -->|Yes| B4
+        B3 -->|No| B5["继续"]
     end
 
     subgraph L3["第三层: REST 周期对账"]
@@ -50,20 +52,28 @@ flowchart TB
         D6 -->|No| D7
     end
 
-    subgraph Trigger["触发链路"]
-        T1["任意层触发"]
-        T2["撤单 + suspend"]
-        T3["事件通知"]
+    subgraph Trigger["触发链路 (硬重置不在 Watchdog)"]
+        T1["硬重置在 QuotingEngine 中"]
+        T2["每 5 分钟触发"]
+        T3["Ghost Order 防护"]
         T1 --> T2 --> T3
+    end
+
+    subgraph HardReset["QuotingEngine 内部硬重置"]
+        HR1["每 5 分钟<br/>on_tick() 中触发"]
+        HR2["oms.physical_clob_cancel_all()"]
+        HR3["本地 cancel_all_orders"]
+        HR4["watchdog.reconcile_single_market(force=True)"]
     end
 
     %% 四层 + 触发链路自上而下串联（避免并排横放）
     A5 --> B1
     B4 --> C1
+    B5 --> C1
     C6 --> D1
     C7 --> D1
-    D8 --> T1
-    D7 --> T1
+
+    note right of D1: 硬重置不在 Watchdog 中!<br/>硬重置在 QuotingEngine.on_tick() 中
 
     %% 样式 - 专业沉稳配色
     classDef l1 fill:#0891b2,stroke:#0e7490,color:#fff
@@ -71,12 +81,14 @@ flowchart TB
     classDef l3 fill:#7c3aed,stroke:#6d28d9,color:#fff
     classDef l4 fill:#d97706,stroke:#b45309,color:#fff
     classDef trigger fill:#475569,stroke:#334155,color:#fff
+    classDef hardreset fill:#1e3a5f,stroke:#334155,color:#fff
 
     class A1,A2,A3,A4,A5 l1
-    class B1,B2,B3,B4 l2
+    class B1,B2,B3,B4,B5 l2
     class C1,C2,C3,C4,C5,C6,C7 l3
     class D1,D2,D3,D4,D5,D6,D7,D8 l4
     class T1,T2,T3 trigger
+    class HR1,HR2,HR3,HR4 hardreset
 ```
 
 ## 风控参数矩阵
@@ -105,7 +117,7 @@ sequenceDiagram
     participant Inv as InventoryState
     participant DB as PostgreSQL
     participant Redis as Redis
-    participant OMS as OMS
+    participant OMS as oms
     participant QE as QuotingEngine
 
     loop 每秒检查
@@ -118,15 +130,16 @@ sequenceDiagram
 
         par 并行执行
             WD->>DB: UPDATE status = 'suspended'
-            WD->>Redis: PUBLISH control channel suspend
+            WD->>Redis: PUBLISH control:{cid} {action: suspend}
             WD->>OMS: cancel_market_orders(cid)
         end
 
-        OMS->>QE: 清理 active_orders
+        OMS-->>QE: cancel_order() 直接调用
 
         Redis-->>QE: SUBSCRIBE control:{cid}
-        QE->>QE: SUSPENDED 状态
-        QE->>QE: 停止报价
+        QE->>QE: on_control_message({action: suspend})
+        QE->>QE: suspended = True
+        QE->>QE: cancel_all_orders()
 
         Note over WD: 完成 kill_switch
     end

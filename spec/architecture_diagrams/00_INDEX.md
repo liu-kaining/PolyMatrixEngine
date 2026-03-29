@@ -42,6 +42,12 @@
 - `MAX_SLOTS_PER_SECTOR` / `MAX_EXPOSURE_PER_SECTOR`
 - 结算前 24h 自动 graceful_exit
 
+## 投资人与对外叙事
+
+| 文档 | 说明 |
+|------|------|
+| [投资人技术文章（中文）](../investor_technical_article.md) | 架构理念、风控与选市场叙事；非实现级白皮书 |
+
 ---
 
 *Generated for 技术大会分享 | PolyMatrix Engine V6.4*

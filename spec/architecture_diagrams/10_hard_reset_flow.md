@@ -1,5 +1,7 @@
 # 硬重置流程 (V6.4)
 
+> **注意**: 硬重置逻辑在 QuotingEngine.on_tick() 中触发，不是一个独立的调度任务。
+
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
   'primaryColor': '#1e3a5f',
@@ -8,76 +10,71 @@
   'lineColor': '#64748b'
 }}%%
 flowchart TB
-    subgraph Schedule["硬重置调度"]
-        A["每 5 分钟<br/>hard_reset_cycle"]
-        B{"当前状态?<br/>ACTIVE / GRACEFUL_EXIT"}
-        A --> B
-        B -->|ACTIVE| C["继续重置流程"]
-        B -->|其他| D["跳过本次"]
+    subgraph Trigger["触发 (QuotingEngine.on_tick)"]
+        A["每 5 分钟 (300s)<br/>time.time() - last_grid_reset_time > 300"]
+        B["检查 debounce<br/>HARD_RESET_CONDITION_DEBOUNCE_SEC = 15s"]
+        C["检查 _hard_reset_peer_gate"]
     end
 
-    subgraph CancelAll["全钱包撤单"]
-        C["OMS<br/>physical_clob_cancel_all()"]
-        E["CLOB HTTP POST<br/>/cancel_all"]
-        F["超时: 45s"]
-        G{"成功?"}
-        H["等待 3s<br/>USDC 释放"]
-        I["读取余额日志<br/>验证"]
-        C --> E --> F --> G
-        G -->|Yes| H --> I
-        G -->|No| J["重试 1 次"]
-        J --> E
+    subgraph CancelAll["全钱包撤单 (OMS)"]
+        D["oms.physical_clob_cancel_all_for_hard_reset()"]
+        E["CLOB HTTP POST<br/>/cancel_all (超时 45s)"]
+        F{"成功?"}
+        G["等待 3s<br/>USDC 释放"]
+        H["读取余额日志<br/>验证"]
+        D --> E --> F
+        F -->|Yes| G --> H
+        F -->|No| I["跳过 (继续)"]
     end
 
     subgraph LocalCancel["本地状态清理"]
-        K["cancel_all_orders()<br/>force_evict=True"]
-        L["清空 active_orders"]
-        M["清空 pending_buy_notional"]
-        N["重置引擎状态 → SUSPENDED"]
+        J["cancel_all_orders()<br/>force_evict=True"]
+        K["清空 active_orders"]
+        L["清空 pending_buy_notional"]
+        M["重置引擎状态 → SUSPENDED"]
     end
 
-    subgraph ForceReconcile["强制对账"]
-        O["reconcile_single_market<br/>(force=True)"]
-        P["绕过时间保护<br/>强制覆盖"]
-        Q["同步 InventoryLedger<br/>到内存"]
+    subgraph ForceReconcile["强制对账 (Watchdog)"]
+        N["watchdog.reconcile_single_market<br/>(force=True)"]
+        O["绕过时间保护<br/>强制覆盖"]
+        P["同步 InventoryLedger<br/>到内存"]
     end
 
     subgraph Decision["对账决策"]
-        R{"对账<br/>成功?"}
-        S["POST_RESET_<br/>RECONCILE_FREEZE<br/>冻结 BUY"]
-        T["引擎状态 → QUOTING<br/>恢复报价"]
+        Q{"对账<br/>成功?"}
+        R["POST_RESET_<br/>RECONCILE_FREEZE<br/>冻结 BUY"]
+        S["引擎状态 → QUOTING<br/>恢复报价"]
     end
 
     subgraph Recovery["恢复阶段"]
-        U["订阅 Market WS<br/>tick: ob:"]
-        V["订阅 User WS<br/>fills, cancels"]
-        W["恢复 QuotingEngine<br/>engine_tasks"]
+        T["恢复接收 tick<br/>继续 on_tick 循环"]
     end
 
     %% 连接
-    C --> E
-    I --> K
-    K --> L --> M --> N
-    N --> O
-    O --> P --> Q
-    Q --> R
-    R -->|Yes| T
-    R -->|No| S
-    S --> U
-    T --> U
-    U --> V --> W
+    A --> B --> C
+    C -->|"通过"| CancelAll
+    C -->|"跳过 (debounce)"| T
+    H --> J
+    J --> K --> L --> M
+    M --> N
+    N --> O --> P
+    P --> Q
+    Q -->|Yes| S
+    Q -->|No| R
+    R --> T
+    S --> T
 
-    classDef schedule fill:#0891b2,stroke:#0e7490,color:#fff
-    classDef cancel fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef trigger fill:#dc2626,stroke:#b91c1c,color:#fff
+    classDef cancel fill:#0891b2,stroke:#0e7490,color:#fff
     classDef reconcile fill:#7c3aed,stroke:#6d28d9,color:#fff
     classDef decision fill:#d97706,stroke:#b45309,color:#fff
     classDef recovery fill:#059669,stroke:#047857,color:#fff
 
-    class A,B,D schedule
-    class C,E,F,G,H,I,J cancel
-    class K,L,M,N,O,P,Q reconcile
-    class R,S,T decision
-    class U,V,W recovery
+    class A,B,C trigger
+    class D,E,F,G,H,I cancel
+    class J,K,L,M,N,O,P reconcile
+    class Q,R,S decision
+    class T recovery
 ```
 
 ## 硬重置核心代码
@@ -158,10 +155,10 @@ flowchart LR
         P3["报价时以为没单<br/>实际有单 → 双边持仓失控"]
     end
 
-    subgraph Solution["V6.4 解决方案"]
-        S1["CLOB cancel_all"]
-        S2["本地状态清理"]
-        S3["强制对账"]
+    subgraph Solution["V6.4 解决方案 (在 QuotingEngine 中)"]
+        S1["CLOB cancel_all<br/>(physical_clob_cancel_all_for_hard_reset)"]
+        S2["本地状态清理<br/>(cancel_all_orders force_evict=True)"]
+        S3["强制对账<br/>(reconcile_single_market force=True)"]
     end
 
     subgraph Result["效果"]
@@ -187,7 +184,7 @@ flowchart LR
     class R1,R2,R3 result
 ```
 
-## 重置时间线
+## 重置时间线 (在 QuotingEngine.on_tick 中)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -197,14 +194,21 @@ flowchart LR
   'lineColor': '#64748b'
 }}%%
 timeline
-    title 硬重置完整流程
+    title 硬重置完整流程 (QuotingEngine.on_tick)
 
-    section T+0s
+    section 触发条件
+        每 5 分钟 (300s)
+        : time.time() - last_grid_reset_time > 300
+        : 检查 debounce (15s) 和 peer_gate
+
+    section T+0s (如果 debounce 通过)
         CLOB cancel_all
+        : oms.physical_clob_cancel_all_for_hard_reset()
         : 超时 45s
 
     section T+3s
         睡眠等待 USDC 释放
+        : HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC
 
     section T+4s
         本地 cancel_all_orders(force_evict=True)
@@ -224,8 +228,8 @@ timeline
         : 失败 → 引擎状态 → POST_RESET_RECONCILE_FREEZE
 
     section T+7s
-        恢复
-        : 订阅 WS, 恢复 QuotingEngine
+        恢复 tick 处理
+        : 继续 on_tick 循环
 ```
 
 ## 对账失败冻结

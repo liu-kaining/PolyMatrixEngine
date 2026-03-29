@@ -60,8 +60,8 @@ flowchart TB
     end
 
     subgraph Execution["执行层面"]
-        AE["并发撤单<br/>asyncio.gather"]
-        AF["并发发单<br/>place_orders"]
+        AE["oms.cancel_order()<br/>直接调用"]
+        AF["oms.create_order()<br/>直接调用"]
         AG["更新<br/>active_orders"]
     end
 
@@ -93,6 +93,7 @@ flowchart TB
     AA --> AB
     AA --> AC
     AB --> AE
+    AE --> AG
     AC --> AF
     AF --> AG
 

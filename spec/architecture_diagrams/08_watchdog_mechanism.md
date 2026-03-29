@@ -14,15 +14,15 @@ flowchart TB
         C["进入主循环<br/>while True"]
     end
 
-    subgraph MainLoop["主监控循环"]
+    subgraph MainLoop["主监控循环 (每秒)"]
         D["await asyncio.sleep(1)<br/>每秒心跳"]
-        E["check_exposure()<br/>暴露检查"]
+        E["check_exposure()<br/>暴露检查 (内存)"]
         F{"暴露 ><br/>MAX_EXPOSURE?"}
         G["trigger_kill_switch()<br/>硬熔断"]
     end
 
-    subgraph Reconcile["对账循环"]
-        H["await asyncio.sleep(60)<br/>60s 间隔"]
+    subgraph Reconcile["对账循环 (周期)"]
+        H["await asyncio.sleep(reconciliation_interval)<br/>默认 3600s 或 60s"]
         I["reconcile_positions()<br/>批量对账"]
         J["获取活跃市场列表<br/>get_active_router_markets()"]
         K["for each market:<br/>reconcile_single_market()"]
@@ -37,16 +37,6 @@ flowchart TB
         Q["覆盖 DB<br/>yes/no_exposure"]
         R["修正 capital_used<br/>按比例"]
         S["apply_reconciliation_snapshot()<br/>同步内存"]
-    end
-
-    subgraph HardReset["硬重置强制对账"]
-        T["每 5 分钟<br/>hard_reset_cycle"]
-        U["physical_clob_cancel_all()<br/>全钱包撤单"]
-        V["睡眠 3s"]
-        W["本地 cancel_all<br/>force_evict=True"]
-        X["reconcile_single_market<br/>(force=True)"]
-        Y{"对账<br/>成功?"}
-        Z["POST_RESET_<br/>RECONCILE_FREEZE"]
     end
 
     Init --> C
@@ -73,20 +63,18 @@ flowchart TB
     S --> K
     K -->|"遍历完成"| C
 
-    T --> U --> V --> W --> X --> Y
-    Y -->|Yes| C
-    Y -->|No| Z
-    Z --> C
+    note right of Init
+        **注意**: 硬重置逻辑不在 Watchdog 中！
+        硬重置在 QuotingEngine.on_tick() 中每 5 分钟触发
+    end note
 
     classDef init fill:#0891b2,stroke:#0e7490,color:#fff
     classDef main fill:#dc2626,stroke:#b91c1c,color:#fff
     classDef reconcile fill:#7c3aed,stroke:#6d28d9,color:#fff
-    classDef reset fill:#d97706,stroke:#b45309,color:#fff
 
     class A,B init
     class D,E,F,G main
     class H,I,J,K,L,M,N,O,P,Q,R,S reconcile
-    class T,U,V,W,X,Y,Z reset
 ```
 
 ## check_exposure 核心逻辑
@@ -177,20 +165,18 @@ timeline
         : 比较 capital_used vs 阈值
         : 超限 → trigger_kill_switch
 
-    section 60秒对账
+    section 周期对账 (默认 3600s)
         reconciliation_loop()
         : 遍历所有活跃市场
         : 调用 Polymarket Data API
         : 差异 > tolerance → 覆盖更新
 
-    section 5分钟硬重置
-        hard_reset_cycle()
-        : CLOB cancel_all
-        : 本地状态清理
-        : 强制对账
+    section 硬重置 (不在 Watchdog 中!)
+        **注意**: 硬重置在 QuotingEngine.on_tick() 中
+        每 5 分钟触发一次 (300s)
 ```
 
-## 熔断器状态
+## 熔断器状态 (在 OMS 中)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -207,7 +193,7 @@ stateDiagram-v2
     HALF_OPEN --> OPEN: 请求失败
 
     note right of CLOSED
-        CircuitBreaker
+        CircuitBreaker (在 OMS 中)
         CLOSED: 正常允许请求
         OPEN: 拒绝请求 (熔断)
         HALF_OPEN: 测试请求
@@ -216,4 +202,4 @@ stateDiagram-v2
 
 ---
 
-*设计亮点: 多时间尺度的风控检查，从秒级熔断到分钟级对账，全方位保障系统安全*
+*设计亮点: 多时间尺度的风控检查，秒级熔断 + 周期对账，QuotingEngine 内部硬重置解决 Ghost Order*
