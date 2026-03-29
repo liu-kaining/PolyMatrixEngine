@@ -17,6 +17,8 @@
 | 09 | [自动路由与组合管理](./09_auto_router.md) | Mermaid | 流程图 |
 | 10 | [硬重置流程](./10_hard_reset_flow.md) | Mermaid | 流程图 |
 | 11 | [数据库实体关系](./11_database_erd.md) | Mermaid | ER图 |
+| 12 | [组件关系总览](./12_architecture_component_diagram.md) | Mermaid | 架构图（原 PlantUML 总览） |
+| 15 | [系统概览](./15_system_overview.md) | Mermaid | 架构图 |
 
 ## 技术亮点
 

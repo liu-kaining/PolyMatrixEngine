@@ -18,9 +18,7 @@ spec/architecture_diagrams/
 ├── 09_auto_router.md           # 自动路由与组合管理
 ├── 10_hard_reset_flow.md       # 硬重置流程
 ├── 11_database_erd.md          # 数据库实体关系
-├── 12_plantuml_overview.puml   # PlantUML 架构图
-├── 13_plantuml_state.puml      # PlantUML 状态机
-├── 14_plantuml_risk.puml       # PlantUML 风控图
+├── 12_architecture_component_diagram.md  # 组件总览 (Mermaid，原 PlantUML 总览)
 ├── 15_system_overview.md       # 系统概览 (Mermaid)
 └── README.md                   # 使用指南
 ```
@@ -89,25 +87,11 @@ score = rate × daily_roi / penalty
 | VS Code | ✅ Mermaid 插件 |
 | Notion | ❌ 需第三方工具 |
 
-### PlantUML 图渲染
-
-`.puml` 文件需要 PlantUML 渲染器：
-
-```bash
-# 安装 PlantUML
-brew install plantuml  # macOS
-
-# 生成 PNG
-plantuml -Tpng -dpi 300 12_plantuml_overview.puml
-
-# 生成 SVG
-plantuml -Tsvg 12_plantuml_overview.puml
-```
-
 ## 🚀 使用建议
 
 ### 技术大会分享
 - **推荐**: 使用 `01_system_overview.md` 作为主架构图
+- **组件包视角**: `12_architecture_component_diagram.md`（与 01 同用 Mermaid）
 - **概览**: `15_system_overview.md` 快速了解全貌
 
 ### 详细技术讲解
@@ -129,10 +113,8 @@ plantuml -Tsvg 12_plantuml_overview.puml
 2. 点击 "Actions" → "Export PNG"
 3. 插入 PPT
 
-### 方式二: PlantUML → 高清图
-```bash
-plantuml -Tpng -dpi 300 spec/architecture_diagrams/12_plantuml_overview.puml
-```
+### 方式二: 组件总览一页图
+- 打开 [`12_architecture_component_diagram.md`](./12_architecture_component_diagram.md)，与 `01_system_overview` 互为补充（前者偏组件包，后者偏数据流）。
 
 ---
 

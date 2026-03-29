@@ -65,7 +65,7 @@ flowchart TB
 
     subgraph AutoRouter["自动路由"]
         Router["PortfolioManager<br/>组合管理器"]
-        Scorer["评分引擎<br/>ROI × 流动性 × 时间"]
+        Scorer["评分引擎<br/>_radar_scan"]
         Rebalancer["重平衡器<br/>赛道隔离"]
     end
 
