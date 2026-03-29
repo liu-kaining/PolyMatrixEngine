@@ -21,14 +21,14 @@ flowchart TB
         B1["RiskMonitor.run()<br/>每秒检查"]
         B2["check_exposure()<br/>capital_used 监控"]
         B3{"单市场超限?<br/>actual_used > MAX_EXPOSURE?"}
-        B4["trigger_kill_switch():<br/>1. DB: status → suspended<br/>2. Redis: control:{cid}<br/>3. OMS: cancel_market_orders()"]
+        B4["trigger_kill_switch:<br/>1 DB status suspended<br/>2 Redis control 频道<br/>3 OMS cancel_market_orders"]
         B1 --> B2 --> B3
         B3 -->|Yes| B4
         B3 -->|No| B5["继续"]
     end
 
     subgraph L3["第三层: REST 周期对账"]
-        C1["reconciliation_loop()<br/>默认 60s 间隔"]
+        C1["reconciliation_loop()<br/>RECONCILIATION_INTERVAL_SEC<br/>config 默认 3600s"]
         C2["GET Polymarket<br/>Data API /positions"]
         C3["对比: DB vs API<br/>yes/no_exposure"]
         C4{"差异大于 EXPOSURE_TOLERANCE?"}
@@ -41,7 +41,7 @@ flowchart TB
 
     subgraph L4["第四层: 硬重置强制对账"]
         D1["每 5 分钟<br/>硬重置周期"]
-        D2["cancel_all_for_hard_reset()<br/>全钱包 CLOB cancel_all"]
+        D2["physical_clob_cancel_all_for_hard_reset()<br/>全钱包 CLOB cancel_all"]
         D3["睡眠 3s<br/>等待 USDC 释放"]
         D4["本地 cancel_all<br/>force_evict=True"]
         D5["reconcile_single_market<br/>(force=True)"]
@@ -61,7 +61,7 @@ flowchart TB
 
     subgraph HardReset["QuotingEngine 内部硬重置"]
         HR1["每 5 分钟<br/>on_tick() 中触发"]
-        HR2["oms.physical_clob_cancel_all()"]
+        HR2["oms.physical_clob_cancel_all_for_hard_reset()"]
         HR3["本地 cancel_all_orders"]
         HR4["watchdog.reconcile_single_market(force=True)"]
     end
@@ -72,8 +72,6 @@ flowchart TB
     B5 --> C1
     C6 --> D1
     C7 --> D1
-
-    note right of D1: 硬重置不在 Watchdog 中!<br/>硬重置在 QuotingEngine.on_tick() 中
 
     %% 样式 - 专业沉稳配色
     classDef l1 fill:#0891b2,stroke:#0e7490,color:#fff
@@ -91,6 +89,8 @@ flowchart TB
     class HR1,HR2,HR3,HR4 hardreset
 ```
 
+> **图注**：硬重置由 `QuotingEngine.on_tick()` 触发，**不在** Watchdog 内；第四层「硬重置强制对账」描述的是引擎侧流程与 Watchdog `reconcile_single_market(force=True)` 的协作关系。
+
 ## 风控参数矩阵
 
 | 参数 | 默认值 | 说明 |
@@ -99,7 +99,7 @@ flowchart TB
 | GLOBAL_MAX_BUDGET | $1000 | 全局资金红线<br/>仅日志警告，不全局熔断 |
 | EXPOSURE_TOLERANCE | 0.01 | 对账覆盖阈值<br/>差异 > 1% → 覆盖 |
 | RECONCILIATION_BUFFER_SECONDS | 8s | 本地成交后保护窗口<br/>8s 内跳过对账覆盖 |
-| RECONCILIATION_INTERVAL_SEC | 60s | Watchdog 对账间隔 |
+| RECONCILIATION_INTERVAL_SEC | 3600s（默认，见 `config.py`） | Watchdog `reconcile_positions` 周期间隔；可由 `.env` 覆盖 |
 | HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC | 3s | 硬重置后等待 USDC 释放 |
 | EVENT_HORIZON_HOURS | 24h | 事件地平线窗口<br/>结算前 24h → graceful_exit |
 
@@ -130,7 +130,7 @@ sequenceDiagram
 
         par 并行执行
             WD->>DB: UPDATE status = 'suspended'
-            WD->>Redis: PUBLISH control:{cid} {action: suspend}
+            WD->>Redis: PUBLISH control channel suspend
             WD->>OMS: cancel_market_orders(cid)
         end
 

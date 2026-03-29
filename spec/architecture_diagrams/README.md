@@ -63,13 +63,15 @@ NO FV = 1 - YES FV
 ```
 L1: 报价前预检 (MAX_EXPOSURE_PER_MARKET = $50)
 L2: Watchdog 硬熔断 (每秒检查)
-L3: REST 周期对账 (60s 间隔)
-L4: 硬重置强制对账 (5 分钟)
+L3: REST 周期对账 (RECONCILIATION_INTERVAL_SEC，默认 3600s)
+L4: 硬重置强制对账 (约每 300s 网格周期触发，见 quoting/engine)
 ```
 
-### 5. 自动路由评分
+### 5. 自动路由评分（`_radar_scan`）
 ```
-Score = daily_roi × rate × (10000/liquidity) × time_decay
+daily_roi = rate / r_min
+penalty = max(1, log1p(competitiveness))
+score = rate × daily_roi / penalty
 ```
 
 ## 📊 图集预览

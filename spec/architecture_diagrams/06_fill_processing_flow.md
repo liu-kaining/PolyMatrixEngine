@@ -26,11 +26,8 @@ flowchart TB
         J["异步队列持久化"]
     end
 
-    subgraph InvUpdate["库存状态更新"]
-        K["内存优先更新"]
-        L["yes_exposure<br/>no_exposure"]
-        M["capital_used<br/>realized_pnl"]
-        N["pending_buy_notional<br/>释放"]
+    subgraph InvUpdate["库存状态更新（apply_fill）"]
+        K["yes/no_exposure<br/>capital_used / realized_pnl"]
     end
 
     subgraph AsyncPersist["异步持久化"]
@@ -45,12 +42,6 @@ flowchart TB
         T["QuotingEngine 订阅<br/>清理 active_orders"]
     end
 
-    subgraph Close["连接管理"]
-        U{"连接正常?"}
-        V["假死探测<br/>45s 无消息"]
-        W["自愈重连<br/>重新认证"]
-    end
-
     %% 连接
     A --> B
     B --> C
@@ -63,11 +54,7 @@ flowchart TB
 
     H --> I
     I --> K
-    K --> L
-    K --> M
-    K --> N
-
-    N --> O
+    K --> O
     O --> P
     P -->|Yes| Q
     P -->|No| R
@@ -75,11 +62,6 @@ flowchart TB
 
     R --> S
     S --> T
-
-    A --> U
-    U -->|No| V
-    V --> W
-    W --> A
 
     %% 样式 - 专业沉稳配色
     classDef ws fill:#0891b2,stroke:#0e7490,color:#fff
@@ -90,7 +72,7 @@ flowchart TB
 
     class A,B ws
     class E,F,H handler
-    class I,J,K,L,M,N memory
+    class I,J,K memory
     class O,P,Q,R persist
     class S,T notify
 ```
@@ -211,7 +193,7 @@ class InventoryStateManager:
                 logger.error(f"Persist error: {e}")
 ```
 
-## 自愈重连机制
+## 连接、认证与断线修补（与 `user_stream.py` 一致）
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -222,28 +204,22 @@ class InventoryStateManager:
 }}%%
 sequenceDiagram
     participant WS as UserStreamGateway
-    participant Auth as HMAC Auth
-    participant Inv as InventoryState
+    participant OMS as oms ClobClient
+    participant WD as watchdog
 
-    Note over WS: 连接建立 (30s ping)
+    WS->>OMS: 等待 client.creds 就绪
+    WS->>WS: websockets.connect<br/>ping_interval 20
 
-    loop 假死探测
-        WS->>WS: 30s 无消息?
-        WS->>WS: 触发重连
+    WS->>WS: _authenticate() 订阅 user
+    WS->>WD: reconcile_positions(force=True)<br/>修补断线窗口
+    WD-->>WS: async task 已投递
+
+    loop _listen
+        WS->>WS: wait_for(ws.recv, 45s)
+        WS->>WS: process_message / handle_fill
     end
 
-    WS->>Auth: 重新生成 HMAC 签名
-    Auth-->>WS: 签名票据
-
-    WS->>WS: 重连 WebSocket
-
-    alt 需要恢复状态
-        WS->>Inv: 查询当前持仓
-        Inv-->>WS: InventorySnapshot
-        WS->>WS: 同步 active_orders
-    end
-
-    Note over WS: 恢复正常处理
+    Note over WS: recv 超时或断连 → 退出 with 块 →<br/>退避重连（指数上限 60s）
 ```
 
 ---

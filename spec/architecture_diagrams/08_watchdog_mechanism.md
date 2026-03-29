@@ -17,26 +17,17 @@ flowchart TB
     subgraph MainLoop["主监控循环 (每秒)"]
         D["await asyncio.sleep(1)<br/>每秒心跳"]
         E["check_exposure()<br/>暴露检查 (内存)"]
-        F{"暴露 ><br/>MAX_EXPOSURE?"}
+        F{"capital_used 是否超过<br/>MAX_EXPOSURE?"}
         G["trigger_kill_switch()<br/>硬熔断"]
     end
 
-    subgraph Reconcile["对账循环 (周期)"]
-        H["await asyncio.sleep(reconciliation_interval)<br/>默认 3600s 或 60s"]
-        I["reconcile_positions()<br/>批量对账"]
-        J["获取活跃市场列表<br/>get_active_router_markets()"]
-        K["for each market:<br/>reconcile_single_market()"]
-    end
-
-    subgraph SingleReconcile["单市场对账"]
-        L["GET Data API<br/>/positions?user={address}"]
-        M["解析 positions<br/>{condition_id: {yes, no}}"]
-        N["行锁 InventoryLedger"]
-        O{"DB vs API<br/>差异检查"}
-        P{"差异 > tolerance<br/>且 非保护窗口?"}
-        Q["覆盖 DB<br/>yes/no_exposure"]
-        R["修正 capital_used<br/>按比例"]
-        S["apply_reconciliation_snapshot()<br/>同步内存"]
+    subgraph Reconcile["对账循环 reconciliation_loop（独立 task）"]
+        H["sleep<br/>RECONCILIATION_INTERVAL_SEC<br/>config 默认 3600s"]
+        I["reconcile_positions()<br/>全量持仓对账"]
+        L["GET Data API<br/>/positions 一次"]
+        M["按 conditionId 聚合 API 仓位"]
+        N["SELECT InventoryLedger<br/>with_for_update 全表行"]
+        O["for each 行:<br/>比对 API、尊重 buffer、<br/>必要时覆盖 DB 并<br/>apply_reconciliation_snapshot"]
     end
 
     Init --> C
@@ -49,24 +40,11 @@ flowchart TB
 
     C --> H
     H --> I
-    I --> J
-    J --> K
-    K --> L
+    I --> L
     L --> M
     M --> N
     N --> O
-    O --> P
-    P -->|Yes| Q
-    P -->|No| S
-    Q --> R
-    R --> S
-    S --> K
-    K -->|"遍历完成"| C
-
-    note right of Init
-        **注意**: 硬重置逻辑不在 Watchdog 中！
-        硬重置在 QuotingEngine.on_tick() 中每 5 分钟触发
-    end note
+    O --> H
 
     classDef init fill:#0891b2,stroke:#0e7490,color:#fff
     classDef main fill:#dc2626,stroke:#b91c1c,color:#fff
@@ -74,8 +52,10 @@ flowchart TB
 
     class A,B init
     class D,E,F,G main
-    class H,I,J,K,L,M,N,O,P,Q,R,S reconcile
+    class H,I,L,M,N,O reconcile
 ```
+
+> **图注**：硬重置不在 Watchdog 中；由 `QuotingEngine.on_tick()` 约每 300s 触发，详见 `10_hard_reset_flow.md`。**单市场** `reconcile_single_market(force=True)` 由引擎在硬重置后调用，**不在**此周期图的主链上（与 `reconcile_positions` 不同）。
 
 ## check_exposure 核心逻辑
 
@@ -159,21 +139,19 @@ async def reconcile_single_market(self, condition_id: str, force: bool = False):
 timeline
     title Watchdog 时间线
 
-    section 1秒检查
-        check_exposure()
-        : 遍历所有活跃市场
-        : 比较 capital_used vs 阈值
-        : 超限 → trigger_kill_switch
+    section 每秒主循环
+        心跳间隔 : asyncio.sleep 约 1s
+        暴露检查 : check_exposure 遍历活跃市场
+        熔断条件 : capital_used 超阈值则 kill_switch
 
-    section 周期对账 (默认 3600s)
-        reconciliation_loop()
-        : 遍历所有活跃市场
-        : 调用 Polymarket Data API
-        : 差异 > tolerance → 覆盖更新
+    section 周期对账
+        间隔可配 : RECONCILIATION_INTERVAL_SEC 见 .env
+        批量任务 : reconcile_positions Data API
+        覆盖规则 : 超容差且过保护窗则写库并同步内存
 
-    section 硬重置 (不在 Watchdog 中!)
-        **注意**: 硬重置在 QuotingEngine.on_tick() 中
-        每 5 分钟触发一次 (300s)
+    section 硬重置
+        职责划分 : 由 QuotingEngine 触发非 Watchdog
+        周期参考 : 约每 300s 见引擎逻辑
 ```
 
 ## 熔断器状态 (在 OMS 中)

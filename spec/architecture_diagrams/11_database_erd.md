@@ -1,4 +1,6 @@
-# 数据库实体关系图
+# 数据库实体关系图（与 `app/models/db_models.py` 一致）
+
+当前 ORM **仅包含三张业务表**：`markets_meta`、`orders_journal`、`inventory_ledger`。激励字段挂在 **`MarketMeta`** 上，**无**独立的 `rewards_config` 表；**无** `funding_address` 表（资金地址来自配置 `FUNDER_ADDRESS`）。
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -8,72 +10,45 @@
   'lineColor': '#64748b'
 }}%%
 erDiagram
-    MARKET_META ||--o{ INVENTORY_LEDGER : "1:N"
-    MARKET_META ||--o{ ORDER_JOURNAL : "1:N"
-    MARKET_META ||--o{ REWARDS_CONFIG : "1:N"
-    INVENTORY_LEDGER }o--|| FUNDING_ADDRESS : "N:1"
+    MARKET_META ||--o| INVENTORY_LEDGER : "1:1 per market"
+    MARKET_META ||--o{ ORDER_JOURNAL : "1:N orders"
 
     MARKET_META {
-        string condition_id PK "条件ID Polymarket"
-        string token_id_yes "YES 代币 ID"
-        string token_id_no "NO 代币 ID"
-        string market_question "市场问题"
-        string status "状态 pending active suspended completed"
-        datetime start_time "开始时间"
-        datetime end_date "结算时间"
-        float liquidity "流动性"
-        string tags "标签 JSON"
-        datetime created_at "创建时间"
-        datetime updated_at "更新时间"
+        string condition_id PK
+        string slug UK
+        datetime end_date
+        string status
+        string yes_token_id
+        string no_token_id
+        numeric rewards_min_size
+        numeric rewards_max_spread
+        numeric reward_rate_per_day
     }
 
     INVENTORY_LEDGER {
-        string condition_id PK "条件ID 外键市场"
-        string funding_address PK "钱包地址"
-        float yes_exposure "YES 持仓份额"
-        float no_exposure "NO 持仓份额"
-        float yes_capital_used "YES 占用资金 USD"
-        float no_capital_used "NO 占用资金 USD"
-        float realized_pnl "已实现盈亏"
-        datetime last_reconcile_at "上次对账时间"
-        datetime updated_at "更新时间"
+        string market_id PK_FK
+        numeric yes_exposure
+        numeric no_exposure
+        numeric yes_capital_used
+        numeric no_capital_used
+        numeric realized_pnl
+        datetime updated_at
     }
 
     ORDER_JOURNAL {
-        string order_id PK "订单ID Polymarket"
-        string condition_id FK "条件ID"
-        string token_id "代币ID"
-        string side "方向 BUY SELL"
-        float price "价格"
-        float size "数量"
-        float filled_size "成交数量"
-        string status "状态 pending open filled partial cancelled"
-        string order_type "类型 GTC IOC FOK"
-        string signature "订单签名"
-        datetime created_at "创建时间"
-        datetime updated_at "更新时间"
-    }
-
-    REWARDS_CONFIG {
-        string condition_id PK "条件ID 外键市场"
-        float annual_roi "年化收益"
-        float rate "利率"
-        float min_size "最小订单 size"
-        float spread "价差"
-        boolean active "是否激活"
-        datetime fetched_at "获取时间"
-    }
-
-    FUNDING_ADDRESS {
-        string address PK "钱包地址"
-        string api_key "API Key"
-        string api_secret "API Secret"
-        boolean is_builder "是否使用 Builder API"
-        datetime created_at "创建时间"
+        string order_id PK
+        string market_id FK
+        enum side
+        numeric price
+        numeric size
+        enum status
+        json payload
+        datetime created_at
+        datetime updated_at
     }
 ```
 
-## 表关系说明
+## 表关系说明（flowchart）
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -83,129 +58,61 @@ erDiagram
   'lineColor': '#64748b'
 }}%%
 flowchart TB
-    subgraph MARKET_META["MARKET_META 市场元数据"]
+    subgraph MM["markets_meta"]
         M1["condition_id PK"]
-        M2["token_id_yes token_id_no"]
-        M3["status end_date"]
+        M2["yes_token_id / no_token_id"]
+        M3["rewards_* 激励字段"]
     end
 
-    subgraph INVENTORY_LEDGER["INVENTORY_LEDGER 库存台账"]
-        I1["condition_id PK FK"]
-        I2["funding_address PK"]
-        I3["yes no exposure"]
-        I4["yes no capital_used"]
+    subgraph IL["inventory_ledger"]
+        I1["market_id PK = condition_id"]
+        I2["yes/no_exposure capital_used"]
     end
 
-    subgraph ORDER_JOURNAL["ORDER_JOURNAL 订单日志"]
+    subgraph OJ["orders_journal"]
         O1["order_id PK"]
-        O2["condition_id FK"]
-        O3["side price size"]
-        O4["filled_size status"]
+        O2["market_id FK"]
+        O3["payload 含 token_id 等"]
     end
 
-    subgraph REWARDS_CONFIG["REWARDS_CONFIG 激励配置"]
-        R1["condition_id PK FK"]
-        R2["annual_roi rate"]
-    end
+    MM -->|"1:1"| IL
+    MM -->|"1:N"| OJ
 
-    subgraph FUNDING_ADDRESS["FUNDING_ADDRESS 钱包"]
-        F1["address PK"]
-        F2["api_key api_secret"]
-    end
-
-    MARKET_META -->|"1:N"| INVENTORY_LEDGER
-    MARKET_META -->|"1:N"| ORDER_JOURNAL
-    MARKET_META -->|"1:N"| REWARDS_CONFIG
-    INVENTORY_LEDGER -->|"N:1"| FUNDING_ADDRESS
-
-    classDef market fill:#0891b2,stroke:#0e7490,color:#fff
-    classDef ledger fill:#7c3aed,stroke:#6d28d9,color:#fff
-    classDef order fill:#dc2626,stroke:#b91c1c,color:#fff
-    classDef rewards fill:#d97706,stroke:#b45309,color:#fff
-    classDef funding fill:#059669,stroke:#047857,color:#fff
-
-    class MARKET_META market
-    class INVENTORY_LEDGER ledger
-    class ORDER_JOURNAL order
-    class REWARDS_CONFIG rewards
-    class FUNDING_ADDRESS funding
+    style MM fill:#0891b2,stroke:#0e7490,color:#fff
+    style IL fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style OJ fill:#dc2626,stroke:#b91c1c,color:#fff
 ```
 
-## 库存计算口径
+## 说明
+
+- **`InventoryLedger` 主键**仅为 `market_id`（对应 `condition_id`），不按钱包地址分表。
+- **成交与库存**：User WS `handle_fill` 更新 `OrderJournal` 与内存 `inventory_state`，再异步刷写 `inventory_ledger`；与下图示意的 SQL 仅为概念参考，**以 ORM 字段为准**。
+
+## 库存计算口径（概念 SQL，非必须与实际列名一一对应）
 
 ```sql
--- 实时库存计算
+-- 示例：按市场 join 元数据做 MTM（定价来自引擎/Redis，非本表持久化）
 SELECT
-    il.condition_id,
-    il.funding_address,
+    il.market_id,
     il.yes_exposure,
     il.no_exposure,
-    il.yes_capital_used + il.no_capital_used AS total_capital_used,
-    -- MTM 盯市价值
-    il.yes_exposure * mm.current_fv_yes +
-    il.no_exposure * mm.current_fv_no AS mtm_value,
-    -- 未实现盈亏
-    il.yes_exposure * (mm.current_fv_yes - mm.entry_price_yes) +
-    il.no_exposure * (mm.current_fv_no - mm.entry_price_no) AS unrealized_pnl
+    il.yes_capital_used + il.no_capital_used AS total_capital_used
 FROM inventory_ledger il
-JOIN market_meta mm ON il.condition_id = mm.condition_id
-WHERE il.funding_address = :address;
+JOIN markets_meta mm ON il.market_id = mm.condition_id;
 ```
 
-## 索引设计
+## 索引设计（建议）
 
 ```sql
--- 核心查询索引
-CREATE INDEX idx_order_journal_condition_id ON order_journal(condition_id);
-CREATE INDEX idx_order_journal_status ON order_journal(status);
-CREATE INDEX idx_order_journal_created_at ON order_journal(created_at DESC);
-CREATE INDEX idx_inventory_ledger_address ON inventory_ledger(funding_address);
-CREATE INDEX idx_market_meta_status ON market_meta(status);
-CREATE INDEX idx_market_meta_end_date ON market_meta(end_date);
+CREATE INDEX IF NOT EXISTS idx_orders_journal_market_id ON orders_journal(market_id);
+CREATE INDEX IF NOT EXISTS idx_orders_journal_status ON orders_journal(status);
+CREATE INDEX IF NOT EXISTS idx_orders_journal_created_at ON orders_journal(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_markets_meta_status ON markets_meta(status);
 ```
 
-## 异步持久化队列
+## 异步持久化队列（InventoryStateManager）
 
-```python
-# InventoryStateManager 有界队列
-class InventoryStateManager:
-    _persist_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-
-    async def apply_fill(self, ...):
-        # 1. 内存更新 (同步, 零延迟)
-        self.yes_exposure += size
-        self.capital_used += size * price
-
-        # 2. 异步持久化 (不阻塞热路径)
-        try:
-            self._persist_queue.put_nowait({
-                "action": "fill",
-                "condition_id": condition_id,
-                "size": size,
-                "price": price,
-                "timestamp": now()
-            })
-        except asyncio.QueueFull:
-            logger.warning("Persist queue full")
-
-    async def _persist_drain_loop(self):
-        """后台持久化循环 (批次写入)"""
-        while not self._shutdown:
-            batch = []
-            for _ in range(100):
-                try:
-                    item = self._persist_queue.get_nowait()
-                    batch.append(item)
-                except asyncio.QueueEmpty:
-                    break
-
-            if batch:
-                await self._batch_persist(batch)
-
-            await asyncio.sleep(1)
-```
-
-## 状态同步流程
+内存单例 + **有界队列**异步写入 `inventory_ledger`，与 `app/core/inventory_state.py` 一致；热路径 `on_tick` **不读**该表。
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -215,28 +122,30 @@ class InventoryStateManager:
   'lineColor': '#64748b'
 }}%%
 flowchart TB
-    subgraph Step1["1. DB 同步写入"]
-        A["OrderJournal<br/>同步, 保证持久化"]
+    subgraph Step1["1. OrderJournal"]
+        A["User WS handle_fill<br/>with_for_update 订单行"]
     end
 
-    subgraph Step2["2. 内存更新"]
-        B["InventoryStateManager<br/>同步, 热路径"]
+    subgraph Step2["2. 内存"]
+        B["inventory_state.apply_fill"]
     end
 
     subgraph Step3["3. 异步队列"]
-        C["有界队列<br/>maxsize=1000"]
+        C["有界队列 maxsize=1000"]
     end
 
-    subgraph Step4["4. 批量 DB 写入"]
-        D["InventoryLedger<br/>异步, 批量"]
+    subgraph Step4["4. 批量落库"]
+        D["inventory_ledger 行更新"]
     end
 
     A --> B --> C --> D
 
-    classDef step fill:#0891b2,stroke:#0e7490,color:#fff
-    class A,B,C,D step
+    style A fill:#0891b2,stroke:#0e7490,color:#fff
+    style B fill:#475569,stroke:#334155,color:#fff
+    style C fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style D fill:#059669,stroke:#047857,color:#fff
 ```
 
 ---
 
-*设计亮点: 内存优先 + 异步批量持久化，热路径零 DB，保证高性能同时不丢数据*
+*与实现文件对齐：`app/models/db_models.py`、`app/core/inventory_state.py`。*

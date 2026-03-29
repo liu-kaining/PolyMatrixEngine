@@ -43,7 +43,7 @@ flowchart TB
         subgraph RiskPlane["风控平面"]
             Watchdog["RiskMonitor<br/>Watchdog"]
             KillSwitch["Kill Switch<br/>硬熔断"]
-            Reconciler["对账引擎<br/>REST 校验"]
+            Reconciler["对账引擎<br/>Data API 全表对账<br/>间隔见 RECONCILIATION_INTERVAL_SEC"]
         end
 
         subgraph Inventory["库存管理层"]
@@ -89,7 +89,6 @@ flowchart TB
     KillSwitch -.->|cancel_all| OMS
     Reconciler -->|Polymarket<br/>Data API| PostgreSQL
 
-    InvState -.->|直接调用<br/>apply_fill| Inventory
     InvState -->|async_persist| PostgreSQL
 
     AutoRouter -->|start_market_making| Core
@@ -103,9 +102,10 @@ flowchart TB
     classDef execution fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
     classDef storage fill:#475569,stroke:#334155,stroke-width:2px,color:#fff
     classDef auto fill:#d97706,stroke:#b45309,stroke-width:2px,color:#fff
+    classDef internalComp fill:#065f7f,stroke:#0e7490,stroke-width:1px,color:#fff
 
     class QuotingEngine engine
-    class AlphaModel,Grid,DiffQuote fill:#065f7f,stroke:#0e7490,stroke-width:1px,color:#fff
+    class AlphaModel,Grid,DiffQuote internalComp
     class Watchdog,KillSwitch,Reconciler risk
     class InvState,PostgreSQL,RedisKV data
     class OMS,CircuitBreaker,CLOB,Builder execution
@@ -129,6 +129,8 @@ flowchart TB
 2. **消息解耦**: 所有模块通过 Redis Pub/Sub 通信
 3. **状态分离**: 控制面(FastAPI) 与 数据面(Engine) 解耦
 4. **异步持久化**: 成交 → 内存更新 → 异步队列 → DB
+
+> **图注**：`apply_fill()` 由 User WebSocket 成交路径调用 `InventoryStateManager`，并非 InvState 自指；故图中不单独画「自环」边。
 
 ---
 

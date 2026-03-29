@@ -20,17 +20,16 @@ flowchart TB
     end
 
     subgraph FairValue["统一定价 Oracle"]
-        F["_get_unified_fair_value()<br/>计算 YES 锚点 FV"]
-        G["FV_yes = clamp<br/>(mid + OBI × 0.015<br/>, 0.01, 0.99)"]
-        H["发布到 Redis<br/>fv_anchor:{cid}"]
-        I["NO 侧派生<br/>FV_no = 1 - FV_yes"]
+        F["_get_unified_fair_value()"]
+        G["YES 引擎写 Redis<br/>fv_anchor:cid ex=30"]
+        H["NO 引擎读锚点或 ob:yes_token 兜底"]
+        I["fv_current + dynamic_spread + fv_yes"]
     end
 
-    subgraph BudgetCheck["严格 MTM 预算检查"]
-        J["获取 InventorySnapshot<br/>yes/no_exposure<br/>pending_buy_notional"]
-        K["held_value =<br/>yes_exp × FV_yes +<br/>no_exp × FV_no"]
-        L["strict_used =<br/>held_value +<br/>pending_yes_n + pending_no_n"]
-        M{"strict_used <<br/>GLOBAL_MAX_BUDGET?"}
+    subgraph BudgetCheck["本市场 MTM + pending 口径（与代码一致）"]
+        J["inventory_state.get_snapshot()"]
+        K["held_inventory_value<br/>+ pending_yes + pending_no"]
+        L["strict_local_used_dollars<br/>后续与 MAX_EXPOSURE 等比较"]
     end
 
     subgraph GridGen["网格生成"]
@@ -41,6 +40,8 @@ flowchart TB
         O --> R["极端行情?<br/>调整策略"]
         R -->|Yes| S["Extreme Taker<br/>更激进报价"]
         R -->|No| T["Normal Maker"]
+        S --> U
+        T --> U
     end
 
     subgraph BalancePrecheck["余额预检"]
@@ -78,11 +79,7 @@ flowchart TB
     I --> J
     J --> K
     K --> L
-    L --> M
-    M -->|Yes| N
-    M -->|No| ZO["跳过报价<br/>日志警告"]
-    N --> P
-    P --> Q
+    L --> N
     Q --> U
     U --> V
     V --> W
@@ -108,7 +105,7 @@ flowchart TB
     class A trigger
     class B,C,D,E config
     class F,G,H,I fv
-    class J,K,L,M risk
+    class J,K,L risk
     class N,O,P,Q,R,S,T grid
     class U,V,W,X exec
     class Y,Z,AA,AB,AC exec

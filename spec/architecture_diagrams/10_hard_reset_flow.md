@@ -18,43 +18,40 @@ flowchart TB
 
     subgraph CancelAll["全钱包撤单 (OMS)"]
         D["oms.physical_clob_cancel_all_for_hard_reset()"]
-        E["CLOB HTTP POST<br/>/cancel_all (超时 45s)"]
-        F{"成功?"}
-        G["等待 3s<br/>USDC 释放"]
-        H["读取余额日志<br/>验证"]
-        D --> E --> F
-        F -->|Yes| G --> H
-        F -->|No| I["跳过 (继续)"]
+        E["to_thread cancel_all 等<br/>HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC"]
+        F["sleep<br/>HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC"]
+        G["可选 get_balance_allowance<br/>仅日志"]
+        D --> E --> F --> G
     end
 
     subgraph LocalCancel["本地状态清理"]
         J["cancel_all_orders()<br/>force_evict=True"]
-        K["清空 active_orders"]
-        L["清空 pending_buy_notional"]
-        M["重置引擎状态 → SUSPENDED"]
+        K["移除 active_orders 中订单"]
+        L["_update_pending_buy_notional()"]
+        M["不修改 suspended<br/>（非 Kill Switch）"]
     end
 
     subgraph ForceReconcile["强制对账 (Watchdog)"]
         N["watchdog.reconcile_single_market<br/>(force=True)"]
-        O["绕过时间保护<br/>强制覆盖"]
-        P["同步 InventoryLedger<br/>到内存"]
+        O["跳过 RECONCILIATION_BUFFER"]
+        P["对齐本市场 DB 与内存"]
     end
 
-    subgraph Decision["对账决策"]
-        Q{"对账<br/>成功?"}
-        R["POST_RESET_<br/>RECONCILE_FREEZE<br/>冻结 BUY"]
-        S["引擎状态 → QUOTING<br/>恢复报价"]
+    subgraph Decision["本 tick 内决策"]
+        Q{"reconcile_single_market<br/>返回 True?"}
+        R["freeze_buys_post_reset_reconcile_fail=True<br/>本 tick 不建 BUY 网格"]
+        S["不置 freeze<br/>正常构建订单"]
     end
 
-    subgraph Recovery["恢复阶段"]
-        T["恢复接收 tick<br/>继续 on_tick 循环"]
+    subgraph Recovery["同一次 on_tick 后续"]
+        T["继续执行本 tick<br/>剩余报价逻辑"]
     end
 
-    %% 连接
+    %% 连接（边必须指向节点；subgraph 仅分组）
     A --> B --> C
-    C -->|"通过"| CancelAll
-    C -->|"跳过 (debounce)"| T
-    H --> J
+    C -->|"通过"| D
+    C -->|"跳过 debounce"| T
+    G --> J
     J --> K --> L --> M
     M --> N
     N --> O --> P
@@ -71,7 +68,7 @@ flowchart TB
     classDef recovery fill:#059669,stroke:#047857,color:#fff
 
     class A,B,C trigger
-    class D,E,F,G,H,I cancel
+    class D,E,F,G cancel
     class J,K,L,M,N,O,P reconcile
     class Q,R,S decision
     class T recovery
@@ -194,42 +191,28 @@ flowchart LR
   'lineColor': '#64748b'
 }}%%
 timeline
-    title 硬重置完整流程 (QuotingEngine.on_tick)
+    title 硬重置完整流程 QuotingEngine.on_tick
 
-    section 触发条件
-        每 5 分钟 (300s)
-        : time.time() - last_grid_reset_time > 300
-        : 检查 debounce (15s) 和 peer_gate
+    section 触发与门禁
+        周期条件 : last_grid_reset_time 间隔约 300s
+        互斥门禁 : debounce 与 peer_gate 见引擎实现
 
-    section T+0s (如果 debounce 通过)
-        CLOB cancel_all
-        : oms.physical_clob_cancel_all_for_hard_reset()
-        : 超时 45s
+    section CLOB 撤单
+        cancel_all : physical_clob_cancel_all_for_hard_reset
+        超时保护 : 线程调用带 wait_for 超时
 
-    section T+3s
-        睡眠等待 USDC 释放
-        : HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC
+    section 等待结算
+        sleep : HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC 释放 USDC
 
-    section T+4s
-        本地 cancel_all_orders(force_evict=True)
-        : 清空 active_orders
-        : 清空 pending_buys
-        : 引擎状态 → SUSPENDED
+    section 本地清理
+        强制驱逐 : cancel_all_orders force_evict 清空 active_orders
 
-    section T+5s
-        reconcile_single_market(force=True)
-        : 绕过时间保护
-        : 强制覆盖 DB
-        : 同步内存状态
+    section 强制对账
+        REST : reconcile_single_market force True
 
-    section T+6s
-        决策
-        : 成功 → 引擎状态 → QUOTING
-        : 失败 → 引擎状态 → POST_RESET_RECONCILE_FREEZE
-
-    section T+7s
-        恢复 tick 处理
-        : 继续 on_tick 循环
+    section 决策与恢复
+        成功路径 : 继续本 tick 报价逻辑
+        失败保守 : 本 tick 冻结新 BUY 直至状态可信
 ```
 
 ## 对账失败冻结

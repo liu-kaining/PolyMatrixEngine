@@ -34,7 +34,7 @@ flowchart TB
         subgraph Risk["风控平面"]
             Watchdog["Watchdog<br/>每秒检查"]
             KillSwitch["Kill Switch<br/>硬熔断"]
-            Reconciler["对账引擎<br/>60s 对账"]
+            Reconciler["对账引擎<br/>reconcile_positions<br/>间隔默认 3600s"]
         end
 
         InvState["InventoryStateManager<br/>内存优先 + 异步持久化"]
@@ -128,7 +128,7 @@ flowchart LR
 | GLOBAL_MAX_BUDGET | $1000 | 全局资金上限 |
 | EXPOSURE_TOLERANCE | 1% | 对账容差 |
 | RECONCILIATION_BUFFER | 8s | 时间保护窗口 |
-| RECONCILIATION_INTERVAL | 60s | 对账间隔 |
+| RECONCILIATION_INTERVAL_SEC | 3600s（默认） | Watchdog 全量对账；`.env` 可改 |
 | HARD_RESET_INTERVAL | 5min | 硬重置间隔 |
 | EVENT_HORIZON | 24h | 事件地平线 |
 | CIRCUIT_BREAKER_FAILURES | 5次 | 熔断阈值 |

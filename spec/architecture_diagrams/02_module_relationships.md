@@ -66,7 +66,6 @@ flowchart TB
     %% MarketData 分发
     Gateway -->|"tick:{token}"| Engine
     Gateway -->|"ob:{token}"| Engine
-    Gateway -->|"subscribe"| UserStream
 
     %% UserStream 通过 Redis PubSub 发布成交事件
     UserStream -.->|"Redis PubSub<br/>order_status:{cid}:{token}"| Engine
@@ -113,6 +112,7 @@ flowchart TB
     classDef risk fill:#dc2626,stroke:#b91c1c,color:#fff
     classDef db fill:#64748b,stroke:#475569,color:#fff
 
+    class FastAPI,Streamlit entry
     class Gateway,UserStream,Gamma data
     class InvState,Lifecycle,AutoRouter,Config core
     class Engine,Alpha,Grid,Diff quoting

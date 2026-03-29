@@ -8,16 +8,16 @@
   'lineColor': '#64748b'
 }}%%
 flowchart TB
-    subgraph Trigger["触发机制"]
-        A["定时扫描<br/>默认 5 分钟"]
-        B["Gamma API<br/>批量查询"]
+    subgraph Trigger["触发机制（auto_router.run）"]
+        A["sleep<br/>AUTO_ROUTER_SCAN_INTERVAL_SEC<br/>默认 3600s；启动后先立即扫"]
+        B["CLOB rewards/markets/multi<br/>分页 + Gamma 补 endDate/tags"]
     end
 
     subgraph Filter["过滤阶段"]
         C{"rewards<br/>存在?"}
-        D{"流动性<br/>≥ $20,000?"}
+        D{"奖励与规模过滤<br/>见 _radar_scan 代码"}
         E{"非体育<br/>非黑名单?"}
-        F{"事件地平线<br/>> 24h?"}
+        F{"距结算是否大于<br/>EVENT_HORIZON_HOURS?"}
         G["候选市场<br/>Passed Filters"]
         C -->|Yes| D
         C -->|No| DROP1["丢弃"]
@@ -29,12 +29,9 @@ flowchart TB
         F -->|No| DROP4["丢弃: 已结算"]
     end
 
-    subgraph Score["评分阶段"]
-        H["daily_roi<br/>日收益"]
-        I["rate<br/>年化利率"]
-        J["liquidity<br/>流动性评分"]
-        K["time_decay<br/>时间衰减"]
-        L["总分 =<br/>ROI × rate ×<br/>(10000/liquidity)<br/>× time_decay"]
+    subgraph Score["评分阶段 _radar_scan"]
+        H["每市场: rate(日池) r_min comp<br/>→ daily_roi = rate/r_min<br/>→ penalty = max(1, log1p(comp))"]
+        L["score = rate × daily_roi / penalty<br/>分页聚齐后排序 → 短名单<br/>→ Gamma 批量补 endDate/tags"]
     end
 
     subgraph Select["选择阶段"]
@@ -65,10 +62,7 @@ flowchart TB
     E --> F
     F --> G
     G --> H
-    H --> I
-    I --> J
-    J --> K
-    K --> L
+    H --> L
     L --> M
     M -->|Yes| N
     M -->|No| Q
@@ -92,35 +86,25 @@ flowchart TB
     classDef exec fill:#dc2626,stroke:#b91c1c,color:#fff
 
     class C,D,E,F,G filter
-    class H,I,J,K,L score
+    class H,L score
     class M,N,O select
     class U,V,W exec
 ```
 
-## 评分算法
+## 评分算法（与 `auto_router._radar_scan` 一致）
 
 ```python
-def score_market(
-    market: MarketInfo,
-    current_time: datetime
-) -> float:
-    """
-    组合评分公式:
-    Score = daily_roi × rate × (10000 / liquidity) × time_decay
+# 摘自逻辑：对每个通过黑名单与门槛的 rewards 市场
+rate = _parse_rewards_rate_from_rewards_api(m)       # 日奖励池 USD/天
+r_min = _parse_rewards_min_size_from_rewards_api(m)  # 最小挂单规模
+comp = _parse_competitiveness(m)
 
-    - daily_roi: 日收益潜力 (年化 / 365)
-    - rate: 年化利率 (激励收益)
-    - (10000/liquidity): 流动性稀缺性因子
-    - time_decay: 时间衰减 (越接近结算越低)
-    """
-    daily_roi = market.rewards.annual_roi / 365
-    rate = market.rewards.rate
-    liquidity_factor = 10000 / max(market.liquidity, 1)
+daily_roi = rate / r_min if r_min > 0 else 0.0
+competition_penalty = max(1.0, math.log1p(max(comp, 0.0)))
+score = (rate * daily_roi) / competition_penalty
 
-    hours_to_event = (market.end_date - current_time).total_seconds() / 3600
-    time_decay = clamp(hours_to_event / 24, 0.1, 1.0)  # 最小 0.1
-
-    return daily_roi * rate * liquidity_factor * time_decay
+# 全量分页收集后再 sort(key=score)，取短名单；再用 Gamma 批量补 endDate/tags，
+# 经事件视界过滤后得到最终 Top N（见 _radar_scan 尾部）。
 ```
 
 ## 赛道隔离规则

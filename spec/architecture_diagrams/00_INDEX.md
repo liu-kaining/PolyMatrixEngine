@@ -36,7 +36,7 @@
 - Rewards Band 保护：订单仍在奖励带内时不撤
 
 ### 4. 多层风控体系
-- 报价前预检 → Watchdog 硬熔断 → REST 周期对账 → 硬重置强制对账
+- 报价前预检 → Watchdog 硬熔断 → REST 周期对账（`RECONCILIATION_INTERVAL_SEC`，默认 3600s）→ 硬重置强制对账
 
 ### 5. 赛道隔离与事件地平线
 - `MAX_SLOTS_PER_SECTOR` / `MAX_EXPOSURE_PER_SECTOR`
