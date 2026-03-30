@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
+from app.core.exposure_limits import resolve_outcome_count
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
 from app.oms.core import oms
@@ -90,6 +91,8 @@ class QuotingEngine:
         self._shutdown_requested = False  # Set when exposure cleared so run() can break
         self.last_grid_reset_time = time.time()
 
+        # Outcomes: 2 = binary YES/NO; >2 = categorical (stricter MAX_EXPOSURE_CATEGORICAL)
+        self.outcome_count: int = 2
         # Rewards Farming: loaded once from Redis on first tick
         self._rewards_loaded = False
         self.rewards_min_size: float = 0.0
@@ -310,10 +313,16 @@ class QuotingEngine:
 
         await redis_client.set_state(f"engine_state:{self.condition_id}:{side}", payload, ex=30)
 
+    def _per_market_exposure_cap(self) -> float:
+        from app.core.exposure_limits import exposure_cap_usd_for_outcome_count
+
+        return exposure_cap_usd_for_outcome_count(self.outcome_count)
+
     async def _load_rewards_config(self) -> None:
         """Load rewards params from Redis once. Safe for markets with no rewards (defaults to 0)."""
         if self._rewards_loaded:
             return
+        self.outcome_count = await resolve_outcome_count(self.condition_id)
         rewards = await redis_client.get_state(f"rewards:{self.condition_id}")
         if rewards:
             try:
@@ -347,7 +356,7 @@ class QuotingEngine:
         stay within strict per-market budget (MTM inventory + opposite-side pending already deducted).
         """
         auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
-        max_exposure = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        max_exposure = self._per_market_exposure_cap()
         total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
@@ -366,7 +375,7 @@ class QuotingEngine:
             shrunk_size = max_exposure / self.grid_levels
             logger.warning(
                 f"[{self.token_id[:6]}] [BUDGET] Shrinking size {target_size:.1f} -> {shrunk_size:.1f} "
-                f"to fit MAX_EXPOSURE_PER_MARKET ({max_exposure:.1f}) across {self.grid_levels} levels."
+                f"to fit per-market cap ({max_exposure:.1f}) across {self.grid_levels} levels."
             )
             target_size = shrunk_size
 
@@ -623,7 +632,7 @@ class QuotingEngine:
             pending_no_n = float(snap.get("pending_no_buy_notional", 0.0))
             strict_local_used_dollars = held_inventory_value + pending_yes_n + pending_no_n
             strict_local_used_excluding_me = strict_local_used_dollars - my_pending_notional
-            max_exposure_per_market_cfg = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            max_exposure_per_market = self._per_market_exposure_cap()
             # Balance precheck: MTM inventory + opposite side's pending BUYs (this side's pending excluded — we replace our own quotes).
             local_used_dollars_excluding_me = strict_local_used_excluding_me
 
@@ -672,7 +681,6 @@ class QuotingEngine:
             orders_payload: List[dict] = []
 
             # Two-way quoting: extreme line (dollars) and exit flags
-            max_exposure_per_market = max_exposure_per_market_cfg
             extreme_threshold_dollars = max_exposure_per_market * 0.9
             my_capital_used = (
                 float(snap.get("yes_capital_used", 0.0))
@@ -751,10 +759,17 @@ class QuotingEngine:
             # --- Line 2: BUY side (build position / take liquidity when safe) ---
             strict_budget_block_buys = strict_local_used_dollars >= max_exposure_per_market - 1e-6
             if strict_budget_block_buys and not self.exit_mode:
-                logger.warning(
-                    f"[{self.token_id[:6]}] STRICT BUDGET CAP: MTM+pending ${strict_local_used_dollars:.2f} "
-                    f">= MAX_EXPOSURE_PER_MARKET ${max_exposure_per_market:.2f} — no new BUY orders."
-                )
+                if self.outcome_count > 2:
+                    logger.warning(
+                        "[BUDGET] Categorical market strict cap hit: %s >= MAX_EXPOSURE_CATEGORICAL (%s). No new BUY orders.",
+                        f"{strict_local_used_dollars:.2f}",
+                        f"{max_exposure_per_market:.2f}",
+                    )
+                else:
+                    logger.warning(
+                        f"[{self.token_id[:6]}] STRICT BUDGET CAP: MTM+pending ${strict_local_used_dollars:.2f} "
+                        f">= MAX_EXPOSURE_PER_MARKET ${max_exposure_per_market:.2f} — no new BUY orders."
+                    )
             if freeze_buys_post_reset_reconcile_fail and not self.exit_mode:
                 logger.warning(
                     f"[{self.token_id[:6]}] Post-reset reconcile freeze active — skipping BUY grid build."
@@ -879,6 +894,7 @@ class QuotingEngine:
                 orders_payload,
                 local_used_dollars_excluding_me=local_used_dollars_excluding_me,
                 global_other_markets_dollars=global_other_markets_dollars,
+                per_market_cap=max_exposure_per_market,
             )
 
             logger.info("Order Instructions Payload:")
@@ -903,6 +919,7 @@ class QuotingEngine:
         orders_payload: List[dict],
         local_used_dollars_excluding_me: float,
         global_other_markets_dollars: float,
+        per_market_cap: Optional[float] = None,
     ) -> List[dict]:
         """
         Trim BUY orders if total notional exceeds available budget. All in Dollars.
@@ -911,10 +928,14 @@ class QuotingEngine:
         if not orders_payload:
             return orders_payload
 
-        max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        cap = (
+            float(per_market_cap)
+            if per_market_cap is not None
+            else float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+        )
         global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
 
-        local_available = max(0.0, max_exposure_per_market - local_used_dollars_excluding_me)
+        local_available = max(0.0, cap - local_used_dollars_excluding_me)
         global_used = global_other_markets_dollars + local_used_dollars_excluding_me
         global_available = max(0.0, global_max_budget - global_used)
         available = min(local_available, global_available)

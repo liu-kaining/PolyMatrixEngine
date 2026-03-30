@@ -107,6 +107,7 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
                     "rewards_min_size": gamma_info.rewards_min_size,
                     "rewards_max_spread": gamma_info.rewards_max_spread,
                     "reward_rate_per_day": gamma_info.reward_rate_per_day,
+                    "outcome_count": int(getattr(gamma_info, "outcome_count", 2) or 2),
                 }
                 await redis_client.set_state(f"rewards:{condition_id}", rewards_payload)
 

@@ -1,6 +1,7 @@
 """
 Auto-Router (V7.2): Portfolio Manager — rewards-market radar via official CLOB rewards API,
-bonus floor, competition-aware scoring, event horizon and sector limits.
+bonus floor, competition-aware scoring, capital-aware rank (binary vs categorical exposure caps),
+event horizon and sector limits.
 Runs as a background asyncio task when AUTO_ROUTER_ENABLED=True.
 """
 import asyncio
@@ -14,6 +15,7 @@ import httpx
 
 import time
 from app.core.config import settings
+from app.core.exposure_limits import exposure_cap_usd_for_outcome_count
 from app.core.redis import redis_client
 from app.core.market_lifecycle import start_market_making_impl, get_active_router_markets
 from app.core.inventory_state import inventory_state
@@ -214,6 +216,44 @@ def _parse_rewards_spread_from_rewards_api(m: dict) -> Optional[float]:
     return v / 100.0 if v > 1.0 else v
 
 
+def _outcome_count_from_gamma_market_dict(raw: Optional[dict]) -> int:
+    """Number of CLOB outcome tokens (Gamma clobTokenIds). Defaults to 2 if missing."""
+    if not raw:
+        return 2
+    clob = raw.get("clobTokenIds") or raw.get("clob_token_ids")
+    tokens: Any = None
+    if isinstance(clob, str):
+        try:
+            tokens = json.loads(clob)
+        except Exception:
+            return 2
+    elif isinstance(clob, list):
+        tokens = clob
+    else:
+        return 2
+    if not isinstance(tokens, list) or len(tokens) < 2:
+        return 2
+    return len(tokens)
+
+
+def _router_rank_score(
+    rate: float,
+    r_min: float,
+    competition_penalty: float,
+    exposure_cap_usd: float,
+    cap_ref_binary: float,
+) -> float:
+    """
+    Capital-aware score for fair ranking: same pool/competition as before, scaled by
+    deployable per-market USD cap (categorical uses MAX_EXPOSURE_CATEGORICAL vs binary MAX_EXPOSURE_PER_MARKET).
+    """
+    daily_roi = rate / r_min if r_min > 0 else 0.0
+    base = (rate * daily_roi) / max(competition_penalty, 1e-9)
+    ref = max(float(cap_ref_binary), 1e-6)
+    capital_scale = max(0.0, float(exposure_cap_usd)) / ref
+    return base * capital_scale
+
+
 def _parse_competitiveness(m: dict) -> float:
     raw = m.get("market_competitiveness")
     if raw is None:
@@ -240,8 +280,9 @@ async def _fetch_gamma_meta_for_conditions(condition_ids: List[str]) -> Dict[str
 async def _radar_scan() -> List[dict]:
     """
     Fetch rewards markets from official CLOB rewards API (cursor pagination),
-    apply reward/base-size/blacklist filters, score by high bonus + low competitiveness,
-    then enrich shortlisted candidates with Gamma metadata (end_date/tags) and apply event-horizon.
+    apply reward/base-size/blacklist filters, batch Gamma for outcome_count + tags/endDate,
+    score with capital-aware ranking (categorical uses MAX_EXPOSURE_CATEGORICAL vs binary MAX_EXPOSURE_PER_MARKET),
+    then shortlist and apply event-horizon.
     """
     base_order_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
     max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)) * 5
@@ -292,19 +333,15 @@ async def _radar_scan() -> List[dict]:
 
                     comp = _parse_competitiveness(m)
                     daily_roi = rate / r_min if r_min > 0 else 0.0
-                    # Blue-ocean preference: reward-rich + low competitiveness.
-                    # competitiveness can be very large, so use log penalty for stability.
-                    competition_penalty = max(1.0, math.log1p(max(comp, 0.0)))
-                    score = (rate * daily_roi) / competition_penalty
                     seen.add(cid)
                     all_markets.append({
                         "condition_id": cid,
                         "daily_roi": daily_roi,
-                        "score": score,
                         "rewards_min_size": r_min,
                         "rewards_max_spread": r_spread,
                         "reward_rate_per_day": rate,
                         "market_competitiveness": comp,
+                        "outcome_count": 2,
                         "end_date": _parse_end_date(m),
                         "tags": _parse_tags(m),
                     })
@@ -329,24 +366,40 @@ async def _radar_scan() -> List[dict]:
     if not all_markets:
         return []
 
-    # Initial ranking from rewards + competitiveness only.
+    cap_ref_binary = max(float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0)), 1e-6)
+    all_cids = [m["condition_id"] for m in all_markets if m.get("condition_id")]
+    logger.info(
+        "[AutoRouter] Gamma batch for %d pass-filter candidates (outcome_count, tags, endDate, rank score)...",
+        len(all_cids),
+    )
+    gamma_meta_all = await _fetch_gamma_meta_for_conditions(all_cids)
+
+    for m in all_markets:
+        raw = gamma_meta_all.get(m["condition_id"])
+        oc = _outcome_count_from_gamma_market_dict(raw) if raw else 2
+        m["outcome_count"] = oc
+        exposure_cap = exposure_cap_usd_for_outcome_count(oc)
+        m["router_exposure_cap_est"] = exposure_cap
+        if raw:
+            end_date = _parse_end_date(raw)
+            if end_date is not None:
+                m["end_date"] = end_date
+            tags = _parse_tags(raw)
+            if tags:
+                m["tags"] = tags
+        comp = float(m.get("market_competitiveness", 0.0) or 0.0)
+        competition_penalty = max(1.0, math.log1p(max(comp, 0.0)))
+        rate = float(m.get("reward_rate_per_day", 0.0) or 0.0)
+        r_min = float(m.get("rewards_min_size", 0.0) or 0.0)
+        m["score"] = _router_rank_score(
+            rate, r_min, competition_penalty, exposure_cap, cap_ref_binary
+        )
+        if r_min > 0:
+            m["daily_roi"] = rate / r_min
+
     all_markets.sort(key=lambda x: x["score"], reverse=True)
     shortlist_count = max(max_markets, top_n * 10)
     shortlisted = all_markets[:shortlist_count]
-
-    # Supplement metadata from Gamma for sector/event-horizon controls.
-    need_meta = [m["condition_id"] for m in shortlisted if m.get("condition_id")]
-    gamma_meta = await _fetch_gamma_meta_for_conditions(need_meta)
-    for m in shortlisted:
-        raw = gamma_meta.get(m["condition_id"])
-        if not raw:
-            continue
-        end_date = _parse_end_date(raw)
-        if end_date is not None:
-            m["end_date"] = end_date
-        tags = _parse_tags(raw)
-        if tags:
-            m["tags"] = tags
 
     filtered = [
         m for m in shortlisted if not _within_event_horizon(m.get("end_date"), event_horizon_hours)
@@ -376,7 +429,6 @@ async def _rebalance(
     event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
     max_exposure_per_sector = float(getattr(settings, "MAX_EXPOSURE_PER_SECTOR", 300.0))
     max_slots_per_sector = int(getattr(settings, "MAX_SLOTS_PER_SECTOR", 2))
-    max_exposure_per_market = float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
     target_ids = {m["condition_id"] for m in target_markets}
     now = time.time()
 
@@ -486,7 +538,8 @@ async def _rebalance(
             tags = [f"_unknown_{cid[:8]}"]
         # Sector limits: slots and exposure
         would_exceed_slots = any(sector_slots.get(t, 0) >= max_slots_per_sector for t in tags)
-        est_new_exposure = max_exposure_per_market
+        oc = int(m.get("outcome_count") or 2)
+        est_new_exposure = float(exposure_cap_usd_for_outcome_count(oc))
         would_exceed_exposure = any(
             (sector_exposure.get(t, 0.0) + est_new_exposure) > max_exposure_per_sector for t in tags
         )
@@ -505,6 +558,7 @@ async def _rebalance(
             active_market_meta[cid] = {
                 "end_date": m.get("end_date"),
                 "tags": tags,
+                "outcome_count": oc,
             }
             for t in tags:
                 sector_exposure[t] = sector_exposure.get(t, 0.0) + est_new_exposure
@@ -538,7 +592,16 @@ async def run() -> None:
             # Update health metrics
             router_state["last_scan_ts"] = time.time()
             router_state["last_scan_error"] = None
-            router_state["top_targets"] = [{"cid": m["condition_id"], "roi": m["daily_roi"]} for m in target_list]
+            router_state["top_targets"] = [
+                {
+                    "cid": m["condition_id"],
+                    "roi": m["daily_roi"],
+                    "outcome_count": m.get("outcome_count", 2),
+                    "router_exposure_cap_est": m.get("router_exposure_cap_est"),
+                    "score": m.get("score"),
+                }
+                for m in target_list
+            ]
             
             if not target_list:
                 logger.info("[AutoRouter] Scan complete. No eligible targets (rewards + base size).")

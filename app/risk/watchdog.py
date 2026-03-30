@@ -8,6 +8,7 @@ from sqlalchemy.future import select
 from app.db.session import AsyncSessionLocal
 from app.models.db_models import InventoryLedger, MarketMeta
 from app.core.config import settings
+from app.core.exposure_limits import exposure_cap_usd_for_condition_redis_only
 from app.oms.core import oms
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
@@ -46,7 +47,6 @@ def _build_actual_inventory_from_positions(positions: list) -> Dict[str, Dict[st
 
 class RiskMonitor:
     def __init__(self):
-        self.max_exposure = settings.MAX_EXPOSURE_PER_MARKET
         self.reconciliation_interval = int(getattr(settings, "RECONCILIATION_INTERVAL_SEC", 60))
         self.exposure_tolerance = settings.EXPOSURE_TOLERANCE
         self.reconciliation_buffer_seconds = float(
@@ -87,7 +87,8 @@ class RiskMonitor:
                 + float(snap.get("no_capital_used", 0.0))
             )
 
-            if actual_used_dollars <= self.max_exposure:
+            per_market_cap = await exposure_cap_usd_for_condition_redis_only(cid)
+            if actual_used_dollars <= per_market_cap:
                 continue
 
             # 3. Breach detected: Verify status in DB before triggering
@@ -100,7 +101,7 @@ class RiskMonitor:
                     continue
 
                 logger.critical(
-                    f"RISK BREACH (Actual Capital): Market {cid[:12]} exceeded limit (${self.max_exposure:.2f})! "
+                    f"RISK BREACH (Actual Capital): Market {cid[:12]} exceeded limit (${per_market_cap:.2f})! "
                     f"actual_used_dollars: ${actual_used_dollars:.2f}"
                 )
                 await self.trigger_kill_switch(cid, session)

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 class GammaMarketInfo:
     yes_token_id: str
     no_token_id: str
+    outcome_count: int = 2  # len(clobTokenIds); >2 => categorical multi-choice
     rewards_min_size: Optional[float] = None
     rewards_max_spread: Optional[float] = None
     reward_rate_per_day: Optional[float] = None
@@ -50,6 +51,8 @@ class GammaAPIClient:
                 if len(tokens) < 2:
                     logger.warning(f"Unexpected tokens format for market {condition_id}: {tokens}")
                     return None
+
+                outcome_count = len(tokens)
 
                 rewards_min_size: Optional[float] = None
                 rewards_max_spread: Optional[float] = None
@@ -123,6 +126,7 @@ class GammaAPIClient:
                 return GammaMarketInfo(
                     yes_token_id=tokens[0],
                     no_token_id=tokens[1],
+                    outcome_count=outcome_count,
                     rewards_min_size=rewards_min_size,
                     rewards_max_spread=rewards_max_spread,
                     reward_rate_per_day=reward_rate_per_day,

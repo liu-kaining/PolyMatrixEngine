@@ -248,7 +248,8 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `MAX_EXPOSURE_PER_SECTOR` | Max USD exposure allowed per tag/sector across active markets | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | Max active markets allowed per tag/sector | `2` |
 | `GLOBAL_MAX_BUDGET` | Absolute max USDC deployed across ALL markets | `1000.0` |
-| `MAX_EXPOSURE_PER_MARKET` | Cap per market (USDC); watchdog kill switch | e.g. `50.0` |
+| `MAX_EXPOSURE_PER_MARKET` | Cap per **binary** market (2 CLOB outcomes); MTM+pending BUY path + watchdog `capital_used` | e.g. `50.0` |
+| `MAX_EXPOSURE_CATEGORICAL` | Stricter cap (USDC) when **>2** outcomes (multi-choice); same budget semantics as above | `30.0` |
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | Seconds after last local fill to skip REST overwrite | `8.0` |
 | `RECONCILIATION_INTERVAL_SEC` | Watchdog periodic **Data API** positions sync interval | `60` |

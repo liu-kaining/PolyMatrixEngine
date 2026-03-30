@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     # Trading params
     AUTO_TUNE_FOR_REWARDS: bool = True    # 开启全自动赏金猎人模式
     MAX_EXPOSURE_PER_MARKET: float = 50.0 # 50 USDC max exposure before kill switch (风控红线)
+    # Categorical / multi-outcome markets (>2 CLOB tokens): stricter per-condition ceiling (MTM + pending BUY path)
+    MAX_EXPOSURE_CATEGORICAL: float = 30.0
     GLOBAL_MAX_BUDGET: float = 1000.0     # 绝对的资金红线 (风控红线)
     EXPOSURE_TOLERANCE: float = 0.01  # Ledger vs API diff above this triggers reconciliation overwrite (e.g. 0.01 so 5.0 vs 4.3 is corrected)
     RECONCILIATION_BUFFER_SECONDS: float = 8.0  # Skip REST overwrite shortly after local fills

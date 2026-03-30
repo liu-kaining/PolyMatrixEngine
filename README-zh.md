@@ -300,7 +300,8 @@ docker compose logs -f api
 | `MAX_EXPOSURE_PER_SECTOR` | 单赛道/标签最大允许敞口（USDC） | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | 单赛道/标签最大同时做市名额 | `2` |
 | `GLOBAL_MAX_BUDGET` | 跨全市场绝对资金红线 (USDC) | `1000.0` |
-| `MAX_EXPOSURE_PER_MARKET` | 单市场最大敞口（USDC） | `50.0` |
+| `MAX_EXPOSURE_PER_MARKET` | **二元**市场（2 个 CLOB outcome）单市场上限（USDC）；MTM+pending 与 Watchdog 共用 | `50.0` |
+| `MAX_EXPOSURE_CATEGORICAL` | **分类/多选**（>2 个 outcome）更严上限（USDC），语义同上 | `30.0` |
 | `EXPOSURE_TOLERANCE` | 对账覆盖阈值 | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | 本地成交后跳过覆盖的秒数 | `8.0` |
 | `RECONCILIATION_INTERVAL_SEC` | Watchdog 周期 Data API 对账间隔（秒） | `60` |
