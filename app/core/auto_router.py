@@ -277,6 +277,79 @@ async def _fetch_gamma_meta_for_conditions(condition_ids: List[str]) -> Dict[str
     return result
 
 
+async def _fetch_book_snapshot(token_id: str) -> Optional[dict]:
+    """Fetch orderbook from CLOB REST for quality checks."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": token_id},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.debug("[AutoRouter] Book fetch failed for %s: %s", token_id[:10], e)
+    return None
+
+
+def _extract_yes_token_from_gamma(raw: Optional[dict]) -> Optional[str]:
+    """Extract YES token_id (first clobTokenIds entry) from Gamma raw dict."""
+    if not raw:
+        return None
+    clob = raw.get("clobTokenIds") or raw.get("clob_token_ids")
+    tokens = None
+    if isinstance(clob, str):
+        try:
+            tokens = json.loads(clob)
+        except Exception:
+            return None
+    elif isinstance(clob, list):
+        tokens = clob
+    if isinstance(tokens, list) and len(tokens) >= 1:
+        return str(tokens[0])
+    return None
+
+
+async def _check_book_quality(token_id: str) -> Tuple[bool, str]:
+    """
+    V8.0: Check orderbook quality for a market candidate.
+    Returns (pass, reason).
+    """
+    min_depth = float(getattr(settings, "ROUTER_MIN_BOOK_DEPTH_USD", 50.0))
+    max_spread = float(getattr(settings, "ROUTER_MAX_BOOK_SPREAD", 0.08))
+    avoid_band = float(getattr(settings, "ROUTER_AVOID_MIDPOINT_BAND", 0.10))
+
+    book = await _fetch_book_snapshot(token_id)
+    if not book:
+        return True, "book_fetch_failed_passthrough"  # fail-open
+
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    if not bids or not asks:
+        return False, "empty_book"
+
+    # Check spread
+    best_bid = float(bids[0]["price"]) if bids else 0
+    best_ask = float(asks[0]["price"]) if asks else 1
+    spread = best_ask - best_bid
+    if spread > max_spread:
+        return False, f"spread_too_wide({spread:.4f}>{max_spread})"
+
+    # Check midpoint — avoid markets near 0.50 (maximum uncertainty)
+    mid = (best_bid + best_ask) / 2.0
+    if abs(mid - 0.50) < avoid_band:
+        return False, f"midpoint_too_uncertain({mid:.4f})"
+
+    # Check depth (top-3 notional on each side)
+    bid_depth = sum(float(b["price"]) * float(b["size"]) for b in bids[:3])
+    ask_depth = sum(float(a["price"]) * float(a["size"]) for a in asks[:3])
+    total_depth = bid_depth + ask_depth
+    if total_depth < min_depth:
+        return False, f"thin_book(${total_depth:.1f}<${min_depth})"
+
+    return True, "ok"
+
+
 async def _radar_scan() -> List[dict]:
     """
     Fetch rewards markets from official CLOB rewards API (cursor pagination),
@@ -405,6 +478,47 @@ async def _radar_scan() -> List[dict]:
         m for m in shortlisted if not _within_event_horizon(m.get("end_date"), event_horizon_hours)
     ]
     filtered.sort(key=lambda x: x["score"], reverse=True)
+
+    # V8.0: Book quality filter — check top candidates' orderbooks via CLOB REST
+    quality_check_count = min(len(filtered), top_n * 2)
+    candidates = filtered[:quality_check_count]
+    if candidates:
+        logger.info(
+            "[AutoRouter] V8.0 book quality check for %d candidates...", len(candidates),
+        )
+        # Resolve YES token_ids from gamma metadata
+        quality_tasks = []
+        cid_for_task = []
+        for m in candidates:
+            cid = m["condition_id"]
+            raw = gamma_meta_all.get(cid)
+            yes_tid = _extract_yes_token_from_gamma(raw)
+            if yes_tid:
+                quality_tasks.append(_check_book_quality(yes_tid))
+                cid_for_task.append(cid)
+            else:
+                # No token_id available — pass through
+                async def _pass(): return (True, "no_token")
+                quality_tasks.append(_pass())
+                cid_for_task.append(cid)
+
+        quality_results = await asyncio.gather(*quality_tasks, return_exceptions=True)
+        rejected_cids: Set[str] = set()
+        for cid, result in zip(cid_for_task, quality_results):
+            if isinstance(result, Exception):
+                continue  # fail-open
+            passed, reason = result
+            if not passed:
+                rejected_cids.add(cid)
+                logger.info("[AutoRouter] Rejected %s: %s", cid[:10], reason)
+
+        if rejected_cids:
+            filtered = [m for m in filtered if m["condition_id"] not in rejected_cids]
+            logger.info(
+                "[AutoRouter] Book quality filter: %d rejected, %d remaining.",
+                len(rejected_cids), len(filtered),
+            )
+
     return filtered[:top_n]
 
 

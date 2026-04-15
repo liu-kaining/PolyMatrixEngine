@@ -297,6 +297,74 @@ class UserStreamGateway:
         if status_for_event and market_id and token_id:
             await self._publish_order_status_event(market_id, token_id, order_id, status_for_event)
 
+        # V8.0: Hedge on Fill — accumulate unhedged BUY fills, trigger hedge when >= 5 shares
+        from app.core.config import settings
+        if (
+            getattr(settings, "HEDGE_ON_FILL", False)
+            and side == "BUY"
+            and market_id
+            and token_id
+        ):
+            tokens = self.market_tokens.get(market_id)
+            is_yes = tokens and token_id == tokens.get("yes_token_id")
+            total_unhedged, avg_price = await inventory_state.accumulate_unhedged_fill(
+                market_id, is_yes, filled_size, fill_price
+            )
+            if total_unhedged >= 5.0:
+                _safe_create_task(self._place_hedge_sell(
+                    market_id, token_id, is_yes, total_unhedged, avg_price
+                ))
+
+    async def _place_hedge_sell(
+        self, market_id: str, token_id: str, is_yes: bool,
+        total_size: float, avg_price: float
+    ):
+        """Place an immediate SELL order to neutralize accumulated BUY fills. Fire-and-forget."""
+        from app.core.config import settings
+        from app.oms.core import oms
+        from app.models.db_models import OrderSide
+
+        margin = float(getattr(settings, "HEDGE_MARGIN_CENTS", 0.02))
+        hedge_price = round(avg_price + margin, 2)
+        hedge_price = max(0.01, min(0.99, hedge_price))
+        hedge_size = round(total_size, 1)
+
+        if hedge_size < 5.0:
+            return
+
+        logger.info(
+            f"[HEDGE] Accumulated unhedged {total_size:.1f} shares @ avg {avg_price:.4f} "
+            f"-> placing SELL hedge @{hedge_price} (margin={margin}) for {market_id[:10]}"
+        )
+
+        try:
+            order_id = await oms.create_order(
+                condition_id=market_id,
+                token_id=token_id,
+                side=OrderSide.SELL,
+                price=hedge_price,
+                size=hedge_size,
+            )
+            if not order_id:
+                logger.warning("[HEDGE] OMS returned None for hedge SELL — order may have failed. Skipping notification.")
+                return
+            # Clear cumulative unhedged tracker now that hedge is placed
+            await inventory_state.clear_unhedged(market_id, is_yes)
+            # Notify the QuotingEngine so it can track the hedge lifecycle
+            await redis_client.publish(
+                f"hedge:{market_id}:{token_id}",
+                {
+                    "action": "hedge_placed",
+                    "order_id": order_id,
+                    "price": hedge_price,
+                    "size": hedge_size,
+                    "cost_basis": avg_price,
+                },
+            )
+            logger.info(f"[HEDGE] Hedge SELL placed: {order_id} @ {hedge_price}")
+        except Exception as e:
+            logger.error(f"[HEDGE] Failed to place hedge SELL: {e}", exc_info=True)
+
     async def handle_cancellation(self, order_id: str):
         """Handle order cancellation, including dust/partial fill cleanup."""
         market_id = None

@@ -106,15 +106,54 @@ class RiskMonitor:
                 )
                 await self.trigger_kill_switch(cid, session)
 
-        # 4. Global Budget Check (all in Dollars)
+        # 4. V8.0: Per-market unrealized PnL stop-loss
+        stop_loss_usd = float(getattr(settings, "PER_MARKET_STOP_LOSS_USD", 5.0))
+        if stop_loss_usd > 0:
+            for cid in active_cids:
+                try:
+                    fv_anchor = await redis_client.get_state(f"fv_anchor:{cid}")
+                    if not fv_anchor or "fv_yes" not in fv_anchor:
+                        continue
+                    fv_yes = float(fv_anchor["fv_yes"])
+                    pnl_data = await inventory_state.get_unrealized_pnl(cid, fv_yes)
+                    total_unrealized = float(pnl_data.get("total_unrealized_pnl", 0.0))
+                    if total_unrealized < -stop_loss_usd:
+                        logger.critical(
+                            f"PER-MARKET STOP-LOSS: {cid[:12]} unrealized PnL ${total_unrealized:.2f} "
+                            f"< -${stop_loss_usd:.2f}. Triggering graceful_exit."
+                        )
+                        await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
+                except Exception as e:
+                    logger.debug(f"PnL stop-loss check error for {cid[:12]}: {e}")
+
+        # 5. Global Budget Check (all in Dollars)
         global_used_dollars = await inventory_state.get_global_used_dollars()
-        global_max = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
+        global_max = float(getattr(settings, "GLOBAL_MAX_BUDGET", 280.0))
         if global_used_dollars > global_max * 1.05:
             logger.critical(
                 f"GLOBAL RISK BREACH: Total used ${global_used_dollars:.2f} exceeds budget ${global_max:.2f}!"
             )
-             # Note: We don't trigger a global kill switch here yet to avoid market-wide panic,
-             # but we log it as critical. The per-engine balance_precheck is the primary preventer.
+            # V8.0: Actually take action — find worst-performing market and exit it
+            worst_cid = None
+            worst_pnl = 0.0
+            for cid in active_cids:
+                try:
+                    fv_anchor = await redis_client.get_state(f"fv_anchor:{cid}")
+                    if not fv_anchor or "fv_yes" not in fv_anchor:
+                        continue
+                    pnl_data = await inventory_state.get_unrealized_pnl(cid, float(fv_anchor["fv_yes"]))
+                    total_pnl = float(pnl_data.get("total_unrealized_pnl", 0.0))
+                    if total_pnl < worst_pnl:
+                        worst_pnl = total_pnl
+                        worst_cid = cid
+                except Exception:
+                    pass
+            if worst_cid:
+                logger.critical(
+                    f"GLOBAL BREACH ACTION: Exiting worst market {worst_cid[:12]} "
+                    f"(unrealized PnL: ${worst_pnl:.2f})"
+                )
+                await redis_client.publish(f"control:{worst_cid}", {"action": "graceful_exit"})
                     
     async def trigger_kill_switch(self, condition_id: str, session):
         """Emergency procedure: cancel all orders, suspend quoting"""

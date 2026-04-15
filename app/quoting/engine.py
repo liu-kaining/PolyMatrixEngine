@@ -91,6 +91,10 @@ class QuotingEngine:
         self._shutdown_requested = False  # Set when exposure cleared so run() can break
         self.last_grid_reset_time = time.time()
 
+        # V8.0: Hedge tracking — lifecycle managed in on_tick, created by user_stream on fill
+        self.hedge_sell_pending: Optional[Dict[str, Any]] = None
+        self._hedge_ticks_waited: int = 0
+
         # Outcomes: 2 = binary YES/NO; >2 = categorical (stricter MAX_EXPOSURE_CATEGORICAL)
         self.outcome_count: int = 2
         # Rewards Farming: loaded once from Redis on first tick
@@ -117,10 +121,12 @@ class QuotingEngine:
 
         pubsub = redis_client.client.pubsub()
         order_status_channel = f"order_status:{self.condition_id}:{self.token_id}"
+        hedge_channel = f"hedge:{self.condition_id}:{self.token_id}"
         await pubsub.subscribe(
             f"tick:{self.token_id}",
             f"control:{self.condition_id}",
             order_status_channel,
+            hedge_channel,
         )
         logger.info(
             f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. "
@@ -148,6 +154,8 @@ class QuotingEngine:
                             await self.on_tick(data)
                     elif channel == order_status_channel:
                         await self.on_order_status_message(data)
+                    elif channel == hedge_channel:
+                        await self.on_hedge_message(data)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -165,6 +173,7 @@ class QuotingEngine:
                 f"tick:{self.token_id}",
                 f"control:{self.condition_id}",
                 order_status_channel,
+                hedge_channel,
             )
             await pubsub.close()
             logger.info(f"Redis PubSub closed for Token {self.token_id}")
@@ -225,6 +234,37 @@ class QuotingEngine:
             )
             # Release locked margin immediately
             await self._update_pending_buy_notional()
+
+    async def on_hedge_message(self, data: dict):
+        """Track hedge SELL orders created by user_stream on BUY fills."""
+        action = data.get("action")
+        if action == "hedge_placed":
+            hedge_order_id = data.get("order_id")
+            hedge_price = float(data.get("price", 0))
+            hedge_size = float(data.get("size", 0))
+            self.hedge_sell_pending = {
+                "price": hedge_price,
+                "size": hedge_size,
+                "cost_basis": float(data.get("cost_basis", 0)),
+                "order_id": hedge_order_id,
+            }
+            self._hedge_ticks_waited = 0
+            # CRITICAL: Register hedge order in active_orders so on_tick lifecycle
+            # check can detect fill/cancel via on_order_status_message.
+            # Without this, on_tick immediately clears the hedge as "resolved"
+            # because hedge orders bypass place_orders() and aren't tracked.
+            if hedge_order_id:
+                self.active_orders[hedge_order_id] = {
+                    "side": "SELL",
+                    "price": hedge_price,
+                    "size": hedge_size,
+                    "created_ts": time.time(),
+                }
+            logger.info(
+                f"[{self.token_id[:6]}] [HEDGE] Tracking hedge SELL: "
+                f"order_id={str(hedge_order_id)[:10] if hedge_order_id else 'None'}, "
+                f"price={hedge_price}, size={hedge_size}"
+            )
 
     async def on_control_message(self, data: dict):
         """Handle incoming signals from the Watchdog, API, or Auto-Router"""
@@ -357,7 +397,9 @@ class QuotingEngine:
         """
         auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
         max_exposure = self._per_market_exposure_cap()
-        total_slots = max(1, self.grid_levels * 2)
+        # V8.0: single-side quoting uses half the slots → each BUY gets larger budget share
+        side_multiplier = 1 if getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False) else 2
+        total_slots = max(1, self.grid_levels * side_multiplier)
         budget_per_order = max_exposure / total_slots
 
         # 1. Determine target size: max(base_size, rewards_min*1.05) when rewards exist
@@ -625,6 +667,59 @@ class QuotingEngine:
                 return
             fair_value, dynamic_spread, fv_yes = unified
 
+            # V8.0: Single-sided cheap-side gate — only BUY tokens priced below CHEAP_SIDE_MAX_PRICE
+            cheap_side_only = getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False)
+            cheap_max = float(getattr(settings, "CHEAP_SIDE_MAX_PRICE", 0.45))
+            cheap_side_blocked = cheap_side_only and fair_value >= cheap_max
+
+            if cheap_side_blocked and current_exposure_for_logic < 5.0 and not self.exit_mode:
+                # No exposure to unwind and this is the expensive side → nothing to do
+                await self._publish_engine_mode(
+                    "CHEAP_SIDE_GATE", fair_value=fair_value, fv_yes=fv_yes,
+                    current_exposure=current_exposure, opposite_exposure=opposite_exposure,
+                )
+                logger.debug(
+                    f"[{self.token_id[:6]}] CHEAP_SIDE_GATE: FV {fair_value:.4f} >= {cheap_max}. "
+                    "No BUY on expensive side, no exposure to unwind. Skip."
+                )
+                return
+
+            # V8.0: Hedge SELL lifecycle — if waiting, count ticks and decay price toward breakeven
+            if self.hedge_sell_pending and not self.exit_mode:
+                self._hedge_ticks_waited += 1
+                hedge_order_id = self.hedge_sell_pending.get("order_id")
+                # Check if hedge order was already filled/canceled
+                if hedge_order_id and hedge_order_id not in self.active_orders:
+                    logger.info(f"[{self.token_id[:6]}] [HEDGE] Hedge order resolved (filled/canceled). Clearing tracker.")
+                    self.hedge_sell_pending = None
+                    self._hedge_ticks_waited = 0
+                elif self._hedge_ticks_waited > int(getattr(settings, "HEDGE_DECAY_TICKS", 10)):
+                    # Decay: lower hedge price toward cost_basis (breakeven)
+                    cost_basis = float(self.hedge_sell_pending.get("cost_basis", 0))
+                    original_margin = float(getattr(settings, "HEDGE_MARGIN_CENTS", 0.02))
+                    decay_steps = int(getattr(settings, "HEDGE_DECAY_TICKS", 10))
+                    ticks_past = self._hedge_ticks_waited - decay_steps
+                    decay_factor = max(0.0, 1.0 - (ticks_past / max(1, decay_steps * 2)))
+                    new_price = round(cost_basis + original_margin * decay_factor, 2)
+                    new_price = max(0.01, min(0.99, new_price))
+                    old_price = self.hedge_sell_pending.get("price", 0)
+                    if abs(new_price - old_price) >= 0.01 and hedge_order_id:
+                        logger.info(
+                            f"[{self.token_id[:6]}] [HEDGE DECAY] Lowering hedge SELL: "
+                            f"{old_price} -> {new_price} (cost_basis={cost_basis})"
+                        )
+                        # Cancel old hedge and let sync_orders_diff place new one
+                        await oms.cancel_order(hedge_order_id)
+                        self.active_orders.pop(hedge_order_id, None)
+                        self.hedge_sell_pending["price"] = new_price
+                        self.hedge_sell_pending["order_id"] = None
+                    if decay_factor <= 0:
+                        logger.warning(
+                            f"[{self.token_id[:6]}] [HEDGE] Decay exhausted at breakeven. Clearing hedge tracker."
+                        )
+                        self.hedge_sell_pending = None
+                        self._hedge_ticks_waited = 0
+
             # Strict per-market "used" budget: MTM inventory + all active BUY notional (bulletproof vs stale capital_used).
             fv_y_anchor = max(0.01, min(0.99, float(fv_yes)))
             held_inventory_value = yes_exposure * fv_y_anchor + no_exposure * (1.0 - fv_y_anchor)
@@ -719,11 +814,16 @@ class QuotingEngine:
                 else:
                     logger.warning(
                         f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
-                        "MAKER UNWINDING (earn spread)."
+                        "MAKER UNWINDING (earn spread + ask-side rewards)."
                     )
                     ask_price = round(fair_value + anchor_distance, 2)
                     safe_maker_floor = round(best_bid_price + self.tick_size, 2)
                     ask_price = max(safe_maker_floor, ask_price)
+                    # V8.0: Clamp SELL price within rewards band to earn ask-side rewards
+                    if self.rewards_max_spread > 0:
+                        rewards_ceil = round(fair_value + self.rewards_max_spread / 2.0, 2)
+                        if ask_price > rewards_ceil:
+                            ask_price = max(safe_maker_floor, rewards_ceil)
                     
                     if ask_price > 0.99:
                         logger.warning(
@@ -741,6 +841,9 @@ class QuotingEngine:
                         )
                     else:
                         sell_size = min(current_exposure, max(self.base_size, 5.0))
+                        # V8.0: Ensure SELL size meets rewards_min_size for ask-side rewards
+                        if self.rewards_min_size > 0 and sell_size < self.rewards_min_size and current_exposure >= self.rewards_min_size:
+                            sell_size = min(current_exposure, self.rewards_min_size)
                         orders_payload.append(
                             {
                                 "condition_id": self.condition_id,
@@ -779,6 +882,7 @@ class QuotingEngine:
                 and not self.exit_mode
                 and not strict_budget_block_buys
                 and not freeze_buys_post_reset_reconcile_fail
+                and not cheap_side_blocked
             ):
                 if cross_token_locked:
                     logger.warning(
@@ -835,6 +939,28 @@ class QuotingEngine:
                             0.0, buy_budget_remaining - effective_size * bid_price
                         )
 
+            # V8.0: Inject hedge SELL into orders_payload if pending and needs (re-)placement
+            if (
+                self.hedge_sell_pending
+                and not self.exit_mode
+                and self.hedge_sell_pending.get("order_id") is None
+                and current_exposure >= 5.0
+            ):
+                h_price = float(self.hedge_sell_pending["price"])
+                h_size = min(float(self.hedge_sell_pending["size"]), current_exposure)
+                if h_size >= 5.0:
+                    orders_payload.append({
+                        "condition_id": self.condition_id,
+                        "token_id": self.token_id,
+                        "side": OrderSide.SELL,
+                        "price": max(0.01, min(0.99, h_price)),
+                        "size": h_size,
+                    })
+                    logger.info(
+                        f"[{self.token_id[:6]}] [HEDGE] Injecting hedge SELL into grid: "
+                        f"price={h_price}, size={h_size}"
+                    )
+
             if self.exit_mode:
                 mode = "GRACEFUL_EXIT"
             elif is_extreme_long:
@@ -843,6 +969,10 @@ class QuotingEngine:
                 mode = "POST_RESET_RECONCILE_FREEZE"
             elif cross_token_locked:
                 mode = "LOCKED_BY_OPPOSITE"
+            elif cheap_side_blocked:
+                mode = "CHEAP_SIDE_GATE"
+            elif self.hedge_sell_pending:
+                mode = "HEDGING"
             else:
                 mode = "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
 
@@ -1178,9 +1308,22 @@ class QuotingEngine:
                     "size": float(order_req["size"]),
                     "created_ts": time.time(),
                 }
+                # V8.0: Track hedge SELL order_id for lifecycle management
+                if (
+                    self.hedge_sell_pending
+                    and order_req["side"] == OrderSide.SELL
+                    and self.hedge_sell_pending.get("order_id") is None
+                    and abs(float(order_req["price"]) - self.hedge_sell_pending.get("price", -1)) < 0.005
+                ):
+                    self.hedge_sell_pending["order_id"] = res
+                    logger.info(f"[{self.token_id[:6]}] [HEDGE] Hedge SELL order tracked: {res[:10]}")
 
     async def cancel_all_orders(self, force_evict: bool = False):
         """Cancel current active grid and ensure no orphan orders remain."""
+        # V8.0: Clear hedge tracker — the hedge order will be canceled below
+        self.hedge_sell_pending = None
+        self._hedge_ticks_waited = 0
+
         if not self.active_orders:
             # Still update notional to 0 just to be sure
             await self._update_pending_buy_notional()

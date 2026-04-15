@@ -96,6 +96,11 @@ class InventoryStateManager:
             "realized_pnl": realized_pnl,
             "last_local_fill_timestamp": 0.0,
             "updated_at": time.time(),
+            # V8.0: cumulative unhedged BUY fills (size + weighted avg price)
+            "yes_unhedged_size": 0.0,
+            "yes_unhedged_cost": 0.0,
+            "no_unhedged_size": 0.0,
+            "no_unhedged_cost": 0.0,
         }
         async with self._lock:
             current = self._state.setdefault(market_id, snapshot)
@@ -160,6 +165,80 @@ class InventoryStateManager:
         async with self._lock:
             snap = self._state.get(market_id) or {}
             return float(snap.get("last_local_fill_timestamp", 0.0))
+
+    async def get_avg_cost_basis(self, market_id: str, is_yes: bool) -> float:
+        """Return average cost basis (capital_used / exposure) for requested side. 0 if no exposure.
+        Used by watchdog PnL reporting and dashboard observability."""
+        await self.ensure_loaded(market_id)
+        async with self._lock:
+            snap = self._state.get(market_id) or {}
+            if is_yes:
+                exp = float(snap.get("yes_exposure", 0.0))
+                cap = float(snap.get("yes_capital_used", 0.0))
+            else:
+                exp = float(snap.get("no_exposure", 0.0))
+                cap = float(snap.get("no_capital_used", 0.0))
+            return cap / exp if exp > 1e-9 else 0.0
+
+    async def get_unrealized_pnl(self, market_id: str, fv_yes: float) -> Dict[str, float]:
+        """
+        Compute per-side and total unrealized PnL based on current fair value.
+        fv_yes: current YES token fair value [0, 1]. NO is derived as 1 - fv_yes.
+        Returns dict with yes_unrealized_pnl, no_unrealized_pnl, total_unrealized_pnl.
+        """
+        await self.ensure_loaded(market_id)
+        async with self._lock:
+            snap = self._state.get(market_id) or {}
+            yes_exp = float(snap.get("yes_exposure", 0.0))
+            no_exp = float(snap.get("no_exposure", 0.0))
+            yes_cap = float(snap.get("yes_capital_used", 0.0))
+            no_cap = float(snap.get("no_capital_used", 0.0))
+
+        fv_no = max(0.01, min(0.99, 1.0 - fv_yes))
+        fv_yes = max(0.01, min(0.99, fv_yes))
+
+        # Unrealized PnL = current_value - cost_basis
+        yes_unrealized = (yes_exp * fv_yes - yes_cap) if yes_exp > 1e-9 else 0.0
+        no_unrealized = (no_exp * fv_no - no_cap) if no_exp > 1e-9 else 0.0
+
+        return {
+            "yes_unrealized_pnl": yes_unrealized,
+            "no_unrealized_pnl": no_unrealized,
+            "total_unrealized_pnl": yes_unrealized + no_unrealized,
+        }
+
+    async def accumulate_unhedged_fill(
+        self, market_id: str, is_yes: bool, filled_size: float, fill_price: float
+    ) -> Tuple[float, float]:
+        """
+        V8.0: Accumulate a BUY fill into unhedged tracking.
+        Returns (total_unhedged_size, weighted_avg_price) after accumulation.
+        """
+        await self.ensure_loaded(market_id)
+        async with self._lock:
+            snap = self._state[market_id]
+            size_key = "yes_unhedged_size" if is_yes else "no_unhedged_size"
+            cost_key = "yes_unhedged_cost" if is_yes else "no_unhedged_cost"
+            old_size = float(snap.get(size_key, 0.0))
+            old_cost = float(snap.get(cost_key, 0.0))
+            new_size = old_size + filled_size
+            new_cost = old_cost + filled_size * fill_price
+            snap[size_key] = new_size
+            snap[cost_key] = new_cost
+            avg_price = new_cost / new_size if new_size > 1e-9 else fill_price
+            return new_size, avg_price
+
+    async def clear_unhedged(self, market_id: str, is_yes: bool) -> None:
+        """V8.0: Reset unhedged tracking after hedge order is placed."""
+        await self.ensure_loaded(market_id)
+        async with self._lock:
+            snap = self._state[market_id]
+            if is_yes:
+                snap["yes_unhedged_size"] = 0.0
+                snap["yes_unhedged_cost"] = 0.0
+            else:
+                snap["no_unhedged_size"] = 0.0
+                snap["no_unhedged_cost"] = 0.0
 
     async def apply_fill(
         self,

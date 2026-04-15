@@ -290,15 +290,21 @@ async def get_markets_status(
     def _dust_filter(e: float) -> float:
         return 0.0 if abs(e) < 1.0 else e
 
+    cheap_side_only = getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False)
+
     def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
         if market_status == "suspended":
             return "SUSPENDED"
+        if market_status == "exited":
+            return "EXITED"
         own_exp = _dust_filter(own_exp)
         opp_exp = _dust_filter(opp_exp)
         if own_exp >= liquidate_threshold:
             return "LIQUIDATING"
         if opp_exp >= liquidate_threshold:
             return "LOCKED_BY_OPPOSITE"
+        if cheap_side_only:
+            return "CHEAP_SIDE_QUOTING"
         return "QUOTING"
 
     markets = []
@@ -331,6 +337,15 @@ async def get_markets_status(
         r_max_spread = rewards_data.get("rewards_max_spread")
         r_rate = rewards_data.get("reward_rate_per_day")
 
+        # V8.0: unrealized PnL for dashboard
+        unrealized_pnl = None
+        if fv_yes is not None:
+            try:
+                pnl_data = await inventory_state.get_unrealized_pnl(cid, fv_yes)
+                unrealized_pnl = pnl_data.get("total_unrealized_pnl")
+            except Exception:
+                pass
+
         markets.append(
             {
                 "condition_id": cid,
@@ -347,6 +362,7 @@ async def get_markets_status(
                 "rewards_min_size": r_min_size,
                 "rewards_max_spread": r_max_spread,
                 "reward_rate_per_day": r_rate,
+                "unrealized_pnl": unrealized_pnl,
             }
         )
 
