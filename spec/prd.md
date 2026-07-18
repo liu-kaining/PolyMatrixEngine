@@ -1,5 +1,7 @@
 ## PolyMatrix Engine: 产品需求文档 (PRD)
 
+> **ARCHIVED：整改前产品需求。** 一键强平、奖励优先准入等内容不再是当前产品行为；当前实盘状态为 NO-GO，以 [`LIVE_TRADING_REMEDIATION_PLAN.md`](./LIVE_TRADING_REMEDIATION_PLAN.md) 和 README 为准。
+
 ### 1. 产品愿景与定位
 
 PolyMatrix Engine 面向 Polymarket，提供自动化高频做市与轻量统计套利能力。

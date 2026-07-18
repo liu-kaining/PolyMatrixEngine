@@ -1,6 +1,8 @@
 # PolyMatrix Engine
 ## 机构级自动化做市商系统 · 技术架构亮点
 
+> **ARCHIVED：整改前投资人材料，不可作为当前能力或实盘安全证明。** 当前实盘状态为 NO-GO；其中 liquidation、memory-first fill 和旧风控链路已删除或替换。
+
 > 本文档面向投资人，系统性地介绍 PolyMatrix Engine 的架构设计、核心技术能力、风险管理体系及自动选市场逻辑，并诚实地披露当前系统的局限性。
 
 ---

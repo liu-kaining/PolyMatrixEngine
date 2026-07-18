@@ -3,9 +3,11 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete
@@ -14,13 +16,38 @@ from app.core.config import settings
 from app.db.session import init_db, get_db, AsyncSessionLocal
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
+from app.core.admin_auth import require_admin
+from app.core.accounting_integrity import accounting_integrity_service
+from app.core.alpha_evidence import refresh_alpha_evidence_readiness
+from app.core.trading_safety import (
+    SafetyInterlockError,
+    TradingMode,
+    trading_safety,
+)
 from app.market_data.gateway import md_gateway
 from app.market_data.user_stream import user_stream
-from app.market_data.gamma_client import gamma_client
-from app.quoting.engine import start_quoting_engine
 from app.risk.watchdog import watchdog
-from app.core.market_lifecycle import start_market_making_impl, stop_all_markets
-from app.models.db_models import MarketMeta, InventoryLedger, OrderJournal, OrderSide, OrderStatus
+from app.risk.reservations import risk_reservations
+from app.oms.order_reconciliation import order_reconciliation_service
+from app.core.market_lifecycle import (
+    get_active_router_markets,
+    start_market_making_impl,
+    stop_all_markets,
+    stop_market_tasks,
+)
+from app.models.db_models import (
+    AccountingAuditRun,
+    ExchangeOrderSnapshot,
+    FillCashLedger,
+    FillEvent,
+    InventoryLedger,
+    MarketMeta,
+    OrderJournal,
+    OrderReconciliationRun,
+    OrderStatus,
+    PortfolioRiskState,
+    RiskReservation,
+)
 from logging.handlers import RotatingFileHandler
 
 # Force application timezone to Beijing (UTC+8) for consistent logging timestamps.
@@ -70,51 +97,147 @@ background_tasks = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup Events
-    logger.info(f"Starting {settings.PROJECT_NAME}")
+    logger.info(
+        "Starting %s with TRADING_MODE=%s",
+        settings.PROJECT_NAME,
+        trading_safety.mode.value,
+    )
     
     # 1. DB Initialization
     await init_db()
+    trading_safety.set_readiness("database", True, "database initialization completed")
     
     # 2. Redis Connection
     await redis_client.connect()
+    trading_safety.set_readiness("redis", True, "Redis ping succeeded")
 
     # 2.5 In-memory inventory state manager
     await inventory_state.start()
+    await inventory_state.load_all()
 
-    # 2.6 Sweep historical PENDING ghost orders before starting background services.
-    from app.oms.core import oms
+    # 2.6 Inventory/accounting preflight. Exchange order facts are reconciled below only
+    # in a valid requested live process; disabled/paper startup performs no exchange I/O.
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(OrderJournal).filter(OrderJournal.status == OrderStatus.PENDING)
+            select(OrderJournal).filter(
+                OrderJournal.status.in_([OrderStatus.PENDING, OrderStatus.UNKNOWN])
+            )
         )
-        pending_orders = result.scalars().all()
-        if pending_orders:
-            logger.warning(f"扫地僧启动，准备清理 {len(pending_orders)} 条历史遗留的 PENDING 幽灵订单...")
-        for order in pending_orders:
+        unresolved_orders = result.scalars().all()
+        if unresolved_orders:
+            logger.warning(
+                "[SAFETY] Found %d PENDING/UNKNOWN orders; authoritative reconciliation "
+                "must classify them before new live risk is allowed.",
+                len(unresolved_orders),
+            )
+        legacy_ledgers = (
+            await session.execute(
+                select(InventoryLedger.market_id).filter(
+                    InventoryLedger.accounting_version != "v2"
+                )
+            )
+        ).scalars().all()
+        if legacy_ledgers:
+            trading_safety.halt(
+                f"{len(legacy_ledgers)} inventory ledgers require a v2 offline accounting rebuild"
+            )
+            trading_safety.set_readiness(
+                "positions_reconciled",
+                False,
+                "legacy v1 PnL ledgers require offline rebuild",
+            )
+            logger.critical(
+                "[SAFETY] Found %d legacy v1 accounting ledgers. New live orders remain blocked.",
+                len(legacy_ledgers),
+            )
+
+    # 2.7 Local-only deterministic accounting replay. This performs no exchange
+    # request and blocks live risk on legacy ledgers, missing fills/cash facts,
+    # unknown fees or any non-fill inventory mutation.
+    try:
+        await accounting_integrity_service.audit()
+    except Exception:
+        logger.critical(
+            "[SAFETY] Accounting integrity audit failed; process remains halted."
+        )
+
+    # 2.8 Local-only strategy evidence verification. A boolean is not proof:
+    # report hash, sample coverage, fee completeness, out-of-sample checks and
+    # positive lower confidence bounds must all pass.
+    refresh_alpha_evidence_readiness()
+
+    if trading_safety.mode is TradingMode.LIVE:
+        from app.oms.core import oms
+
+        if trading_safety.is_static_live_armed() and not trading_safety.status()["halted"]:
+            await oms.initialize_live_client()
+        if oms.client is not None:
             try:
-                await oms.cancel_order(order.order_id)
-                order.status = OrderStatus.CANCELED  # Mark as canceled if successful
-            except Exception as e:
-                logger.warning(f"扫地僧在尝试撤销历史 PENDING 订单 {order.order_id} 时出错: {e}")
-                order.status = OrderStatus.FAILED  # Only mark failed if exception occurs
-            logger.warning(f"扫地僧已清理历史遗留的 PENDING 幽灵订单: {order.order_id}")
-        if pending_orders:
-            await session.commit()
+                await order_reconciliation_service.reconcile(oms.client)
+            except Exception:
+                # The service already records a sticky halt and failed readiness. Keep the
+                # control plane alive so operators can inspect state and attempt cancellation.
+                logger.critical(
+                    "[SAFETY] Startup order reconciliation failed; process remains halted."
+                )
+        else:
+            trading_safety.set_readiness(
+                "open_orders_reconciled",
+                False,
+                "live arm/client unavailable for authoritative reconciliation",
+            )
+    else:
+        trading_safety.set_readiness(
+            "open_orders_reconciled",
+            True,
+            "exchange order reconciliation is not required outside live mode",
+        )
+
+    # Rebuild cached reservation totals only after order reconciliation has had the
+    # opportunity to close confirmed cancel-pending reservations.
+    await risk_reservations.rebuild_and_validate()
 
     # 3. Background Services
-    task_md = asyncio.create_task(md_gateway.connect())
-    task_user = asyncio.create_task(user_stream.connect())
-    task_watchdog = asyncio.create_task(watchdog.run())
-    
-    background_tasks.add(task_md)
-    background_tasks.add(task_user)
-    background_tasks.add(task_watchdog)
+    trading_services_allowed = trading_safety.mode is not TradingMode.DISABLED
+    if trading_safety.mode is TradingMode.LIVE and not trading_safety.is_static_live_armed():
+        trading_services_allowed = False
+        trading_safety.halt("invalid or expired static live arm")
+        logger.critical(
+            "[SAFETY] Live mode requested but static arm is invalid. Network trading services were not started: %s",
+            "; ".join(trading_safety.static_live_errors()),
+        )
+    if trading_safety.mode is TradingMode.LIVE and trading_safety.status()["halted"]:
+        trading_services_allowed = False
+        logger.critical(
+            "[SAFETY] Live trading services were not started because a sticky halt is active."
+        )
 
-    if getattr(settings, "AUTO_ROUTER_ENABLED", False):
-        from app.core.auto_router import run as auto_router_run
-        task_router = asyncio.create_task(auto_router_run())
-        background_tasks.add(task_router)
-        logger.info("Auto-Router (Portfolio Manager) started.")
+    if trading_services_allowed:
+        task_md = asyncio.create_task(md_gateway.connect())
+        task_watchdog = asyncio.create_task(watchdog.run())
+        background_tasks.add(task_md)
+        background_tasks.add(task_watchdog)
+
+        # The private user stream is needed only for deliberately armed live execution.
+        if trading_safety.mode is TradingMode.LIVE:
+            task_user = asyncio.create_task(user_stream.connect())
+            background_tasks.add(task_user)
+
+        if getattr(settings, "AUTO_ROUTER_ENABLED", False):
+            try:
+                trading_safety.assert_router_start_allowed()
+            except SafetyInterlockError as e:
+                logger.critical("[SAFETY] Auto-Router blocked: %s", e)
+            else:
+                from app.core.auto_router import run as auto_router_run
+
+                task_router = asyncio.create_task(auto_router_run())
+                background_tasks.add(task_router)
+                logger.info("Auto-Router (Portfolio Manager) started.")
+    else:
+        logger.warning(
+            "[SAFETY] Trading background services are disabled; control plane remains available."
+        )
     
     yield
     
@@ -130,7 +253,7 @@ async def lifespan(app: FastAPI):
     # 2. Stop all running market engines safely (Wait for pubsub close & cancellation)
     await stop_all_markets()
     
-    # 3. Drain inventory queue safely to DB before connection closes
+    # 3. Stop the DB-authoritative inventory cache.
     await inventory_state.stop()
 
     # 3.5 Close OMS httpx connection pool (avoids FD / connector leak on reload/shutdown)
@@ -139,6 +262,8 @@ async def lifespan(app: FastAPI):
 
     # 4. Disconnect Redis safely
     await redis_client.disconnect()
+    trading_safety.set_readiness("redis", False, "application shutdown")
+    trading_safety.set_readiness("database", False, "application shutdown")
     
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
@@ -146,7 +271,11 @@ app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
 @app.get("/health")
 async def health_check():
-    health_data = {"status": "ok", "version": "0.1.0"}
+    health_data = {
+        "status": "ok",
+        "version": "0.2.0-safety-interlock",
+        "trading_safety": trading_safety.status(),
+    }
     if getattr(settings, "AUTO_ROUTER_ENABLED", False):
         try:
             from app.core.auto_router import router_state
@@ -155,7 +284,27 @@ async def health_check():
             pass
     return health_data
 
-@app.post("/markets/{condition_id}/start")
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness is fail-closed for live order submission and never exposes secrets."""
+    safety = trading_safety.status()
+    ready = (
+        trading_safety.mode is not TradingMode.LIVE
+        or safety["live_order_submission_allowed"]
+    )
+    payload = {
+        "status": "ready" if ready else "blocked",
+        "control_plane_ready": bool(
+            safety["readiness"]["database"]["ready"]
+            and safety["readiness"]["redis"]["ready"]
+        ),
+        "live_order_ready": safety["live_order_submission_allowed"],
+        "trading_safety": safety,
+    }
+    return JSONResponse(payload, status_code=200 if ready else 503)
+
+@app.post("/markets/{condition_id}/start", dependencies=[Depends(require_admin)])
 async def start_market_making(condition_id: str):
     """Add market to engine and start quoting (shared impl with Auto-Router)."""
     logger.info(f"POST /markets/{condition_id[:12]}.../start received")
@@ -167,8 +316,10 @@ async def start_market_making(condition_id: str):
         if "not found" in msg.lower():
             raise HTTPException(status_code=404, detail=msg)
         raise HTTPException(status_code=400, detail=msg)
+    except SafetyInterlockError as e:
+        raise HTTPException(status_code=423, detail=f"Trading safety interlock: {e}")
 
-@app.post("/markets/{condition_id}/stop")
+@app.post("/markets/{condition_id}/stop", dependencies=[Depends(require_admin)])
 async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_db)):
     """Soft stop: Cancel all orders and suspend quoting engine for this market"""
     from app.oms.core import oms
@@ -178,7 +329,8 @@ async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_d
     logger.info(f"Published suspend signal for {condition_id}")
     
     # Soft Cancel via Relayer (Cancel all active orders for this market)
-    await oms.cancel_market_orders(condition_id)
+    cancel_ok = await oms.cancel_market_orders(condition_id)
+    stopped_tasks = await stop_market_tasks(condition_id)
     
     # Update DB status
     result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
@@ -187,66 +339,31 @@ async def stop_market_making(condition_id: str, db: AsyncSession = Depends(get_d
         market.status = "suspended"
         await db.commit()
         
-    return {"status": "stopped", "condition_id": condition_id}
+    if not cancel_ok:
+        trading_safety.halt(
+            f"stop for {condition_id[:12]} could not confirm all order cancellations"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Engine stopped, but one or more exchange order cancellations were not confirmed",
+        )
 
-@app.post("/markets/{condition_id}/liquidate")
-async def liquidate_market(condition_id: str, db: AsyncSession = Depends(get_db)):
-    """Liquidate all positions: Cancel orders and market dump (Cross the spread)"""
-    from app.oms.core import oms
-    
-    # 1. Immediate Suspension and Soft Cancel
-    await redis_client.publish(f"control:{condition_id}", {"action": "suspend"})
-    await oms.cancel_market_orders(condition_id)
-    
-    # Update DB status
-    result = await db.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
-    market = result.scalar_one_or_none()
-    if market:
-        market.status = "suspended"
-        
-    # 2. Get current inventory
-    result_inv = await db.execute(select(InventoryLedger).filter(InventoryLedger.market_id == condition_id))
-    inv = result_inv.scalar_one_or_none()
-    
-    if not inv or not market:
-        await db.commit()
-        return {"status": "liquidated (no inventory)", "condition_id": condition_id}
-        
-    # 3. Liquidate Yes/No Exposure by crossing the spread (Taker)
-    yes_exp = float(inv.yes_exposure)
-    no_exp = float(inv.no_exposure)
-    
-    # We construct market orders (Taker). For CLOB, we place limit orders deep into the book to guarantee execution.
-    tasks = []
-    
-    # Selling Yes exposure (If we hold YES, we SELL YES at $0.01 to guarantee fill)
-    if yes_exp > 0:
-        logger.warning(f"Liquidating {yes_exp} YES exposure for {condition_id}")
-        tasks.append(oms.create_order(
-            condition_id=condition_id, 
-            token_id=market.yes_token_id, 
-            side=OrderSide.SELL, 
-            price=0.01, # Floor price to match any bid
-            size=yes_exp
-        ))
-    
-    # Selling No exposure (If we hold NO, we SELL NO at $0.01 to guarantee fill)
-    if no_exp > 0:
-        logger.warning(f"Liquidating {no_exp} NO exposure for {condition_id}")
-        tasks.append(oms.create_order(
-            condition_id=condition_id, 
-            token_id=market.no_token_id, 
-            side=OrderSide.SELL, 
-            price=0.01, # Floor price to match any bid
-            size=no_exp
-        ))
-        
-    if tasks:
-        # We don't wait for fills here; they will be handled by the user stream and update the DB automatically.
-        await asyncio.gather(*tasks, return_exceptions=True)
-    
-    await db.commit()
-    return {"status": "liquidating", "condition_id": condition_id, "yes_liquidated": yes_exp, "no_liquidated": no_exp}
+    return {
+        "status": "stopped",
+        "condition_id": condition_id,
+        "engine_tasks_stopped": stopped_tasks,
+    }
+
+@app.post("/markets/{condition_id}/liquidate", dependencies=[Depends(require_admin)])
+async def liquidate_market(condition_id: str):
+    """Permanently reject the removed unbounded-slippage liquidation endpoint."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            f"Unsafe market-dump liquidation was removed for {condition_id}. "
+            "Use /stop or /admin/halt; automated exits use the bounded depth-aware policy."
+        ),
+    )
 
 @app.get("/markets/{condition_id}/risk")
 async def get_market_risk(condition_id: str, db: AsyncSession = Depends(get_db)):
@@ -257,11 +374,20 @@ async def get_market_risk(condition_id: str, db: AsyncSession = Depends(get_db))
     if not inventory:
         raise HTTPException(status_code=404, detail="Market inventory not found")
         
+    accounting_ready = trading_safety.status()["readiness"]["accounting_integrity"][
+        "ready"
+    ]
+    verified = accounting_ready and str(inventory.accounting_version) == "v2"
+    verified_pnl = float(inventory.realized_pnl or 0) if verified else None
     return {
         "market_id": condition_id,
-        "yes_exposure": float(inventory.yes_exposure),
-        "no_exposure": float(inventory.no_exposure),
-        "realized_pnl": float(inventory.realized_pnl)
+        "yes_exposure": float(inventory.yes_exposure or 0),
+        "no_exposure": float(inventory.no_exposure or 0),
+        # Backward-compatible key, but never return an unverified number.
+        "realized_pnl": verified_pnl,
+        "net_realized_pnl": verified_pnl,
+        "pnl_status": "VERIFIED_NET" if verified else "UNVERIFIED",
+        "accounting_version": inventory.accounting_version,
     }
 
 @app.get("/markets/status")
@@ -290,21 +416,15 @@ async def get_markets_status(
     def _dust_filter(e: float) -> float:
         return 0.0 if abs(e) < 1.0 else e
 
-    cheap_side_only = getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False)
-
     def derive_mode(own_exp: float, opp_exp: float, market_status: str) -> str:
         if market_status == "suspended":
             return "SUSPENDED"
-        if market_status == "exited":
-            return "EXITED"
         own_exp = _dust_filter(own_exp)
         opp_exp = _dust_filter(opp_exp)
         if own_exp >= liquidate_threshold:
             return "LIQUIDATING"
         if opp_exp >= liquidate_threshold:
             return "LOCKED_BY_OPPOSITE"
-        if cheap_side_only:
-            return "CHEAP_SIDE_QUOTING"
         return "QUOTING"
 
     markets = []
@@ -337,15 +457,6 @@ async def get_markets_status(
         r_max_spread = rewards_data.get("rewards_max_spread")
         r_rate = rewards_data.get("reward_rate_per_day")
 
-        # V8.0: unrealized PnL for dashboard
-        unrealized_pnl = None
-        if fv_yes is not None:
-            try:
-                pnl_data = await inventory_state.get_unrealized_pnl(cid, fv_yes)
-                unrealized_pnl = pnl_data.get("total_unrealized_pnl")
-            except Exception:
-                pass
-
         markets.append(
             {
                 "condition_id": cid,
@@ -362,7 +473,6 @@ async def get_markets_status(
                 "rewards_min_size": r_min_size,
                 "rewards_max_spread": r_max_spread,
                 "reward_rate_per_day": r_rate,
-                "unrealized_pnl": unrealized_pnl,
             }
         )
 
@@ -374,13 +484,20 @@ async def get_markets_status(
 
 @app.get("/orders/active")
 async def get_active_orders(db: AsyncSession = Depends(get_db)):
-    """List all pending/open orders"""
-    result = await db.execute(select(OrderJournal).filter(OrderJournal.status.in_(["PENDING", "OPEN"])))
+    """List all pending/open/unknown orders that may still carry exchange risk."""
+    result = await db.execute(
+        select(OrderJournal).filter(
+            OrderJournal.status.in_(
+                [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.UNKNOWN]
+            )
+        )
+    )
     orders = result.scalars().all()
     
     return [
         {
-            "id": o.order_id,
+            "id": o.exchange_order_id or o.order_id,
+            "client_order_id": o.order_id,
             "market_id": o.market_id,
             "side": o.side,
             "price": float(o.price),
@@ -390,13 +507,231 @@ async def get_active_orders(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@app.post("/admin/wipe")
-async def wipe_all_data(db: AsyncSession = Depends(get_db)):
+@app.get(
+    "/admin/reconciliation/orders/latest",
+    dependencies=[Depends(require_admin)],
+)
+async def latest_order_reconciliations(
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return redacted reconciliation audit summaries, never raw exchange payloads."""
+    safe_limit = max(1, min(int(limit), 100))
+    rows = (
+        await db.execute(
+            select(OrderReconciliationRun)
+            .order_by(OrderReconciliationRun.started_at.desc())
+            .limit(safe_limit)
+        )
+    ).scalars().all()
+    return [
+        {
+            "run_id": row.run_id,
+            "status": row.status,
+            "local_order_count": row.local_order_count,
+            "exchange_open_count": row.exchange_open_count,
+            "blocker_count": row.blocker_count,
+            "summary": row.summary,
+            "started_at": row.started_at,
+            "completed_at": row.completed_at,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/admin/reconciliation/orders", dependencies=[Depends(require_admin)])
+async def reconcile_orders_now():
+    """Run read-only exchange fact collection and local reservation reconciliation."""
+    if trading_safety.mode is not TradingMode.LIVE:
+        raise HTTPException(status_code=409, detail="order reconciliation requires live mode")
+    if get_active_router_markets():
+        raise HTTPException(
+            status_code=409,
+            detail="stop all market engines before manual order reconciliation",
+        )
+    from app.oms.core import oms
+
+    if oms.client is None:
+        raise HTTPException(status_code=503, detail="CLOB client is unavailable")
+    trading_safety.set_readiness(
+        "open_orders_reconciled", False, "manual reconciliation in progress"
+    )
+    report = await order_reconciliation_service.reconcile(oms.client)
+    return {
+        "safe": report.safe,
+        "blocker_count": len(report.blockers),
+        "actions": [asdict(action) for action in report.actions],
+        "restart_required_to_clear_prior_halt": trading_safety.status()["halted"],
+    }
+
+
+@app.get(
+    "/admin/accounting/audits/latest",
+    dependencies=[Depends(require_admin)],
+)
+async def latest_accounting_audits(
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return local accounting replay results; no exchange facts are requested."""
+    safe_limit = max(1, min(int(limit), 100))
+    rows = (
+        await db.execute(
+            select(AccountingAuditRun)
+            .order_by(AccountingAuditRun.started_at.desc())
+            .limit(safe_limit)
+        )
+    ).scalars().all()
+    return [
+        {
+            "run_id": row.run_id,
+            "status": row.status,
+            "inventory_count": row.inventory_count,
+            "fill_count": row.fill_count,
+            "blocker_count": row.blocker_count,
+            "summary": row.summary,
+            "started_at": row.started_at,
+            "completed_at": row.completed_at,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/admin/accounting/audits", dependencies=[Depends(require_admin)])
+async def run_accounting_audit_now():
+    """Run a deterministic local replay only while all engines are stopped."""
+    if trading_safety.mode is not TradingMode.DISABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="manual accounting audit requires TRADING_MODE=disabled",
+        )
+    if get_active_router_markets():
+        raise HTTPException(
+            status_code=409,
+            detail="stop all market engines before accounting audit",
+        )
+    report = await accounting_integrity_service.audit()
+    return {
+        "safe": report.safe,
+        "inventory_count": report.inventory_count,
+        "fill_count": report.fill_count,
+        "blocker_count": len(report.blockers),
+        "blockers": [asdict(blocker) for blocker in report.blockers],
+        "restart_required_to_clear_prior_halt": trading_safety.status()["halted"],
+    }
+
+
+@app.post("/admin/halt", dependencies=[Depends(require_admin)])
+async def emergency_halt(db: AsyncSession = Depends(get_db)):
+    """Sticky safety halt: block new risk and attempt to suspend/cancel every known market."""
+    from app.oms.core import oms
+
+    trading_safety.halt("authenticated manual emergency halt")
+    active = set(get_active_router_markets())
+    journal_markets = set(
+        (
+            await db.execute(
+                select(OrderJournal.market_id).filter(
+                    OrderJournal.status.in_(
+                        [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.UNKNOWN]
+                    )
+                )
+            )
+        ).scalars().all()
+    )
+    targets = sorted(active.union(journal_markets))
+    results = {}
+    for condition_id in targets:
+        if condition_id in active:
+            await redis_client.publish(
+                f"control:{condition_id}", {"action": "suspend"}
+            )
+        cancel_ok = await oms.cancel_market_orders(condition_id)
+        stopped_tasks = (
+            await stop_market_tasks(condition_id) if condition_id in active else 0
+        )
+        results[condition_id] = {
+            "cancel_confirmed": cancel_ok,
+            "engine_tasks_stopped": stopped_tasks,
+        }
+    if targets:
+        markets = (
+            await db.execute(
+                select(MarketMeta).filter(MarketMeta.condition_id.in_(targets))
+            )
+        ).scalars().all()
+        for market in markets:
+            market.status = "suspended"
+        await db.commit()
+    return {
+        "status": "halted",
+        "new_live_orders_blocked": True,
+        "markets": results,
+    }
+
+
+@app.post("/admin/wipe", dependencies=[Depends(require_admin)])
+async def wipe_all_data(
+    db: AsyncSession = Depends(get_db),
+    confirmation: Optional[str] = Header(default=None, alias="X-Confirm-Wipe"),
+):
     """
     DANGER: Wipe all local state (Postgres + Redis) for a clean reset.
     Intended for development / manual recovery only.
     """
+    if not bool(getattr(settings, "ENABLE_ADMIN_WIPE", False)):
+        raise HTTPException(status_code=403, detail="ADMIN wipe is disabled by configuration")
+    if trading_safety.mode is not TradingMode.DISABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="ADMIN wipe requires TRADING_MODE=disabled",
+        )
+    active = get_active_router_markets()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"ADMIN wipe blocked while {len(active)} market engines are active",
+        )
+    if confirmation != "WIPE_LOCAL_STATE_IRREVERSIBLY":
+        raise HTTPException(
+            status_code=400,
+            detail="Missing exact X-Confirm-Wipe safety phrase",
+        )
+
+    unresolved_orders = (
+        await db.execute(
+            select(OrderJournal.order_id).filter(
+                OrderJournal.status.in_(
+                    [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.UNKNOWN]
+                )
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    nonzero_inventory = (
+        await db.execute(
+            select(InventoryLedger.market_id).filter(
+                (InventoryLedger.yes_exposure > 0)
+                | (InventoryLedger.no_exposure > 0)
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if unresolved_orders or nonzero_inventory:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "ADMIN wipe is blocked while unresolved orders or nonzero positions exist; "
+                "preserve local evidence and reconcile/recover first"
+            ),
+        )
+
     # 1. Wipe Postgres tables in safe order (children first).
+    await db.execute(delete(ExchangeOrderSnapshot))
+    await db.execute(delete(OrderReconciliationRun))
+    await db.execute(delete(AccountingAuditRun))
+    await db.execute(delete(FillCashLedger))
+    await db.execute(delete(FillEvent))
+    await db.execute(delete(RiskReservation))
+    await db.execute(delete(PortfolioRiskState))
     await db.execute(delete(OrderJournal))
     await db.execute(delete(InventoryLedger))
     await db.execute(delete(MarketMeta))

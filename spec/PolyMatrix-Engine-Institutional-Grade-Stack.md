@@ -1,5 +1,7 @@
 # PolyMatrix Engine: Building an Institutional-Grade Autonomous Market-Making Stack for Polymarket
 
+> **ARCHIVED pre-remediation narrative.** This is not evidence of institutional readiness or profitability. Current live status is NO-GO; use the repository README and `LIVE_TRADING_REMEDIATION_PLAN.md` for current behavior.
+
 **PolyMatrix Engine** is not a hobby bot, a weekend trading script, or a thin wrapper around exchange APIs. It is a full-stack autonomous market-making system engineered for one of the hardest execution environments in crypto prediction markets: live, reward-driven, binary-outcome order books with fragmented liquidity, real-time inventory risk, and constant state drift between local models and exchange reality.
 
 We built PolyMatrix Engine to answer a very specific question:

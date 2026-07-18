@@ -1,18 +1,22 @@
 import asyncio
-import math
 import os
 import json
 import logging
-import re
-import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 import httpx
-
 from dotenv import load_dotenv
-load_dotenv()
-
 import streamlit as st
+import pandas as pd
+from sqlalchemy import create_engine
+import requests
+
+try:
+    from dashboard.i18n import t
+except ImportError:
+    from i18n import t
+
+load_dotenv()
 
 # Dashboard debug logging (visible in docker logs)
 _log = logging.getLogger("dashboard")
@@ -21,14 +25,6 @@ if not _log.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     _log.addHandler(_h)
-import pandas as pd
-from sqlalchemy import create_engine
-import requests
-
-try:
-    from dashboard.i18n import t, TRANSLATIONS
-except ImportError:
-    from i18n import t, TRANSLATIONS
 
 # Set page config
 st.set_page_config(page_title="PolyMatrix Engine Dashboard", layout="wide", page_icon="📈")
@@ -60,6 +56,17 @@ DB_URL_SYNC = (
     else DB_URL_ASYNC
 )
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
+
+
+def control_headers(extra: dict | None = None) -> dict:
+    """Headers for authenticated mutating API calls; never log the bearer token."""
+    headers = {}
+    if ADMIN_API_TOKEN:
+        headers["Authorization"] = f"Bearer {ADMIN_API_TOKEN}"
+    if extra:
+        headers.update(extra)
+    return headers
 
 # Path to backend trading log (can be overridden by TRADING_LOG_PATH)
 LOG_FILE_PATH = os.getenv(
@@ -81,10 +88,6 @@ GAMMA_SEMAPHORE = 5
 # Session state for two-step confirmations
 if "pending_start_condition_id" not in st.session_state:
     st.session_state["pending_start_condition_id"] = None
-if "pending_screener_start_cid" not in st.session_state:
-    st.session_state["pending_screener_start_cid"] = None
-if "pending_screener_question" not in st.session_state:
-    st.session_state["pending_screener_question"] = ""
 if "pending_kill_action" not in st.session_state:
     st.session_state["pending_kill_action"] = None
 if "pending_kill_condition_id" not in st.session_state:
@@ -180,7 +183,19 @@ def fetch_gamma_markets_cached() -> list:
 def fetch_inventory():
     engine = get_engine()
     query = """
-        SELECT market_id, yes_exposure, no_exposure, realized_pnl, updated_at 
+        SELECT
+            market_id,
+            yes_exposure,
+            no_exposure,
+            realized_pnl,
+            accounting_version,
+            updated_at,
+            (
+                SELECT status
+                FROM accounting_audit_runs
+                ORDER BY started_at DESC
+                LIMIT 1
+            ) AS accounting_audit_status
         FROM inventory_ledger
     """
     try:
@@ -188,6 +203,12 @@ def fetch_inventory():
         # Convert numeric types
         for col in ['yes_exposure', 'no_exposure', 'realized_pnl']:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+        verified = (
+            df["accounting_version"].eq("v2")
+            & df["accounting_audit_status"].eq("SAFE")
+        )
+        # Never turn legacy cash flow, incomplete fees or a failed replay into PnL.
+        df["verified_net_realized_pnl"] = df["realized_pnl"].where(verified)
         return df
     except Exception as e:
         st.error(f"Error fetching inventory: {e}")
@@ -332,28 +353,29 @@ def resolve_condition_id(market_input: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Screener Scoring Logic V3.0 — LP Farming (赏金猎人)
+# Screener Research Heuristic V3.0 — telemetry only
 # ---------------------------------------------------------------------------
-# 策略从 HFT 转向 LP Farming：寻找官方奖励高、竞争小、价格偏斜大（安全）、门槛适合散户的市场。
+# This ranking is not expected return, safety, alpha, or permission to trade. It is
+# retained only to explore Gamma liquidity/reward metadata in the Dashboard.
 #
 # 硬性过滤：rewards_min_size>0 且 <=250，liquidity>=1000；保留体育/博彩黑名单，放开地缘政治类。
 # 打分公式（100 分）：
-#   A. 资金回报率 (50 分)：daily_yield = reward_rate_per_day/liquidity，0.0005 为极优基准
-#   B. 安全偏斜度 (30 分)：distance = |yes_price-0.50|，越偏越高分
+#   A. 奖励/流动性比 (50 分)：raw reward_rate_per_day/liquidity
+#   B. 价格距中值 (30 分)：distance = |yes_price-0.50|
 #   C. 盘口静默度 (20 分)：turnover = volume_24h/liquidity，越低越高分，>=1 得 0
 # ---------------------------------------------------------------------------
 
 
 def calculate_market_score(market_data: dict) -> float:
     """
-    Farming Score V3.0（满分 100 分）— 赏金猎人模式。
+    Research metadata score (0-100); never an execution or profitability signal.
 
     假定 market_data 已通过硬性过滤（rewards_min_size>0, <=250, liquidity>=1000）。
 
-    维度 A - 资金回报率 (50 分)：daily_yield = reward_rate_per_day / liquidity
-        基准 0.0005（日化 0.05%，年化约 18%）为极优；yield_score = min(50, (daily_yield/0.0005)*50)
-    维度 B - 安全偏斜度 (30 分)：distance = |yes_price - 0.50|
-        safety_score = (distance / 0.50) * 30；越偏 0.5 悬念越小越安全
+    Dimension A - raw reward/liquidity ratio (50 points). The Gamma field's
+        economics are not contract-validated here, so this is not a yield estimate.
+    Dimension B - price distance from 0.50 (30 points). This is descriptive and
+        must not be interpreted as lower risk.
     维度 C - 盘口静默度 (20 分)：turnover = volume_24h / liquidity
         turnover>=1 得 0；quietness_score = max(0, 20 * (1 - turnover))
     """
@@ -365,26 +387,28 @@ def calculate_market_score(market_data: dict) -> float:
     yp = float(yp)
     r_rate = float(market_data.get("reward_rate_per_day") or 0)
 
-    # A. Yield Score (50): daily_yield = reward_rate_per_day / liquidity
-    #    Gamma reward_rate_per_day 通常为百分比（如 1=1%），需 /100 得小数；此处按原始值，基准 0.0005
-    daily_yield = r_rate / max(liq, 1.0)
-    YIELD_BENCHMARK = 0.0005
-    yield_score = min(50.0, (daily_yield / YIELD_BENCHMARK) * 50.0) if YIELD_BENCHMARK > 0 else 0.0
+    # A. Raw reward/liquidity ratio (50). This is a relative display heuristic,
+    # not annualized yield and not an expected account reward share.
+    reward_liquidity_ratio = r_rate / max(liq, 1.0)
+    reward_ratio_benchmark = 0.0005
+    reward_ratio_score = min(
+        50.0, (reward_liquidity_ratio / reward_ratio_benchmark) * 50.0
+    )
 
-    # B. Safety Score (30): distance from 0.50, max distance 0.50
+    # B. Descriptive price-distance score (30); no safety claim.
     distance = abs(yp - 0.50)
-    safety_score = (distance / 0.50) * 30.0
+    price_distance_score = (distance / 0.50) * 30.0
 
     # C. Quietness Score (20): turnover = vol/liquidity; >=1 → 0, else 20*(1-turnover)
     turnover = vol / liq if liq > 0 else 0.0
     quietness_score = max(0.0, 20.0 * (1.0 - turnover))
 
-    total_score = yield_score + safety_score + quietness_score
+    total_score = reward_ratio_score + price_distance_score + quietness_score
     return max(0.0, min(100.0, total_score))
 
 
 def _filter_and_score_screener(raw_markets: list) -> list:
-    """Filter raw Gamma markets (binary, blacklist, V3.0 farming hard filters) and compute Farming Score. Returns list of screened dicts."""
+    """Compute a telemetry-only Gamma research ranking for binary markets."""
     sports_blacklist = {
         "sports", "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "tennis",
         "hockey", "baseball", "basketball", "premier-league", "premier league",
@@ -534,11 +558,11 @@ def _filter_and_score_screener(raw_markets: list) -> list:
     if screened:
         for m in screened:
             score = calculate_market_score(m)
-            m["recommendation_score"] = round(score, 1)
+            m["research_score"] = round(score, 1)
             # Star bands: 1* 0-19, 2* 20-39, 3* 40-59, 4* 60-79, 5* 80-100
             m["stars"] = max(1, min(5, 1 + int(score / 20)))
-    # V3.0: 按 Farming Score 降序排列（不再按交易量）
-    screened.sort(key=lambda x: x.get("recommendation_score", 0), reverse=True)
+    # Sort only for research display; never feed this order into execution.
+    screened.sort(key=lambda x: x.get("research_score", 0), reverse=True)
     return screened
 
 
@@ -588,7 +612,11 @@ if pending_cid:
         if st.button(f"✅ {t('app.confirm_start')}", key="confirm_start_sidebar"):
             try:
                 with st.spinner(t("app.initializing")):
-                    response = requests.post(f"{API_URL}/markets/{pending_cid}/start")
+                    response = requests.post(
+                        f"{API_URL}/markets/{pending_cid}/start",
+                        headers=control_headers(),
+                        timeout=30,
+                    )
                 if response.status_code == 200:
                     data = response.json()
                     st.success(t("app.started_quoting").format(cid=pending_cid[:8]))
@@ -609,38 +637,30 @@ st.sidebar.markdown(f"### {t('app.emergency_controls')}")
 
 kill_condition_id = st.sidebar.text_input(t("app.target_condition_id"), placeholder="0x...", key="kill_input")
 
-col_stop, col_liq = st.sidebar.columns(2)
 _label_stop = t("app.stop")
-_label_liq = t("app.liquidate_all")
 
-with col_stop:
-    if st.button(f"🛑 {_label_stop}", help=t("app.stop_help")):
-        if kill_condition_id:
-            st.session_state["pending_kill_action"] = "stop"
-            st.session_state["pending_kill_condition_id"] = kill_condition_id
-        else:
-            st.warning(t("app.enter_id"))
+if st.sidebar.button(f"🛑 {_label_stop}", help=t("app.stop_help")):
+    if kill_condition_id:
+        st.session_state["pending_kill_action"] = "stop"
+        st.session_state["pending_kill_condition_id"] = kill_condition_id
+    else:
+        st.warning(t("app.enter_id"))
 
-with col_liq:
-    if st.button(f"☢️ {_label_liq}", help=t("app.liquidate_help")):
-        if kill_condition_id:
-            st.session_state["pending_kill_action"] = "liquidate"
-            st.session_state["pending_kill_condition_id"] = kill_condition_id
-        else:
-            st.warning(t("app.enter_id"))
-
-# Sidebar confirmation for Stop / Liquidate
+# Sidebar confirmation for Stop. Unbounded market-dump liquidation was removed.
 pending_kill_action = st.session_state.get("pending_kill_action")
 pending_kill_cid = st.session_state.get("pending_kill_condition_id")
 if pending_kill_action and pending_kill_cid:
-    label = _label_stop if pending_kill_action == "stop" else _label_liq
+    label = _label_stop
     st.sidebar.warning(t("app.confirm_action_message").format(label=label, cid=pending_kill_cid[:8]))
     k_col1, k_col2 = st.sidebar.columns(2)
     with k_col1:
-        if st.button(f"✅ {t('app.confirm_stop') if pending_kill_action == 'stop' else t('app.confirm_liquidate')}", key="confirm_kill_action"):
-            endpoint = "stop" if pending_kill_action == "stop" else "liquidate"
+        if st.button(f"✅ {t('app.confirm_stop')}", key="confirm_kill_action"):
             try:
-                res = requests.post(f"{API_URL}/markets/{pending_kill_cid}/{endpoint}")
+                res = requests.post(
+                    f"{API_URL}/markets/{pending_kill_cid}/stop",
+                    headers=control_headers(),
+                    timeout=30,
+                )
                 if res.status_code == 200:
                     st.success(t("app.label_executed").format(label=label))
                     st.session_state["pending_kill_action"] = None
@@ -671,7 +691,13 @@ with st.sidebar.form("wipe_form"):
             st.warning(t("app.please_type_wipe"))
         else:
             try:
-                res = requests.post(f"{API_URL}/admin/wipe")
+                res = requests.post(
+                    f"{API_URL}/admin/wipe",
+                    headers=control_headers(
+                        {"X-Confirm-Wipe": "WIPE_LOCAL_STATE_IRREVERSIBLY"}
+                    ),
+                    timeout=30,
+                )
                 if res.status_code == 200:
                     st.success(t("app.wipe_success"))
                     st.rerun()
@@ -693,7 +719,10 @@ inv_df = fetch_inventory()
 
 if not inv_df.empty:
     # Display top-level metrics in a compact card layout
-    total_pnl = inv_df["realized_pnl"].sum()
+    pnl_verified = bool(inv_df["verified_net_realized_pnl"].notna().all())
+    total_pnl = (
+        float(inv_df["verified_net_realized_pnl"].sum()) if pnl_verified else None
+    )
     total_markets = len(inv_df)
     gross_exposure = float(
         inv_df["yes_exposure"].abs().sum() + inv_df["no_exposure"].abs().sum()
@@ -701,8 +730,16 @@ if not inv_df.empty:
 
     m_col1, m_col2, m_col3 = st.columns(3)
     m_col1.metric("Active Markets", total_markets)
-    m_col2.metric("Total Realized PnL (USDC)", f"${total_pnl:.4f}")
+    m_col2.metric(
+        "Verified Net Realized PnL (USDC)",
+        f"${total_pnl:.4f}" if total_pnl is not None else "N/A",
+    )
     m_col3.metric("Total Gross Exposure (YES+NO)", f"{gross_exposure:.4f}")
+    if not pnl_verified:
+        st.warning(
+            "PnL is hidden because the latest deterministic accounting audit is not SAFE, "
+            "the ledger is legacy/unverified, or execution fees are incomplete."
+        )
 
     # Optional exposure chart in a collapsible panel to avoid large empty space
     with st.expander(t("app.market_exposures"), expanded=gross_exposure > 0):
@@ -722,7 +759,15 @@ if not inv_df.empty:
     inv_display_df = inv_df.copy()
     # Reorder for nicer display
     inv_display_df = inv_display_df[
-        ["market_id", "yes_exposure", "no_exposure", "realized_pnl", "updated_at"]
+        [
+            "market_id",
+            "yes_exposure",
+            "no_exposure",
+            "verified_net_realized_pnl",
+            "accounting_version",
+            "accounting_audit_status",
+            "updated_at",
+        ]
     ]
     inv_display_df["gamma_link"] = inv_display_df["market_id"].apply(
         lambda cid: f"https://gamma-api.polymarket.com/markets?condition_ids={cid}"
@@ -736,7 +781,11 @@ if not inv_df.empty:
             "market_id": st.column_config.TextColumn("Market ID"),
             "yes_exposure": st.column_config.NumberColumn("YES Exposure", format="%.4f"),
             "no_exposure": st.column_config.NumberColumn("NO Exposure", format="%.4f"),
-            "realized_pnl": st.column_config.NumberColumn("Realized PnL", format="%.4f"),
+            "verified_net_realized_pnl": st.column_config.NumberColumn(
+                "Verified Net Realized PnL", format="%.4f"
+            ),
+            "accounting_version": st.column_config.TextColumn("Accounting Version"),
+            "accounting_audit_status": st.column_config.TextColumn("Audit Status"),
             "gamma_link": st.column_config.LinkColumn(
                 "Gamma",
                 # Show condition_id extracted from the URL query
@@ -903,7 +952,7 @@ if screened_markets:
         current_idx = st.session_state.get("screener_selected_idx", 0)
         current_idx = max(0, min(current_idx, len(display_markets) - 1))
 
-        # Table header (Competition = Polymarket 竞争度, lower % = easier to earn rewards)
+        # Competition is an unverified Gamma telemetry field, not a reward forecast.
         col_w = [0.3, 0.5, 0.4, 2.5, 0.7, 0.5, 0.5, 0.5, 0.6, 0.5, 0.5, 0.5, 0.5]
         hc = st.columns(col_w)
         for col, label in zip(hc, ["", "Stars", "Score", "Question", "Category", "YES", "Vol 24h", "Liq", t("app.col_rewards_per_day"), t("app.col_min_size"), t("app.col_spread"), t("app.col_competition"), t("app.select")]):
@@ -913,7 +962,7 @@ if screened_markets:
         for i, m in enumerate(display_markets):
             cols = st.columns(col_w)
             # Stars = 1 + int(score/20); derive from score if missing so display matches score
-            score_val = m.get("recommendation_score", 0) or 0
+            score_val = m.get("research_score", 0) or 0
             stars_val = m.get("stars")
             if stars_val is None or (score_val >= 80 and (stars_val or 0) < 4):
                 stars_val = max(1, min(5, 1 + int(float(score_val) / 20)))
@@ -956,8 +1005,6 @@ if screened_markets:
 
         st.caption(t("app.table_selection_hint"))
 
-        st.markdown(f"#### {t('app.launch_quoting')}")
-
         # Nicely formatted "card" preview for the currently selected market (from display_markets)
         sel_idx = st.session_state.get("screener_selected_idx", 0)
         sel_idx = max(0, min(sel_idx, len(display_markets) - 1))
@@ -991,79 +1038,7 @@ if screened_markets:
         </div>
         """
         st.markdown(card_html, unsafe_allow_html=True)
-
-        col_start, col_info = st.columns([1, 3])
-        with col_start:
-            if st.button(
-                f"✅ {t('app.start_from_screener')}",
-                key="start_from_screener",
-                help=t("app.start_from_screener_help"),
-            ):
-                m_sel = display_markets[sel_idx]
-                if not m_sel["condition_id"]:
-                    st.error(t("app.missing_condition_id"))
-                else:
-                    st.session_state["pending_screener_start_cid"] = m_sel["condition_id"]
-                    st.session_state["pending_screener_question"] = m_sel["question"]
-        with col_info:
-            raw_count = st.session_state.get("screener_raw_count")
-            st.write(t("app.displaying_markets").format(n=len(display_markets), total=len(screened_markets), raw_count=raw_count if raw_count is not None else "?"))
-
-        # Compact confirmation panel for screener-based starts
-        pending_screener_cid = st.session_state.get("pending_screener_start_cid")
-        if pending_screener_cid:
-            m_confirm = next(
-                (m for m in screened_markets if m["condition_id"] == pending_screener_cid),
-                None,
-            )
-            if not m_confirm:
-                st.warning(t("app.market_no_longer"))
-                st.session_state["pending_screener_start_cid"] = None
-                st.session_state["pending_screener_question"] = ""
-            else:
-                yes_p = m_confirm["yes_price"]
-                st.info(t("app.confirm_screener_start"))
-                st.markdown(f"**{m_confirm['question']}**")
-                st.markdown(
-                    f"- Condition ID: `{m_confirm['condition_id']}`  \n"
-                    f"- YES Price: `{yes_p if yes_p is not None else 'N/A'}`  \n"
-                    f"- 24h Volume: `${m_confirm['volume24hr']:.0f}`  \n"
-                    f"- Liquidity: `${m_confirm['liquidity']:.0f}`  \n"
-                    f"- End Date: `{m_confirm['end_date'].strftime('%Y-%m-%d')}`"
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button(
-                        f"✅ {t('app.confirm_screener_btn')}", key="confirm_screener_start_inline"
-                    ):
-                        try:
-                            url = f"{API_URL}/markets/{pending_screener_cid}/start"
-                            _log.info("[Screener] POST %s", url)
-                            with st.spinner(t("app.starting_quoting_screener")):
-                                res = requests.post(url, timeout=30)
-                            if res.status_code == 200:
-                                _log.info("[Screener] Start OK: %s", res.json())
-                                st.success(
-                                    f"Started quoting for {pending_screener_cid[:8]}..."
-                                )
-                                st.json(res.json())
-                                st.session_state["pending_screener_start_cid"] = None
-                                st.session_state["pending_screener_question"] = ""
-                                st.rerun()
-                            else:
-                                _log.warning("[Screener] Start failed: %s %s", res.status_code, res.text[:200])
-                                st.error(res.text)
-                                st.session_state["pending_screener_start_cid"] = None
-                                st.session_state["pending_screener_question"] = ""
-                        except Exception as e:
-                            _log.exception("[Screener] Start request failed: %s", e)
-                            st.error(f"API Error: {e}")
-                            st.session_state["pending_screener_start_cid"] = None
-                            st.session_state["pending_screener_question"] = ""
-                with c2:
-                    if st.button(t("app.cancel"), key="cancel_screener_start_inline"):
-                        st.session_state["pending_screener_start_cid"] = None
-                        st.session_state["pending_screener_question"] = ""
+        st.warning(t("app.screener_research_only"))
 else:
     st.info(t("app.load_markets_hint"))
 
@@ -1156,7 +1131,7 @@ try:
         st.json(health.json())
     else:
         st.warning(t("app.backend_unknown"))
-except Exception as e:
+except Exception:
     st.error(t("app.backend_offline"))
     
 st.caption(t("app.log_tip"))

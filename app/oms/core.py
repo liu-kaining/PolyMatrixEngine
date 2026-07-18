@@ -1,27 +1,51 @@
 import asyncio
 import inspect
 import logging
-import time
+import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import or_
 from sqlalchemy.future import select
-
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, RequestArgs
-from py_clob_client.headers.headers import create_level_2_headers
 
 from app.models.db_models import OrderJournal, OrderStatus, OrderSide
 from app.db.session import AsyncSessionLocal
 from app.core.config import settings
+from app.core.trading_safety import TradingMode, trading_safety
+from app.risk.reservations import ReservationRejected, risk_reservations
+from app.oms.validation import OrderValidationError, validate_order_intent
 
 logger = logging.getLogger(__name__)
 
-# Process-wide: YES/NO engines share one wallet — avoid double cancel_all + double sleep same second.
-_last_wallet_cancel_all_monotonic: float = 0.0
+CANCEL_CONFIRMED = "CONFIRMED_CANCELED"
+CANCEL_ALREADY_CLOSED = "ALREADY_CANCELED"
+CANCEL_MATCHED_UNKNOWN = "MATCHED_UNKNOWN"
+CANCEL_UNKNOWN = "UNKNOWN"
 
+
+def classify_cancel_response(exchange_order_id: str, response: Any) -> str:
+    """Accept a cancel only when the response proves the requested order's outcome."""
+    target = str(exchange_order_id)
+    if response == "Canceled":
+        return CANCEL_CONFIRMED
+    if not isinstance(response, dict):
+        return CANCEL_UNKNOWN
+    canceled = response.get("canceled")
+    if isinstance(canceled, list) and target in {str(value) for value in canceled}:
+        return CANCEL_CONFIRMED
+    not_canceled = response.get("not_canceled")
+    if not isinstance(not_canceled, dict) or target not in not_canceled:
+        return CANCEL_UNKNOWN
+    reason = str(not_canceled.get(target, "")).lower()
+    if "already canceled" in reason or "already cancelled" in reason:
+        return CANCEL_ALREADY_CLOSED
+    if any(
+        keyword in reason
+        for keyword in ("already matched", "matched orders can't be canceled", "matched orders")
+    ):
+        return CANCEL_MATCHED_UNKNOWN
+    return CANCEL_UNKNOWN
 
 def _try_build_polymarket_builder_config(
     api_key: str,
@@ -112,61 +136,12 @@ class CircuitBreaker:
 
 class OrderManagementSystem:
     def __init__(self):
-        # py-clob-client initialization (Note: requires actual PK/Funder for live usage)
-        host = settings.PM_API_URL
-        key = settings.PK
-        chain_id = settings.PM_CHAIN_ID
-        funder = settings.FUNDER_ADDRESS
-        
         self.client = None
-        # LIVE_TRADING_ENABLED checks if we want to actually push to the Polymarket network
-        self.live_trading_enabled = settings.LIVE_TRADING_ENABLED
-        
-        if key and funder:
-            try:
-                builder_config = None
-                builder_api_key = str(getattr(settings, "POLY_BUILDER_API_KEY", "") or "").strip()
-                builder_secret = str(getattr(settings, "POLY_BUILDER_SECRET", "") or "").strip()
-                builder_passphrase = str(getattr(settings, "POLY_BUILDER_PASSPHRASE", "") or "").strip()
-                if builder_api_key and builder_secret and builder_passphrase:
-                    builder_config = _try_build_polymarket_builder_config(
-                        builder_api_key,
-                        builder_secret,
-                        builder_passphrase,
-                    )
-                    if builder_config is not None:
-                        logger.info(
-                            "BuilderConfig enabled for official Polymarket volume attribution."
-                        )
-                elif builder_api_key or builder_secret or builder_passphrase:
-                    logger.warning(
-                        "Incomplete POLY_BUILDER_* credentials; BuilderConfig disabled. "
-                        "Set POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE together."
-                    )
-
-                # 2 is typically the signature_type for POLY_PROXY / POLYMORPHIC (proxy wallets)
-                # Ensure the funder address is correct.
-                clob_kw: Dict[str, Any] = {
-                    "key": key,
-                    "chain_id": chain_id,
-                    "signature_type": 2,
-                    "funder": funder,
-                }
-                if "builder_config" in inspect.signature(ClobClient.__init__).parameters:
-                    clob_kw["builder_config"] = builder_config
-                elif builder_config is not None:
-                    logger.warning(
-                        "Installed py-clob-client has no builder_config; upgrade for builder attribution."
-                    )
-                self.client = ClobClient(host, **clob_kw)
-                
-                # Derive or set API creds (standard for proxy wallets in py-clob-client)
-                creds = self.client.create_or_derive_api_creds()
-                self.client.set_api_creds(creds)
-                
-                logger.info(f"ClobClient initialized. Live Trading Enabled: {self.live_trading_enabled}")
-            except Exception as e:
-                logger.error(f"Failed to init ClobClient: {e}")
+        self._client_init_lock = asyncio.Lock()
+        # Importing this module must never derive credentials or touch the exchange.
+        trading_safety.set_readiness(
+            "oms_credentials", False, "CLOB client has not passed guarded initialization"
+        )
                 
         self.circuit_breaker = CircuitBreaker()
 
@@ -175,10 +150,85 @@ class OrderManagementSystem:
             timeout=httpx.Timeout(30.0, connect=10.0),
             limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
         )
-        self._bal_allow_lock = asyncio.Lock()
-        self._bal_allow_cached_at: float = 0.0
-        self._bal_allow_cached_value: Optional[Any] = None
-        self._bal_allow_cache_valid: bool = False
+
+    def _build_live_client(self):
+        """Synchronous SDK setup, invoked only in a worker after local safety preflight."""
+        from py_clob_client.client import ClobClient
+
+        builder_config = None
+        builder_api_key = str(
+            getattr(settings, "POLY_BUILDER_API_KEY", "") or ""
+        ).strip()
+        builder_secret = str(getattr(settings, "POLY_BUILDER_SECRET", "") or "").strip()
+        builder_passphrase = str(
+            getattr(settings, "POLY_BUILDER_PASSPHRASE", "") or ""
+        ).strip()
+        if builder_api_key and builder_secret and builder_passphrase:
+            builder_config = _try_build_polymarket_builder_config(
+                builder_api_key, builder_secret, builder_passphrase
+            )
+        elif builder_api_key or builder_secret or builder_passphrase:
+            logger.warning(
+                "Incomplete POLY_BUILDER_* credentials; builder attribution disabled."
+            )
+
+        clob_kw: Dict[str, Any] = {
+            "key": settings.PK,
+            "chain_id": settings.PM_CHAIN_ID,
+            "signature_type": 2,
+            "funder": settings.FUNDER_ADDRESS,
+        }
+        if "builder_config" in inspect.signature(ClobClient.__init__).parameters:
+            clob_kw["builder_config"] = builder_config
+        elif builder_config is not None:
+            logger.warning(
+                "Installed py-clob-client has no builder_config; builder attribution disabled."
+            )
+        client = ClobClient(settings.PM_API_URL, **clob_kw)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        return client
+
+    async def initialize_live_client(self) -> bool:
+        """Initialize exchange credentials only after local gates have passed."""
+        async with self._client_init_lock:
+            if self.client is not None:
+                return True
+            if trading_safety.mode is not TradingMode.LIVE:
+                trading_safety.set_readiness(
+                    "oms_credentials", False, "CLOB client is disabled outside live mode"
+                )
+                return False
+            if not trading_safety.is_static_live_armed():
+                trading_safety.set_readiness(
+                    "oms_credentials", False, "static live arm is invalid"
+                )
+                return False
+            if trading_safety.status()["halted"]:
+                trading_safety.set_readiness(
+                    "oms_credentials", False, "local preflight raised a sticky halt"
+                )
+                return False
+            if not settings.PK or not settings.FUNDER_ADDRESS:
+                trading_safety.set_readiness(
+                    "oms_credentials", False, "live credentials are missing"
+                )
+                return False
+            try:
+                self.client = await asyncio.to_thread(self._build_live_client)
+            except Exception:
+                self.client = None
+                trading_safety.set_readiness(
+                    "oms_credentials", False, "CLOB client initialization failed"
+                )
+                trading_safety.halt("CLOB credential initialization failed")
+                logger.exception("Failed to initialize guarded CLOB client")
+                return False
+            trading_safety.set_readiness(
+                "oms_credentials", True, "guarded CLOB credential initialization completed"
+            )
+            logger.info("Guarded CLOB client initialization completed.")
+            return True
 
     async def aclose(self) -> None:
         """Close pooled HTTP resources (call from app shutdown if desired)."""
@@ -194,34 +244,114 @@ class OrderManagementSystem:
         """
         if not self.client or not self.client.signer or not self.client.creds:
             raise RuntimeError("ClobClient not initialized or missing signer/creds")
+        from py_clob_client.clob_types import RequestArgs
+        from py_clob_client.headers.headers import create_level_2_headers
+
         request_args = RequestArgs(method=method, request_path=request_path, body="")
         return create_level_2_headers(self.client.signer, self.client.creds, request_args)
 
     async def create_order(self, condition_id: str, token_id: str, side: OrderSide, price: float, size: float) -> Optional[str]:
         """Creates an order: DB Pending -> API Call -> DB Open/Failed"""
-        
-        # 1. State Machine: PENDING (Session 1)
-        order_id = f"local_{token_id}_{side}_{asyncio.get_event_loop().time()}" # Temp ID until polymarket returns one
-        async with AsyncSessionLocal() as session:
-            journal_entry = OrderJournal(
-                order_id=order_id,
-                market_id=condition_id,  # Storing condition_id for foreign key relation
+
+        try:
+            intent = validate_order_intent(
+                condition_id=condition_id,
+                token_id=token_id,
                 side=side,
                 price=price,
                 size=size,
-                status=OrderStatus.PENDING,
-                payload={"token_id": token_id} # Stash the token_id in payload for context
             )
-            session.add(journal_entry)
-            await session.commit()
+        except OrderValidationError as exc:
+            logger.error("[SAFETY] Invalid order intent blocked before journaling: %s", exc)
+            return None
+        condition_id = intent.condition_id
+        token_id = intent.token_id
+        side = OrderSide(intent.side)
+        price = intent.price
+        size = intent.size
+
+        mode = trading_safety.mode
+        if mode is TradingMode.DISABLED:
+            logger.error(
+                "[SAFETY] Order blocked before journaling: TRADING_MODE=disabled "
+                "condition=%s token=%s side=%s",
+                condition_id[:12],
+                token_id[:12],
+                side.value,
+            )
+            return None
+        if mode is TradingMode.LIVE:
+            blockers = (
+                trading_safety.runtime_order_blockers()
+                if side == OrderSide.BUY
+                else trading_safety.runtime_reduce_only_blockers()
+            )
+            if blockers or self.client is None:
+                if self.client is None:
+                    blockers = [*blockers, "ClobClient is not initialized"]
+                logger.critical(
+                    "[SAFETY] LIVE %s order blocked before journaling: %s",
+                    side.value,
+                    "; ".join(blockers),
+                )
+                return None
+
+        # 1. Atomically reserve BUY capital or SELL inventory before journaling/submitting.
+        order_id = f"local_{uuid.uuid4().hex}"
+        reservation_id = None
+        try:
+            if side == OrderSide.BUY:
+                grant = await risk_reservations.reserve_buy(
+                    client_order_id=order_id,
+                    market_id=condition_id,
+                    token_id=token_id,
+                    limit_price=price,
+                    size=size,
+                )
+            else:
+                grant = await risk_reservations.reserve_sell(
+                    client_order_id=order_id,
+                    market_id=condition_id,
+                    token_id=token_id,
+                    limit_price=price,
+                    size=size,
+                )
+            reservation_id = grant.reservation_id
+        except ReservationRejected as exc:
+            logger.warning("[RISK] %s reservation rejected: %s", side.value, exc)
+            return None
+        except Exception as exc:
+            trading_safety.halt(f"risk reservation service failure: {exc}")
+            logger.exception("[RISK] %s reservation failed closed", side.value)
+            return None
+
+        # 2. State Machine: PENDING (Session 1)
+        try:
+            async with AsyncSessionLocal() as session:
+                journal_entry = OrderJournal(
+                    order_id=order_id,
+                    exchange_order_id=None,
+                    reservation_id=reservation_id,
+                    market_id=condition_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    status=OrderStatus.PENDING,
+                    payload={"token_id": token_id, "reservation_id": reservation_id},
+                )
+                session.add(journal_entry)
+                await session.commit()
+        except Exception:
+            await risk_reservations.release(reservation_id, "JOURNAL_FAILED")
+            raise
             
-        # 2. API Execution via Circuit Breaker (NO DB SESSION)
+        # 3. API Execution via Circuit Breaker (NO DB SESSION)
         api_status = None
         api_payload = {}
         final_order_id = order_id
         
-        # Test Mode (Dry-Run) or missing client
-        if not self.client or not self.live_trading_enabled:
+        # Paper mode never sends an exchange command.
+        if mode is TradingMode.PAPER:
             logger.info(f"[DRY-RUN] Simulating execution for local order: {order_id} (PENDING)")
             await asyncio.sleep(0.5) # Simulate network delay non-blockingly
             
@@ -233,6 +363,8 @@ class OrderManagementSystem:
         # Real Execution Mode
         else:
             try:
+                from py_clob_client.clob_types import OrderArgs
+
                 order_args = OrderArgs(
                     price=price,
                     size=size,
@@ -249,100 +381,228 @@ class OrderManagementSystem:
                 
                 res = await self.circuit_breaker.execute(_place_order)
                 
-                if res and res.get("success") and res.get("orderID"):
+                if isinstance(res, dict) and res.get("success") and res.get("orderID"):
                     api_status = OrderStatus.OPEN
                     api_payload = res
                     final_order_id = res["orderID"]
                     logger.info(f"[LIVE] Order successfully posted to CLOB: {final_order_id}")
+                elif isinstance(res, dict) and res.get("success") is False:
+                    # An explicit exchange rejection is the only remote outcome for which
+                    # releasing the reservation is safe without an order reconciliation.
+                    api_status = OrderStatus.FAILED
+                    api_payload = {
+                        "error": str(res.get("errorMsg", "exchange rejected order")),
+                        "exchange_response": res,
+                    }
                 else:
-                    error_msg = res.get("errorMsg", "Unknown API Error") if res else "No response"
-                    raise Exception(f"Failed to get orderID. Response: {error_msg}")
+                    api_status = OrderStatus.UNKNOWN
+                    api_payload = {
+                        "error": "ambiguous exchange submit response",
+                        "exchange_response": res,
+                    }
+                    trading_safety.halt(
+                        f"ambiguous submit outcome for local order {order_id[:24]}"
+                    )
+                    logger.critical(
+                        "[SAFETY] Submit outcome is ambiguous for %s; reservation retained.",
+                        order_id,
+                    )
                     
             except Exception as e:
-                # 4. State Machine: FAILED
-                logger.error(f"[LIVE] Order failed: {e}")
-                api_status = OrderStatus.FAILED
-                api_payload = {"error": str(e)}
+                # A timeout/transport exception can happen after the exchange accepted an
+                # order. Never call it FAILED or release its budget without reconciliation.
+                logger.exception("[LIVE] Order submit outcome is unknown: %s", e)
+                api_status = OrderStatus.UNKNOWN
+                api_payload = {
+                    "error": str(e),
+                    "status_detail": "SUBMIT_OUTCOME_UNKNOWN",
+                }
+                trading_safety.halt(
+                    f"unknown submit outcome for local order {order_id[:24]}"
+                )
                 
-        # 3. State Machine: OPEN / FAILED (Session 2)
-        async with AsyncSessionLocal() as session:
-            # Re-fetch with row lock to avoid race with user_stream fills/cancels.
-            result = await session.execute(
-                select(OrderJournal).filter_by(order_id=order_id).with_for_update()
+        # 4. State Machine: OPEN / FAILED (Session 2). A remote acceptance followed by
+        # local persistence failure is an UNKNOWN exposure, never an ordinary exception.
+        try:
+            async with AsyncSessionLocal() as session:
+                # Re-fetch with row lock to avoid race with user_stream fills/cancels.
+                result = await session.execute(
+                    select(OrderJournal).filter_by(order_id=order_id).with_for_update()
+                )
+                order = result.scalar_one_or_none()
+                if not order:
+                    raise RuntimeError("order journal disappeared after exchange submit")
+
+                if final_order_id != order_id:
+                    # Keep the local primary key stable. The separate exchange id removes the
+                    # race where a fill arrived while the primary key was being replaced.
+                    order.exchange_order_id = final_order_id
+
+                order.status = api_status
+                payload = dict(order.payload) if order.payload else {}
+                payload.update(api_payload)
+                order.payload = payload
+
+                await session.commit()
+        except Exception as exc:
+            trading_safety.halt(
+                f"submit outcome could not be persisted for {order_id[:24]}"
             )
-            order = result.scalar_one_or_none()
-            if not order:
-                return None
-                
-            if final_order_id != order_id:
-                # If API returned a real order_id, update it
-                order.order_id = final_order_id
-                
-            order.status = api_status
-            payload = dict(order.payload) if order.payload else {}
-            payload.update(api_payload)
-            order.payload = payload
-                
-            await session.commit()
-            return final_order_id if api_status == OrderStatus.OPEN else None
+            logger.critical(
+                "[SAFETY] Could not persist submit outcome for local=%s exchange=%s; "
+                "reservation retained and all new risk halted: %s",
+                order_id,
+                final_order_id,
+                exc,
+            )
+            try:
+                await risk_reservations.mark_unknown_for_order(order_id)
+            except Exception:
+                logger.exception(
+                    "[SAFETY] Could not mark reservation UNKNOWN after submit persistence failure"
+                )
+            return None
+
+        if final_order_id != order_id and api_status == OrderStatus.OPEN:
+            try:
+                await risk_reservations.mark_open(reservation_id, final_order_id)
+                from app.oms.fill_processor import fill_processor
+
+                asyncio.create_task(
+                    fill_processor.retry_unmapped_for_exchange_order(final_order_id)
+                )
+            except Exception as exc:
+                trading_safety.halt(
+                    f"failed to map risk reservation for order {final_order_id[:12]}: {exc}"
+                )
+                logger.exception("[RISK] Failed to map open reservation")
+        elif api_status == OrderStatus.FAILED:
+            await risk_reservations.release(reservation_id, "ORDER_FAILED")
+        elif api_status == OrderStatus.UNKNOWN:
+            await risk_reservations.mark_unknown_for_order(order_id)
+        return final_order_id if api_status == OrderStatus.OPEN else None
 
     async def cancel_order(self, order_id: str):
         """Cancels an open order."""
-        # Test Mode (Dry-Run) or missing client
-        if not self.client or not self.live_trading_enabled:
+        mode = trading_safety.mode
+        if mode is TradingMode.DISABLED:
+            logger.error(
+                "[SAFETY] Cancel blocked: TRADING_MODE=disabled. Local order state is unchanged: %s",
+                order_id,
+            )
+            return False
+
+        # Paper mode changes only the local simulated journal.
+        if mode is TradingMode.PAPER:
             logger.info(f"[DRY-RUN] Simulating cancel for {order_id}...")
             await asyncio.sleep(0.3)
-            
+            reservation_id = None
             async with AsyncSessionLocal() as session:
-                order = await session.get(OrderJournal, order_id)
+                stmt = select(OrderJournal).filter(
+                    or_(
+                        OrderJournal.order_id == order_id,
+                        OrderJournal.exchange_order_id == order_id,
+                    )
+                )
+                order = (await session.execute(stmt)).scalar_one_or_none()
                 if order:
+                    reservation_id = order.reservation_id
                     order.status = OrderStatus.CANCELED
                     logger.info(f"[DRY-RUN] Simulated cancel success for order {order_id} -> CANCELED")
                     await session.commit()
+            await risk_reservations.release(reservation_id, "CANCELED")
             return True
+
+        if not self.client or not trading_safety.can_send_exchange_cancel():
+            logger.critical(
+                "[SAFETY] Exchange cancel unavailable for %s (client=%s, mode=%s). "
+                "Local order state is unchanged.",
+                order_id,
+                self.client is not None,
+                mode.value,
+            )
+            return False
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(OrderJournal).filter(
+                or_(
+                    OrderJournal.order_id == order_id,
+                    OrderJournal.exchange_order_id == order_id,
+                )
+            )
+            local_order = (await session.execute(stmt)).scalar_one_or_none()
+            exchange_order_id = None
+            if local_order:
+                exchange_order_id = local_order.exchange_order_id
+                if exchange_order_id is None and not local_order.order_id.startswith("local_"):
+                    exchange_order_id = local_order.order_id
+            elif not str(order_id).startswith("local_"):
+                exchange_order_id = str(order_id)
+        if not exchange_order_id:
+            logger.critical(
+                "[SAFETY] Cannot cancel local order %s: exchange order id is unknown.",
+                order_id,
+            )
+            return False
             
         # Real Execution Mode
         try:
             async def _cancel():
-                return await asyncio.to_thread(self.client.cancel, order_id)
+                return await asyncio.to_thread(self.client.cancel, exchange_order_id)
             
             res = await self.circuit_breaker.execute(_cancel)
 
-            # Normalize different cancel response formats from the CLOB API.
-            cancel_success = False
-            already_closed = False
+            outcome = classify_cancel_response(exchange_order_id, res)
+            cancel_success = outcome in {CANCEL_CONFIRMED, CANCEL_ALREADY_CLOSED}
+            already_closed = outcome == CANCEL_ALREADY_CLOSED
+            matched_unknown = outcome == CANCEL_MATCHED_UNKNOWN
 
-            if res == "Canceled":
-                cancel_success = True
-            elif isinstance(res, dict):
-                # Newer API: {'not_canceled': {...}, 'canceled': [...]} or similar.
-                canceled_list = res.get("canceled") or []
-                not_canceled = res.get("not_canceled") or {}
-
-                # If our order_id is in the canceled list (or any were canceled at all),
-                # we consider this a successful cancel.
-                if order_id in canceled_list or (canceled_list and not not_canceled):
-                    cancel_success = True
-                # If the API says "already canceled", "already matched", or "matched orders
-                # can't be canceled", the order is no longer active — treat as success.
-                elif isinstance(not_canceled, dict) and order_id in not_canceled:
-                    reason = str(not_canceled.get(order_id, "")).lower()
-                    if any(kw in reason for kw in (
-                        "already canceled",
-                        "already matched",
-                        "matched orders can't be canceled",
-                        "matched orders",
-                    )):
-                        cancel_success = True
-                        already_closed = True
-                # Legacy success flag
-                elif res.get("success", False) is True:
-                    cancel_success = True
+            if matched_unknown:
+                local_order_id = None
+                async with AsyncSessionLocal() as session:
+                    stmt = select(OrderJournal).filter(
+                        or_(
+                            OrderJournal.order_id == order_id,
+                            OrderJournal.exchange_order_id == exchange_order_id,
+                        )
+                    )
+                    order = (await session.execute(stmt)).scalar_one_or_none()
+                    if order:
+                        local_order_id = order.order_id
+                        order.status = OrderStatus.UNKNOWN
+                        payload = dict(order.payload) if order.payload else {}
+                        payload["cancel_response"] = res
+                        payload["status_detail"] = "MATCHED_BUT_FILL_NOT_ACCOUNTED"
+                        order.payload = payload
+                        await session.commit()
+                if local_order_id:
+                    await risk_reservations.mark_unknown_for_order(local_order_id)
+                trading_safety.halt(
+                    f"order {str(exchange_order_id)[:12]} matched before fill accounting"
+                )
+                logger.critical(
+                    "[SAFETY] Order %s is matched but fill accounting is not confirmed; "
+                    "reservation retained and new risk halted.",
+                    exchange_order_id,
+                )
+                return False
 
             if cancel_success:
+                local_order_id = None
                 async with AsyncSessionLocal() as session:
-                    order = await session.get(OrderJournal, order_id)
+                    stmt = (
+                        select(OrderJournal)
+                        .filter(
+                            or_(
+                                OrderJournal.order_id == order_id,
+                                OrderJournal.exchange_order_id == exchange_order_id,
+                            )
+                        )
+                        .with_for_update()
+                    )
+                    order = (await session.execute(stmt)).scalar_one_or_none()
                     if order:
+                        local_order_id = order.order_id
                         order.status = OrderStatus.CANCELED
                         payload = dict(order.payload) if order.payload else {}
                         payload["cancel_response"] = res
@@ -355,6 +615,16 @@ class OrderManagementSystem:
                         else:
                             logger.info(f"[LIVE] Order successfully canceled on CLOB: {order_id}")
                         await session.commit()
+                if local_order_id:
+                    # A cancellation response proves the remaining order is closed, but an
+                    # earlier fill event may still be delayed. Keep capital/shares reserved
+                    # until authoritative order/fill/position reconciliation releases it.
+                    await risk_reservations.mark_cancel_pending_for_order(local_order_id)
+                    trading_safety.set_readiness(
+                        "open_orders_reconciled",
+                        False,
+                        "canceled BUY reservations await authoritative reconciliation",
+                    )
                 return True
             else:
                 raise Exception(f"Cancel failed or unrecognized response format: {res}")
@@ -369,7 +639,9 @@ class OrderManagementSystem:
         async with AsyncSessionLocal() as session:
             stmt = select(OrderJournal).filter(
                 OrderJournal.market_id == condition_id,
-                OrderJournal.status.in_([OrderStatus.PENDING, OrderStatus.OPEN])
+                OrderJournal.status.in_(
+                    [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.UNKNOWN]
+                )
             )
             result = await session.execute(stmt)
             active_orders = result.scalars().all()
@@ -380,10 +652,18 @@ class OrderManagementSystem:
             
         tasks = []
         for order in active_orders:
-            tasks.append(self.cancel_order(order.order_id))
+            tasks.append(self.cancel_order(order.exchange_order_id or order.order_id))
             
         # Execute concurrently, wait for all
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for order, result in zip(active_orders, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Cancel task crashed for %s: %s",
+                    order.exchange_order_id or order.order_id,
+                    result,
+                )
         
         success_count = sum(1 for r in results if r is True)
         failed_count = len(active_orders) - success_count
@@ -394,164 +674,5 @@ class OrderManagementSystem:
             
         logger.info(f"KILL SWITCH SUCCESS: {success_count}/{len(active_orders)} orders canceled for {condition_id}")
         return True
-
-    async def get_balance_allowance_cached(self, params: Any, *, timeout: float) -> Any:
-        """
-        Collateral balance/allowance with 5s TTL and async lock so YES/NO engines share one CLOB read.
-        """
-        if not self.client:
-            return None
-        ttl = 5.0
-        async with self._bal_allow_lock:
-            now_m = time.monotonic()
-            if self._bal_allow_cache_valid and (now_m - self._bal_allow_cached_at) < ttl:
-                return self._bal_allow_cached_value
-            bal = await asyncio.wait_for(
-                asyncio.to_thread(self.client.get_balance_allowance, params),
-                timeout=timeout,
-            )
-            self._bal_allow_cached_value = bal
-            self._bal_allow_cached_at = time.monotonic()
-            self._bal_allow_cache_valid = True
-            return bal
-
-    @staticmethod
-    def _format_collateral_balance(bal: Any) -> str:
-        """Best-effort stringify of CLOB get_balance_allowance response."""
-        if bal is None:
-            return "unknown"
-        if isinstance(bal, dict):
-            for k in ("balance", "available", "availableBalance", "allowance", "collateral"):
-                v = bal.get(k)
-                if v is not None and v != "":
-                    return str(v)
-            return str(bal)
-        return str(bal)
-
-    def _sync_clob_cancel_all_wallet(self) -> Any:
-        """
-        Synchronous: cancel every open order for this API key on the CLOB (ghost-order purge).
-        Prefer client.cancel_all(); fall back to get_orders + cancel_orders if unavailable.
-        """
-        self.client.assert_level_2_auth()
-        if hasattr(self.client, "cancel_all") and callable(getattr(self.client, "cancel_all")):
-            return self.client.cancel_all()
-        # Older py-clob-client fallback
-        orders: List[dict] = self.client.get_orders() or []
-        ids: List[str] = []
-        for o in orders:
-            if not isinstance(o, dict):
-                continue
-            oid = o.get("id") or o.get("orderID") or o.get("order_id")
-            if oid:
-                ids.append(str(oid))
-        if not ids:
-            return {"canceled": [], "not_canceled": {}, "note": "no open orders from get_orders"}
-        if hasattr(self.client, "cancel_orders") and callable(getattr(self.client, "cancel_orders")):
-            return self.client.cancel_orders(ids)
-        last = None
-        for oid in ids:
-            last = self.client.cancel(oid)
-        return last
-
-    async def physical_clob_cancel_all_for_hard_reset(self) -> Dict[str, Any]:
-        """
-        V6.4 — Wallet-wide physical cancel on Polymarket CLOB, then sleep for balance release.
-        Safe for the event loop: blocking HTTP runs in a thread. Never raises; logs errors.
-
-        Returns:
-            dict with keys: cancel_all_ok (Optional[bool]), usdc_balance_label (str), skipped (bool)
-        """
-        global _last_wallet_cancel_all_monotonic
-
-        result: Dict[str, Any] = {
-            "cancel_all_ok": None,
-            "usdc_balance_label": "unknown",
-            "skipped": False,
-        }
-
-        sleep_sec = float(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_SLEEP_SEC", 3.0))
-        cancel_timeout = float(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_TIMEOUT_SEC", 45.0))
-        bal_timeout = float(getattr(settings, "HARD_RESET_CLOB_BALANCE_FETCH_TIMEOUT_SEC", 20.0))
-        enabled = bool(getattr(settings, "HARD_RESET_CLOB_CANCEL_ALL_ENABLED", True))
-
-        dedup_sec = float(getattr(settings, "HARD_RESET_CLOB_WALLET_DEDUP_SEC", 15.0))
-        now_m = time.monotonic()
-        if (
-            dedup_sec > 0
-            and _last_wallet_cancel_all_monotonic > 0
-            and (now_m - _last_wallet_cancel_all_monotonic) < dedup_sec
-        ):
-            logger.info(
-                "[HARD RESET] Wallet Cancel-All dedup: another engine ran within "
-                f"{dedup_sec:.0f}s — skipping repeat (ghost purge already triggered)."
-            )
-            result["skipped"] = True
-            result["dedup"] = True
-            return result
-
-        logger.info("[HARD RESET] Initiating physical CLOB Cancel-All to clear Ghost Orders...")
-
-        if not enabled:
-            logger.info("[HARD RESET] CLOB Cancel-All disabled via HARD_RESET_CLOB_CANCEL_ALL_ENABLED=false.")
-            result["skipped"] = True
-            logger.info(
-                f"[HARD RESET] Cancel-All skipped (disabled). Sleeping {sleep_sec:.1f}s before local cleanup..."
-            )
-            await asyncio.sleep(sleep_sec)
-            _last_wallet_cancel_all_monotonic = time.monotonic()
-            return result
-
-        if not self.client or not self.live_trading_enabled:
-            logger.info(
-                "[HARD RESET] Skipping CLOB Cancel-All (dry-run or ClobClient not initialized). "
-                "Sleeping before local cleanup anyway."
-            )
-            result["skipped"] = True
-            await asyncio.sleep(sleep_sec)
-            _last_wallet_cancel_all_monotonic = time.monotonic()
-            return result
-
-        try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(self._sync_clob_cancel_all_wallet),
-                timeout=cancel_timeout,
-            )
-            result["cancel_all_ok"] = True
-            logger.info(f"[HARD RESET] CLOB Cancel-All completed. API response (truncated): {str(raw)[:500]}")
-        except asyncio.TimeoutError:
-            result["cancel_all_ok"] = False
-            logger.error(
-                f"[HARD RESET] CLOB Cancel-All timed out after {cancel_timeout:.1f}s — continuing with sleep."
-            )
-        except Exception as e:
-            result["cancel_all_ok"] = False
-            logger.error(f"[HARD RESET] CLOB Cancel-All failed — continuing: {e}", exc_info=True)
-
-        logger.info(
-            f"[HARD RESET] Cancel-All sent. Sleeping for {sleep_sec:.1f}s to await balance release..."
-        )
-        await asyncio.sleep(sleep_sec)
-
-        try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-
-            async with self._bal_allow_lock:
-                self._bal_allow_cache_valid = False
-
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            bal = await self.get_balance_allowance_cached(params, timeout=bal_timeout)
-            label = self._format_collateral_balance(bal)
-            result["usdc_balance_label"] = label
-            logger.info(f"[HARD RESET] CLOB collateral balance read: {label}")
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[HARD RESET] get_balance_allowance timed out after {bal_timeout:.1f}s — balance unknown."
-            )
-        except Exception as e:
-            logger.warning(f"[HARD RESET] Could not fetch USDC collateral balance: {e}")
-
-        _last_wallet_cancel_all_monotonic = time.monotonic()
-        return result
 
 oms = OrderManagementSystem()

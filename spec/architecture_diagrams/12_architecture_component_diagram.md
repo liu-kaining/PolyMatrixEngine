@@ -111,7 +111,7 @@ flowchart TB
 
 - **Redis**：`tick:` / `ob:` / `control:` / `order_status:` 等同实例上的 Pub/Sub 主题，图中只画与引擎订阅主链相关的 tick/ob。
 - **Scorer**：逻辑在 `auto_router._radar_scan` 内，与 `PortfolioMgr` 为同一模块内的步骤，虚线表示「从属」而非跨进程调用。
-- **Reconciler**：周期由 `RECONCILIATION_INTERVAL_SEC` 控制（默认 3600s），与硬重置后的 `reconcile_single_market(force=True)` 不同，详见 [`08_watchdog_mechanism.md`](./08_watchdog_mechanism.md)。
+- **Reconciler**：周期由 `RECONCILIATION_INTERVAL_SEC` 控制（默认 300s）；差异使精确会计失效并 Halt，不再存在 Hard Reset 后的单市场强制覆盖，详见 [`08_watchdog_mechanism.md`](./08_watchdog_mechanism.md)。
 
 ---
 

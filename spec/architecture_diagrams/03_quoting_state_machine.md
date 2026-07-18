@@ -1,80 +1,37 @@
-# QuotingEngine 运行语义（与代码一致）
+# QuotingEngine 当前运行语义
 
-`QuotingEngine` **没有**独立的有限状态机类；行为由 **`suspended` / `exit_mode`** 等**跨 tick 标志**，以及 **`on_tick` 内部的布尔与局部变量**（例如硬重置失败后的 `freeze_buys_post_reset_reconcile_fail`，**仅影响当前这一次 tick**）共同决定。
-
----
-
-## 1. 跨 tick 标志（`listen` 循环 + 控制消息）
+`QuotingEngine` 没有独立的有限状态机类。跨 tick 状态只有 `suspended`、`exit_mode` 和已提交库存快照；其余模式由每次合法行情 tick 重新计算。
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e3a5f',
-  'primaryTextColor': '#ffffff',
-  'primaryBorderColor': '#334155',
-  'lineColor': '#64748b'
-}}%%
 stateDiagram-v2
-    [*] --> Running: start_quoting_engine / run()
-
-    Running --> Suspended: control suspend Kill Switch
-    Suspended --> Running: control resume
-
-    Running --> GracefulExit: control graceful_exit
-    GracefulExit --> [*]: 敞口清零或 dust 退出 complete
-
-    note right of Running
-        suspended=False exit_mode=False
-        收到 tick 则进入 on_tick（见下）
-    end note
-
-    note right of Suspended
-        suspended=True
-        收到 tick 时不调用 on_tick
-    end note
-
-    note right of GracefulExit
-        exit_mode=True
-        仍调用 on_tick
-        以卖单/平仓为主 stop BUY 建仓
-    end note
+    [*] --> WAITING_FOR_VALID_BOOK
+    WAITING_FOR_VALID_BOOK --> QUOTING_BIDS_ONLY: "book healthy + alpha armed + risk ready"
+    QUOTING_BIDS_ONLY --> TWO_WAY_QUOTING: "持有可卖库存"
+    TWO_WAY_QUOTING --> QUOTING_BIDS_ONLY: "库存降到 dust"
+    QUOTING_BIDS_ONLY --> NO_VALIDATED_ALPHA: "alpha 未经离线验证"
+    TWO_WAY_QUOTING --> NO_VALIDATED_ALPHA: "禁止新增 BUY，保留安全 SELL"
+    QUOTING_BIDS_ONLY --> LOCKED_BY_OPPOSITE: "对侧库存触发 cross-token lock"
+    TWO_WAY_QUOTING --> GRACEFUL_EXIT: "生命周期要求退出"
+    QUOTING_BIDS_ONLY --> EXTREME_LIQUIDATING: "本侧接近风险上限"
+    state "MARKET_DATA_INVALID" as INVALID
+    QUOTING_BIDS_ONLY --> INVALID: "stale/gap/crossed/empty/invalid"
+    TWO_WAY_QUOTING --> INVALID: "stale/gap/crossed/empty/invalid"
+    INVALID --> WAITING_FOR_VALID_BOOK: "先撤已知订单，等待全量有效快照"
+    state "SUSPENDED" as SUSPENDED
+    WAITING_FOR_VALID_BOOK --> SUSPENDED: "control suspend"
+    QUOTING_BIDS_ONLY --> SUSPENDED: "control suspend"
+    TWO_WAY_QUOTING --> SUSPENDED: "control suspend"
 ```
 
-| 标志 | 设置方式 | 代码效果 |
-|------|----------|----------|
-| `suspended` | `control:{cid}` → `suspend` / `resume` | `suspend` 时 `cancel_all_orders`，此后 **跳过** `on_tick` |
-| `exit_mode` | `graceful_exit` | 进入后 **仍跑** `on_tick`，逻辑上停止新 BUY 建仓并逐步平仓；结束后 `_shutdown_requested` |
+## 模式与安全含义
 
----
+| 模式 | 行为 |
+|---|---|
+| `NO_VALIDATED_ALPHA` | 默认模式；不创建新 BUY，并强制撤掉不再需要的旧 BUY。 |
+| `QUOTING_BIDS_ONLY` | 只有在 alpha、readiness、预算和净边际全部通过时才可能创建 BUY。 |
+| `TWO_WAY_QUOTING` | 在上述条件外，SELL 还必须通过库存 reservation；不得裸卖。 |
+| `GRACEFUL_EXIT` / `EXTREME_LIQUIDATING` | 只按可见深度、最大冲击和成本亏损下限生成 SELL；无法安全成交则等待。 |
+| `MARKET_DATA_INVALID` | 取消已知订单并停止定价，直到收到新的完整有效快照。 |
+| `SUSPENDED` | 停止引擎任务并尝试逐单撤单。 |
 
-## 2. 单次 `on_tick` 内：硬重置与「冻结 BUY」
-
-- **周期**：约每 `300s`（`time.time() - last_grid_reset_time > 300`）且非 `exit_mode`。
-- **互斥**：`_hard_reset_condition_lock` + `_hard_reset_peer_gate`，避免 YES/NO 双引擎与 CLOB `cancel_all` 竞态。
-- **流程**：`oms.physical_clob_cancel_all_for_hard_reset()` → `cancel_all_orders(force_evict=True)` → `watchdog.reconcile_single_market(..., force=True)`。
-- **`freeze_buys_post_reset_reconcile_fail`**：若本轮 **强制对账失败**，**仅本 tick** 在构建订单时 **跳过 BUY 网格**；**下一 tick 重新计算**，不是持久状态。
-
----
-
-## 3. 引擎模式标签（Redis / 监控展示 `_publish_engine_mode`）
-
-以下为 **当次 tick 计算出的展示用 mode**，不是 `stateDiagram` 状态：
-
-| mode 字符串 | 代码侧主要条件 |
-|-------------|----------------|
-| `SUSPENDED` | 已处理 `suspend` 控制消息 |
-| `GRACEFUL_EXIT` | `exit_mode` |
-| `POST_RESET_RECONCILE_FREEZE` | 本 tick `freeze_buys_post_reset_reconcile_fail`（硬重置后对账失败） |
-| `EXTREME_LIQUIDATING` | `is_extreme_long`（本侧 capital 接近上限） |
-| `LOCKED_BY_OPPOSITE` | `cross_token_locked` |
-| `TWO_WAY_QUOTING` / `QUOTING_BIDS_ONLY` | 正常报价，敞口是否达 dust 阈值等 |
-
----
-
-## 4. 与旧版「状态机图」的差异说明
-
-- **不存在**从 `GRACEFUL_EXIT` 转入 `POST_RESET_RECONCILE_FREEZE` 这类持久迁移；后者是 **tick 局部变量**。
-- **不存在**「每分钟重试对账」的专用状态机；对账由 **Watchdog 周期** + **硬重置后单次 `reconcile_single_market`** 等路径触发。
-
----
-
-*与实现文件对齐：`app/quoting/engine.py`（`on_tick`、`on_control_message`、`cancel_all_orders`）。*
+wallet-wide Hard Reset、`POST_RESET_RECONCILE_FREEZE` 和 `force_evict` 已删除，详见 [`10_hard_reset_flow.md`](./10_hard_reset_flow.md)。

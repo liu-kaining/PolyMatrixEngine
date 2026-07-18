@@ -1,0 +1,41 @@
+{
+  "schema_version": "alpha-evidence-v2",
+  "strategy_id": "DO_NOT_USE-example-only",
+  "generated_at": "2000-01-01T00:00:00+00:00",
+  "generator": {
+    "name": "polymatrix-alpha-evaluator",
+    "version": "1.1.0",
+    "input_schema": "alpha-dataset-v1",
+    "bootstrap_iterations": 5000,
+    "bootstrap_seed": 20260718,
+    "confidence_level": 0.95,
+    "cluster_unit": "market_id",
+    "pnl_method": "fee_aware_cash_plus_terminal_mark",
+    "markout_horizon_seconds": 30,
+    "rewards_included": false,
+    "drawdown_method": "peak_to_trough_over_strategy_capital"
+  },
+  "dataset": {
+    "start_at": "1999-01-01T00:00:00+00:00",
+    "end_at": "1999-12-31T00:00:00+00:00",
+    "fill_count": 0,
+    "market_count": 0,
+    "fee_completeness": 0.0,
+    "out_of_sample": false,
+    "lookahead_checks_passed": false,
+    "fill_event_uniqueness_passed": false,
+    "market_data_integrity_passed": false,
+    "source_data_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "results": {
+    "net_trading_pnl_ex_rewards_usd": 0.0,
+    "net_trading_pnl_ex_rewards_95ci_lower_usd": 0.0,
+    "markout_30s_per_share_95ci_lower": 0.0,
+    "maximum_drawdown_fraction": 1.0
+  },
+  "provenance": {
+    "code_commit": "0000000000000000000000000000000000000000",
+    "config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "runtime_source_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

@@ -1,8 +1,10 @@
 """
-Auto-Router (V7.2): Portfolio Manager — rewards-market radar via official CLOB rewards API,
+Paper-only Auto-Router: rewards-market radar via official CLOB rewards API,
 bonus floor, competition-aware scoring, capital-aware rank (binary vs categorical exposure caps),
 event horizon and sector limits.
-Runs as a background asyncio task when AUTO_ROUTER_ENABLED=True.
+
+Reward-ranked selection is not validated alpha. The central safety gate therefore rejects this
+router in live mode even if the module is invoked directly.
 """
 import asyncio
 import json
@@ -19,6 +21,7 @@ from app.core.exposure_limits import exposure_cap_usd_for_outcome_count
 from app.core.redis import redis_client
 from app.core.market_lifecycle import start_market_making_impl, get_active_router_markets
 from app.core.inventory_state import inventory_state
+from app.core.trading_safety import trading_safety
 from app.market_data.gamma_client import gamma_client
 
 logger = logging.getLogger(__name__)
@@ -311,26 +314,42 @@ def _extract_yes_token_from_gamma(raw: Optional[dict]) -> Optional[str]:
 
 
 async def _check_book_quality(token_id: str) -> Tuple[bool, str]:
-    """
-    V8.0: Check orderbook quality for a market candidate.
-    Returns (pass, reason).
-    """
+    """Fail-closed paper-research filter for a candidate order book."""
     min_depth = float(getattr(settings, "ROUTER_MIN_BOOK_DEPTH_USD", 50.0))
     max_spread = float(getattr(settings, "ROUTER_MAX_BOOK_SPREAD", 0.08))
     avoid_band = float(getattr(settings, "ROUTER_AVOID_MIDPOINT_BAND", 0.10))
 
     book = await _fetch_book_snapshot(token_id)
     if not book:
-        return True, "book_fetch_failed_passthrough"  # fail-open
+        return False, "book_unavailable"
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
     if not bids or not asks:
         return False, "empty_book"
 
-    # Check spread
-    best_bid = float(bids[0]["price"]) if bids else 0
-    best_ask = float(asks[0]["price"]) if asks else 1
+    try:
+        normalized_bids = [
+            (float(level["price"]), float(level["size"])) for level in bids[:3]
+        ]
+        normalized_asks = [
+            (float(level["price"]), float(level["size"])) for level in asks[:3]
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False, "malformed_book"
+    values = [value for level in normalized_bids + normalized_asks for value in level]
+    if not all(math.isfinite(value) for value in values):
+        return False, "non_finite_book"
+    if any(
+        price <= 0 or price >= 1 or size <= 0
+        for price, size in normalized_bids + normalized_asks
+    ):
+        return False, "out_of_range_book"
+
+    best_bid = normalized_bids[0][0]
+    best_ask = normalized_asks[0][0]
+    if best_bid >= best_ask:
+        return False, "crossed_book"
     spread = best_ask - best_bid
     if spread > max_spread:
         return False, f"spread_too_wide({spread:.4f}>{max_spread})"
@@ -341,8 +360,8 @@ async def _check_book_quality(token_id: str) -> Tuple[bool, str]:
         return False, f"midpoint_too_uncertain({mid:.4f})"
 
     # Check depth (top-3 notional on each side)
-    bid_depth = sum(float(b["price"]) * float(b["size"]) for b in bids[:3])
-    ask_depth = sum(float(a["price"]) * float(a["size"]) for a in asks[:3])
+    bid_depth = sum(price * size for price, size in normalized_bids)
+    ask_depth = sum(price * size for price, size in normalized_asks)
     total_depth = bid_depth + ask_depth
     if total_depth < min_depth:
         return False, f"thin_book(${total_depth:.1f}<${min_depth})"
@@ -358,9 +377,9 @@ async def _radar_scan() -> List[dict]:
     then shortlist and apply event-horizon.
     """
     base_order_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
-    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)) * 5
-    top_n = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
-    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
+    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 8)) * 5
+    top_n = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 8))
+    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 72.0))
     min_pool = float(getattr(settings, "AUTO_ROUTER_MIN_REWARD_POOL", 50.0))
     all_markets: List[dict] = []
     seen: Set[str] = set()
@@ -439,7 +458,9 @@ async def _radar_scan() -> List[dict]:
     if not all_markets:
         return []
 
-    cap_ref_binary = max(float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0)), 1e-6)
+    cap_ref_binary = max(
+        float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 40.0)), 1e-6
+    )
     all_cids = [m["condition_id"] for m in all_markets if m.get("condition_id")]
     logger.info(
         "[AutoRouter] Gamma batch for %d pass-filter candidates (outcome_count, tags, endDate, rank score)...",
@@ -479,12 +500,13 @@ async def _radar_scan() -> List[dict]:
     ]
     filtered.sort(key=lambda x: x["score"], reverse=True)
 
-    # V8.0: Book quality filter — check top candidates' orderbooks via CLOB REST
+    # Paper-only research quality filter; every missing/invalid fact rejects.
     quality_check_count = min(len(filtered), top_n * 2)
     candidates = filtered[:quality_check_count]
     if candidates:
         logger.info(
-            "[AutoRouter] V8.0 book quality check for %d candidates...", len(candidates),
+            "[AutoRouter] Fail-closed book quality check for %d candidates...",
+            len(candidates),
         )
         # Resolve YES token_ids from gamma metadata
         quality_tasks = []
@@ -497,16 +519,23 @@ async def _radar_scan() -> List[dict]:
                 quality_tasks.append(_check_book_quality(yes_tid))
                 cid_for_task.append(cid)
             else:
-                # No token_id available — pass through
-                async def _pass(): return (True, "no_token")
-                quality_tasks.append(_pass())
+                async def _reject_missing_token():
+                    return False, "missing_yes_token"
+
+                quality_tasks.append(_reject_missing_token())
                 cid_for_task.append(cid)
 
         quality_results = await asyncio.gather(*quality_tasks, return_exceptions=True)
         rejected_cids: Set[str] = set()
         for cid, result in zip(cid_for_task, quality_results):
             if isinstance(result, Exception):
-                continue  # fail-open
+                rejected_cids.add(cid)
+                logger.warning(
+                    "[AutoRouter] Book quality check crashed for %s: %s",
+                    cid[:10],
+                    result,
+                )
+                continue
             passed, reason = result
             if not passed:
                 rejected_cids.add(cid)
@@ -538,16 +567,16 @@ async def _rebalance(
     (2) Dropped from Top N → graceful_exit only after min_hold_sec.
     Add new markets respecting sector limits (slots + exposure).
     """
-    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4))
-    min_hold_sec = max(0.0, float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 12)) * 3600.0)
-    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 24.0))
+    max_markets = int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 8))
+    min_hold_sec = max(
+        0.0,
+        float(getattr(settings, "AUTO_ROUTER_MIN_HOLD_HOURS", 2.0)) * 3600.0,
+    )
+    event_horizon_hours = float(getattr(settings, "EVENT_HORIZON_HOURS", 72.0))
     max_exposure_per_sector = float(getattr(settings, "MAX_EXPOSURE_PER_SECTOR", 300.0))
     max_slots_per_sector = int(getattr(settings, "MAX_SLOTS_PER_SECTOR", 2))
     target_ids = {m["condition_id"] for m in target_markets}
     now = time.time()
-
-    # Build target lookup for metadata
-    target_by_cid: Dict[str, dict] = {m["condition_id"]: m for m in target_markets if m.get("condition_id")}
 
     # 🛠️ 存量盘口：内存缺失时从 Redis 恢复 min_hold 起点，否则写入 Redis
     for cid in active_set:
@@ -691,11 +720,12 @@ async def run() -> None:
     Main loop: scan Gamma at interval, rank by daily_roi, rebalance (add / graceful_exit).
     Timeout-safe; never blocks indefinitely on external API.
     """
+    trading_safety.assert_router_start_allowed()
     interval = max(60, int(getattr(settings, "AUTO_ROUTER_SCAN_INTERVAL_SEC", 3600)))
     logger.info(
         "[AutoRouter] Started. Scan interval=%ds, max_markets=%d.",
         interval,
-        int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 4)),
+        int(getattr(settings, "AUTO_ROUTER_MAX_MARKETS", 8)),
     )
     
     # Do an immediate scan on startup, then sleep at the end of the loop

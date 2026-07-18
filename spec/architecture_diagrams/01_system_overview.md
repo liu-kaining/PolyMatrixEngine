@@ -10,6 +10,7 @@ flowchart TB
     end
     subgraph S2["数据面"]
         N3["Market WebSocket"]
+        N26["User WebSocket"]
         N4["REST 快照"]
         N5["Gamma API"]
         N6["Redis PubSub tick"]
@@ -46,6 +47,7 @@ flowchart TB
     N2 --> N23
     N3 --> N6
     N3 --> N7
+    N26 --> N21
     N6 --> N10
     N7 --> N10
     N5 --> N10
@@ -54,12 +56,13 @@ flowchart TB
     N12 -.-> N17
     N17 --> N19
     N17 --> N20
+    N17 --> N21
     N13 --> N16
     N13 -.-> N14
     N13 -.-> N15
     N14 -.-> N17
     N15 --> N21
-    N16 --> N21
+    N21 --> N16
     N23 --> N24
     N24 --> N25
     N23 --> N10
@@ -86,13 +89,13 @@ flowchart TB
 
 ### 关键设计原则
 
-1. **内存优先**: 热路径完全无 DB 读取
+1. **已提交快照**: 报价 tick 无 DB 读取；成交与订单先 durable commit，再同步内存
 2. **消息解耦**: 所有模块通过 Redis Pub/Sub 通信
 3. **状态分离**: 控制面(FastAPI) 与 数据面(Engine) 解耦
-4. **异步持久化**: 成交 → 内存更新 → 异步队列 → DB
+4. **原子事实层**: 成交 → inbox/reservation/cash/fee/inventory/order 同事务 → versioned memory snapshot
 
-> **图注**：`apply_fill()` 由 User WebSocket 成交路径调用 `InventoryStateManager`，并非 InvState 自指；故图中不单独画「自环」边。
+> **图注**：`InventoryStateManager` 是报价热路径缓存，不是 durable 事实源；User WS fill 先提交 PostgreSQL。
 
 ---
 
-*设计亮点: 准机构级架构，热点路径完全内存化，零 DB 阻塞*
+*安全边界：报价 tick 读取内存；任何资金、订单或成交事实必须先持久化。*

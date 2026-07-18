@@ -6,11 +6,14 @@ import websockets
 from typing import Dict, Optional, Set
 
 from app.core.redis import redis_client
-from app.core.inventory_state import inventory_state
 from app.oms.core import oms
+from app.oms.fill_processor import derive_fill_event_id, fill_processor
+from app.risk.reservations import risk_reservations
 from app.risk.watchdog import watchdog
+from app.core.trading_safety import trading_safety
 from app.db.session import AsyncSessionLocal
 from app.models.db_models import OrderJournal, OrderStatus
+from sqlalchemy import or_
 from sqlalchemy.future import select
 
 logger = logging.getLogger(__name__)
@@ -60,8 +63,14 @@ class UserStreamGateway:
 
                     self.ping_task = asyncio.create_task(self._heartbeat())
                     await self._authenticate()
-                    # Long reconciliation interval (e.g. 3600s): repair inventory after any WS gap.
-                    _safe_create_task(watchdog.reconcile_positions(force=True))
+                    trading_safety.set_readiness(
+                        "user_stream",
+                        False,
+                        "subscription sent but authentication acknowledgement contract is unverified",
+                    )
+                    # Compare positions after any WS gap, but retain the recent-fill
+                    # delay guard because the Data API can lag a committed local fill.
+                    _safe_create_task(watchdog.reconcile_positions())
                     await self._listen()
                     raise RuntimeError("User WS listen loop exited unexpectedly without exception.")
                     
@@ -79,6 +88,9 @@ class UserStreamGateway:
                     self.ping_task.cancel()
                     self.ping_task = None
                 self.ws = None
+                trading_safety.set_readiness(
+                    "user_stream", False, "user WebSocket disconnected"
+                )
                 connected_for = 0.0
                 if connected_at is not None:
                     connected_for = max(0.0, time.monotonic() - connected_at)
@@ -194,13 +206,34 @@ class UserStreamGateway:
                     matched_amount = float(maker.get("matched_amount", 0))
                     price = float(maker.get("price", 0))
                     if order_id:
-                        _safe_create_task(self.handle_fill(order_id, matched_amount, price))
+                        event_id = derive_fill_event_id(data, order_id, "maker")
+                        token_id = maker.get("asset_id") or data.get("asset_id")
+                        _safe_create_task(
+                            self.handle_fill_if_local(
+                                event_id=event_id,
+                                order_id=order_id,
+                                filled_size=matched_amount,
+                                fill_price=price,
+                                raw_event=data,
+                                token_id=token_id,
+                            )
+                        )
                         
                 # Check taker order (if we were the taker)
                 if taker_order_id:
                     size = float(data.get("size", 0))
                     price = float(data.get("price", 0))
-                    _safe_create_task(self.handle_fill(taker_order_id, size, price))
+                    event_id = derive_fill_event_id(data, taker_order_id, "taker")
+                    _safe_create_task(
+                        self.handle_fill_if_local(
+                            event_id=event_id,
+                            order_id=taker_order_id,
+                            filled_size=size,
+                            fill_price=price,
+                            raw_event=data,
+                            token_id=data.get("asset_id"),
+                        )
+                    )
                     
         elif event_type == "order":
             # For CANCELLATION or CLOSED events, we check if it was partially filled before
@@ -210,22 +243,6 @@ class UserStreamGateway:
                 
                 if order_id:
                     _safe_create_task(self.handle_cancellation(order_id))
-
-    async def _resolve_market_tokens(self, session, market_id: str) -> Optional[Dict[str, str]]:
-        cached = self.market_tokens.get(market_id)
-        if cached and cached.get("yes_token_id") and cached.get("no_token_id"):
-            return cached
-
-        from app.models.db_models import MarketMeta
-
-        meta_stmt = select(MarketMeta).filter(MarketMeta.condition_id == market_id)
-        meta_res = await session.execute(meta_stmt)
-        meta = meta_res.scalar_one_or_none()
-        if not meta or not meta.yes_token_id or not meta.no_token_id:
-            return None
-        tokens = {"yes_token_id": meta.yes_token_id, "no_token_id": meta.no_token_id}
-        self.market_tokens[market_id] = tokens
-        return tokens
 
     async def _publish_order_status_event(self, market_id: str, token_id: Optional[str], order_id: str, status: str):
         if not token_id:
@@ -238,143 +255,98 @@ class UserStreamGateway:
             },
         )
 
-    async def handle_fill(self, order_id: str, filled_size: float, fill_price: float):
-        """
-        Process fill:
-        1) update order journal row (locked)
-        2) update in-memory inventory immediately
-        3) persist inventory via async background queue (fire-and-forget)
-        """
-        market_id = None
-        token_id = None
-        side = None
-        status_for_event = None
-
-        async with AsyncSessionLocal() as session:
-            stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id).with_for_update()
-            result = await session.execute(stmt)
-            order = result.scalar_one_or_none()
-
-            if not order:
-                return
-
-            payload = dict(order.payload) if order.payload else {}
-            current_filled = float(payload.get("filled_size", 0.0))
-            new_total_filled = current_filled + filled_size
-            payload["filled_size"] = new_total_filled
-            order.payload = payload
-
-            original_size = float(order.size)
-            if new_total_filled >= original_size - 1e-6:
-                order.status = OrderStatus.FILLED
-                status_for_event = "FILLED"
-            else:
-                order.status = OrderStatus.OPEN
-
-            market_id = order.market_id
-            side = order.side.value
-            token_id = payload.get("token_id")
-
-            await session.commit()
-
-            # Update memory-first inventory state (DB persistence is queued inside manager).
-            tokens = await self._resolve_market_tokens(session, market_id)
-            if tokens and token_id:
-                is_yes = token_id == tokens["yes_token_id"]
-                updated = await inventory_state.apply_fill(
-                    market_id=market_id,
-                    is_yes=is_yes,
-                    side=side,
-                    filled_size=filled_size,
-                    fill_price=fill_price,
-                )
-                logger.info(
-                    f"Inventory Updated for {market_id}: "
-                    f"YES={updated['yes_exposure']:.4f}, NO={updated['no_exposure']:.4f}"
-                )
-
-        logger.info(f"Order {order_id} fill processed. Size: {filled_size} @ {fill_price}")
-        if status_for_event and market_id and token_id:
-            await self._publish_order_status_event(market_id, token_id, order_id, status_for_event)
-
-        # V8.0: Hedge on Fill — accumulate unhedged BUY fills, trigger hedge when >= 5 shares
-        from app.core.config import settings
-        if (
-            getattr(settings, "HEDGE_ON_FILL", False)
-            and side == "BUY"
-            and market_id
-            and token_id
-        ):
-            tokens = self.market_tokens.get(market_id)
-            is_yes = tokens and token_id == tokens.get("yes_token_id")
-            total_unhedged, avg_price = await inventory_state.accumulate_unhedged_fill(
-                market_id, is_yes, filled_size, fill_price
-            )
-            if total_unhedged >= 5.0:
-                _safe_create_task(self._place_hedge_sell(
-                    market_id, token_id, is_yes, total_unhedged, avg_price
-                ))
-
-    async def _place_hedge_sell(
-        self, market_id: str, token_id: str, is_yes: bool,
-        total_size: float, avg_price: float
+    async def handle_fill(
+        self,
+        *,
+        event_id: str,
+        order_id: str,
+        filled_size: float,
+        fill_price: float,
+        raw_event: dict,
+        token_id: Optional[str] = None,
     ):
-        """Place an immediate SELL order to neutralize accumulated BUY fills. Fire-and-forget."""
-        from app.core.config import settings
-        from app.oms.core import oms
-        from app.models.db_models import OrderSide
-
-        margin = float(getattr(settings, "HEDGE_MARGIN_CENTS", 0.02))
-        hedge_price = round(avg_price + margin, 2)
-        hedge_price = max(0.01, min(0.99, hedge_price))
-        hedge_size = round(total_size, 1)
-
-        if hedge_size < 5.0:
-            return
-
+        result = await fill_processor.record_and_process(
+            event_id=event_id,
+            exchange_order_id=order_id,
+            filled_size=filled_size,
+            fill_price=fill_price,
+            raw_event=raw_event,
+            token_id=token_id,
+        )
         logger.info(
-            f"[HEDGE] Accumulated unhedged {total_size:.1f} shares @ avg {avg_price:.4f} "
-            f"-> placing SELL hedge @{hedge_price} (margin={margin}) for {market_id[:10]}"
+            "Fill event %s for order %s result=%s duplicate=%s",
+            event_id[:12],
+            order_id[:12],
+            result.status,
+            result.duplicate,
         )
 
-        try:
-            order_id = await oms.create_order(
-                condition_id=market_id,
-                token_id=token_id,
-                side=OrderSide.SELL,
-                price=hedge_price,
-                size=hedge_size,
-            )
-            if not order_id:
-                logger.warning("[HEDGE] OMS returned None for hedge SELL — order may have failed. Skipping notification.")
+    async def _is_local_order(self, order_id: str) -> bool:
+        async with AsyncSessionLocal() as session:
+            stmt = select(OrderJournal.order_id).filter(
+                or_(
+                    OrderJournal.order_id == order_id,
+                    OrderJournal.exchange_order_id == order_id,
+                )
+            ).limit(1)
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def handle_fill_if_local(
+        self,
+        *,
+        event_id: str,
+        order_id: str,
+        filled_size: float,
+        fill_price: float,
+        raw_event: dict,
+        token_id: Optional[str] = None,
+    ) -> None:
+        """Reject counterparty maker/taker rows that are not in our order journal.
+
+        The short retry window covers the valid race where User WS delivery beats
+        persistence of the exchange order id from the submit response.
+        """
+        for delay in (0.0, 0.05, 0.2, 0.75, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            if await self._is_local_order(order_id):
+                await self.handle_fill(
+                    event_id=event_id,
+                    order_id=order_id,
+                    filled_size=filled_size,
+                    fill_price=fill_price,
+                    raw_event=raw_event,
+                    token_id=token_id,
+                )
                 return
-            # Clear cumulative unhedged tracker now that hedge is placed
-            await inventory_state.clear_unhedged(market_id, is_yes)
-            # Notify the QuotingEngine so it can track the hedge lifecycle
-            await redis_client.publish(
-                f"hedge:{market_id}:{token_id}",
-                {
-                    "action": "hedge_placed",
-                    "order_id": order_id,
-                    "price": hedge_price,
-                    "size": hedge_size,
-                    "cost_basis": avg_price,
-                },
-            )
-            logger.info(f"[HEDGE] Hedge SELL placed: {order_id} @ {hedge_price}")
-        except Exception as e:
-            logger.error(f"[HEDGE] Failed to place hedge SELL: {e}", exc_info=True)
+        logger.info(
+            "Ignored trade candidate for non-local order %s after ownership retry",
+            str(order_id)[:12],
+        )
 
     async def handle_cancellation(self, order_id: str):
         """Handle order cancellation, including dust/partial fill cleanup."""
         market_id = None
         token_id = None
+        local_order_id = None
+        has_reservation = False
         async with AsyncSessionLocal() as session:
-            stmt = select(OrderJournal).filter(OrderJournal.order_id == order_id).with_for_update()
+            stmt = (
+                select(OrderJournal)
+                .filter(
+                    or_(
+                        OrderJournal.order_id == order_id,
+                        OrderJournal.exchange_order_id == order_id,
+                    )
+                )
+                .with_for_update()
+            )
             result = await session.execute(stmt)
             order = result.scalar_one_or_none()
             
             if order and order.status not in [OrderStatus.CANCELED, OrderStatus.FILLED]:
+                local_order_id = order.order_id
+                has_reservation = bool(order.reservation_id)
                 payload = dict(order.payload) if order.payload else {}
                 filled_size = float(payload.get("filled_size", 0.0))
                 original_size = float(order.size)
@@ -391,6 +363,15 @@ class UserStreamGateway:
                 order.payload = payload
                 order.status = OrderStatus.CANCELED
                 await session.commit()
+        if local_order_id and has_reservation:
+            # The cancel event can overtake an earlier trade event. Retain remaining
+            # capital/shares until authoritative reconciliation proves the final fill.
+            await risk_reservations.mark_cancel_pending_for_order(local_order_id)
+            trading_safety.set_readiness(
+                "open_orders_reconciled",
+                False,
+                "canceled BUY reservations await authoritative reconciliation",
+            )
         if market_id and token_id:
             await self._publish_order_status_event(market_id, token_id, order_id, "CANCELED")
 

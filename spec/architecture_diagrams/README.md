@@ -59,9 +59,9 @@ NO FV = 1 - YES FV
 
 ### 4. 四层风控
 ```
-L1: 报价前预检 (MAX_EXPOSURE_PER_MARKET = $50)
+L1: 报价前预检 (MAX_EXPOSURE_PER_MARKET = $40)
 L2: Watchdog 硬熔断 (每秒检查)
-L3: REST 周期对账 (RECONCILIATION_INTERVAL_SEC，默认 3600s)
+L3: REST 周期对账 (RECONCILIATION_INTERVAL_SEC，默认 300s)
 L4: 硬重置强制对账 (约每 300s 网格周期触发，见 quoting/engine)
 ```
 
@@ -97,9 +97,9 @@ score = rate × daily_roi / penalty
 ### 详细技术讲解
 - **入场**: `01_system_overview` + `02_module_relationships`
 - **核心**: `03_quoting_state_machine` + `04_tick_processing_flow` + `05_differential_quoting`
-- **差异化**: `06_fill_processing_flow` (内存优先设计)
+- **差异化**: `06_fill_processing_flow`（durable fill + cash + fee + deterministic replay）
 - **风控**: `07_risk_control_layers` + `08_watchdog_mechanism`
-- **高级**: `09_auto_router` + `10_hard_reset_flow`
+- **安全决策**: `10_hard_reset_flow`（已删除路径及权威订单对账替代方案）
 
 ### 面试/技术评估
 - **架构**: `01_system_overview` + `02_module_relationships`

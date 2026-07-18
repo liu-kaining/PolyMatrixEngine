@@ -8,20 +8,14 @@ from app.core.config import settings
 from app.core.exposure_limits import resolve_outcome_count
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
+from app.core.exit_policy import plan_bounded_sell
+from app.core.quote_economics import evaluate_quote_economics
+from app.core.trading_safety import TradingMode, trading_safety
+from app.market_data.integrity import assess_snapshot
 from app.oms.core import oms
-from app.risk.watchdog import watchdog
 from app.models.db_models import OrderSide, OrderStatus, OrderJournal
 
 logger = logging.getLogger(__name__)
-
-# Per-condition debounce so YES/NO engines do not both run wallet cancel_all + reconcile within 15s.
-_hard_reset_condition_last_mono: Dict[str, float] = {}
-_hard_reset_condition_lock = asyncio.Lock()
-# When set, no peer is in wallet cancel_all + local cancel + reconcile. Cleared for the whole critical section.
-_hard_reset_peer_gate = asyncio.Event()
-_hard_reset_peer_gate.set()
-HARD_RESET_CONDITION_DEBOUNCE_SEC = 15.0
-
 
 class AlphaPricingModel:
     """Calculates baseline probability based on inputs"""
@@ -89,11 +83,6 @@ class QuotingEngine:
         self.suspended = False # Internal flag for Kill Switch
         self.exit_mode = False   # Graceful exit: stop BUY, unwind inventory, then shut down
         self._shutdown_requested = False  # Set when exposure cleared so run() can break
-        self.last_grid_reset_time = time.time()
-
-        # V8.0: Hedge tracking — lifecycle managed in on_tick, created by user_stream on fill
-        self.hedge_sell_pending: Optional[Dict[str, Any]] = None
-        self._hedge_ticks_waited: int = 0
 
         # Outcomes: 2 = binary YES/NO; >2 = categorical (stricter MAX_EXPOSURE_CATEGORICAL)
         self.outcome_count: int = 2
@@ -111,6 +100,20 @@ class QuotingEngine:
         """
         return 0.0 if abs(exposure) < threshold else exposure
 
+    def _market_data_health(self, snapshot: Any):
+        is_live = trading_safety.mode is TradingMode.LIVE
+        return assess_snapshot(
+            snapshot,
+            max_age_seconds=float(settings.MARKET_DATA_MAX_AGE_SEC),
+            require_sequence=(
+                is_live and bool(settings.MARKET_DATA_REQUIRE_SEQUENCE_LIVE)
+            ),
+            require_exchange_timestamp=(
+                is_live
+                and bool(settings.MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE)
+            ),
+        )
+
     async def run(self):
         """Main loop for the quoting engine"""
         if not await self._bootstrap_context_and_inventory():
@@ -121,12 +124,10 @@ class QuotingEngine:
 
         pubsub = redis_client.client.pubsub()
         order_status_channel = f"order_status:{self.condition_id}:{self.token_id}"
-        hedge_channel = f"hedge:{self.condition_id}:{self.token_id}"
         await pubsub.subscribe(
             f"tick:{self.token_id}",
             f"control:{self.condition_id}",
             order_status_channel,
-            hedge_channel,
         )
         logger.info(
             f"QuotingEngine started for Condition {self.condition_id[:6]} | Token {self.token_id[:6]}. "
@@ -144,7 +145,16 @@ class QuotingEngine:
                         continue
                     data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
                 except (TypeError, ValueError, KeyError) as e:
-                    logger.warning(f"[{self.token_id[:6]}] PubSub message parse error: {e}. Skip.")
+                    self.suspended = True
+                    trading_safety.halt(
+                        f"quote input parse failure for {self.token_id[:12]}"
+                    )
+                    logger.exception(
+                        "[%s] PubSub message parse failed closed: %s",
+                        self.token_id[:6],
+                        e,
+                    )
+                    await self.cancel_all_orders()
                     continue
                 try:
                     if channel == f"control:{self.condition_id}":
@@ -154,26 +164,43 @@ class QuotingEngine:
                             await self.on_tick(data)
                     elif channel == order_status_channel:
                         await self.on_order_status_message(data)
-                    elif channel == hedge_channel:
-                        await self.on_hedge_message(data)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    self.suspended = True
+                    trading_safety.halt(
+                        f"quoting engine processing failure for {self.token_id[:12]}"
+                    )
                     logger.exception(
                         f"[{self.token_id[:6]}] Error processing channel {channel}: {e}. "
-                        "Engine continues to avoid permanent exit."
+                        "Engine suspended and canceling known orders."
                     )
+                    await self.cancel_all_orders()
                 if getattr(self, "_shutdown_requested", False):
                     break
         except asyncio.CancelledError:
             logger.info(f"QuotingEngine shutting down for Token {self.token_id}")
         finally:
+            try:
+                cancel_safe = await self.cancel_all_orders()
+                if cancel_safe is not True:
+                    trading_safety.halt(
+                        f"engine shutdown could not confirm cancels for {self.token_id[:12]}"
+                    )
+            except Exception as exc:
+                trading_safety.halt(
+                    f"engine shutdown cancel crashed for {self.token_id[:12]}"
+                )
+                logger.exception(
+                    "[%s] Engine shutdown cancellation failed: %s",
+                    self.token_id[:6],
+                    exc,
+                )
             # Ensure Redis resources are released
             await pubsub.unsubscribe(
                 f"tick:{self.token_id}",
                 f"control:{self.condition_id}",
                 order_status_channel,
-                hedge_channel,
             )
             await pubsub.close()
             logger.info(f"Redis PubSub closed for Token {self.token_id}")
@@ -190,7 +217,9 @@ class QuotingEngine:
                 res = await session.execute(
                     select(OrderJournal).filter(
                         OrderJournal.market_id == self.condition_id,
-                        OrderJournal.status.in_([OrderStatus.OPEN, OrderStatus.PENDING]),
+                        OrderJournal.status.in_(
+                            [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNKNOWN]
+                        ),
                     )
                 )
                 rows = res.scalars().all()
@@ -204,7 +233,8 @@ class QuotingEngine:
                             created_ts = float(o.created_at.timestamp())
                         except Exception:
                             created_ts = time.time()
-                    self.active_orders[o.order_id] = {
+                    active_id = o.exchange_order_id or o.order_id
+                    self.active_orders[active_id] = {
                         "side": o.side.value,
                         "price": float(o.price),
                         "size": float(o.size),
@@ -235,37 +265,6 @@ class QuotingEngine:
             # Release locked margin immediately
             await self._update_pending_buy_notional()
 
-    async def on_hedge_message(self, data: dict):
-        """Track hedge SELL orders created by user_stream on BUY fills."""
-        action = data.get("action")
-        if action == "hedge_placed":
-            hedge_order_id = data.get("order_id")
-            hedge_price = float(data.get("price", 0))
-            hedge_size = float(data.get("size", 0))
-            self.hedge_sell_pending = {
-                "price": hedge_price,
-                "size": hedge_size,
-                "cost_basis": float(data.get("cost_basis", 0)),
-                "order_id": hedge_order_id,
-            }
-            self._hedge_ticks_waited = 0
-            # CRITICAL: Register hedge order in active_orders so on_tick lifecycle
-            # check can detect fill/cancel via on_order_status_message.
-            # Without this, on_tick immediately clears the hedge as "resolved"
-            # because hedge orders bypass place_orders() and aren't tracked.
-            if hedge_order_id:
-                self.active_orders[hedge_order_id] = {
-                    "side": "SELL",
-                    "price": hedge_price,
-                    "size": hedge_size,
-                    "created_ts": time.time(),
-                }
-            logger.info(
-                f"[{self.token_id[:6]}] [HEDGE] Tracking hedge SELL: "
-                f"order_id={str(hedge_order_id)[:10] if hedge_order_id else 'None'}, "
-                f"price={hedge_price}, size={hedge_size}"
-            )
-
     async def on_control_message(self, data: dict):
         """Handle incoming signals from the Watchdog, API, or Auto-Router"""
         action = data.get("action")
@@ -274,7 +273,10 @@ class QuotingEngine:
                 self.suspended = True
                 logger.critical(f"[{self.token_id[:6]}] QuotingEngine SUSPENDED by Control Signal. Executing TRUE KILL SWITCH.")
                 # True Kill Switch: Must synchronously wait for all orphans to cancel
-                await self.cancel_all_orders()
+                if await self.cancel_all_orders() is not True:
+                    trading_safety.halt(
+                        f"suspend could not confirm cancels for {self.token_id[:12]}"
+                    )
                 await self._publish_engine_mode("SUSPENDED")
         elif action == "resume":
             async with self._trade_lock:
@@ -296,7 +298,10 @@ class QuotingEngine:
     async def _complete_graceful_exit(self, mode_label="GRACEFUL_EXIT"):
         """Cleanly release resources for this token engine upon exit."""
         logger.info(f"[QuotingEngine {self.condition_id[:10]}] {mode_label} complete. Shutting down.")
-        await self.cancel_all_orders()
+        if await self.cancel_all_orders() is not True:
+            trading_safety.halt(
+                f"graceful exit could not confirm cancels for {self.token_id[:12]}"
+            )
         side = "YES" if self.is_yes_token else "NO"
         if redis_client.client:
             await redis_client.client.delete(f"engine_state:{self.condition_id}:{side}")
@@ -389,25 +394,18 @@ class QuotingEngine:
         """
         Grid-budget-aware size calculation (return value = CLOB order size in **outcome shares**).
 
-        If AUTO_TUNE_FOR_REWARDS=True and rewards exist, auto-adjust size to rewards_min_size * 1.05.
-        Fallback logic: shrink to fit budget, or return 0.0 if below 5.0 (Polymarket min).
+        Rewards are never an input. Size comes from strategy configuration and is shrunk to
+        risk budgets, or rejected if it falls below the venue minimum.
 
         max_additional_notional: if set, notional for this order is capped so cumulative new BUYs
         stay within strict per-market budget (MTM inventory + opposite-side pending already deducted).
         """
-        auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
         max_exposure = self._per_market_exposure_cap()
-        # V8.0: single-side quoting uses half the slots → each BUY gets larger budget share
-        side_multiplier = 1 if getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False) else 2
-        total_slots = max(1, self.grid_levels * side_multiplier)
+        total_slots = max(1, self.grid_levels * 2)
         budget_per_order = max_exposure / total_slots
 
-        # 1. Determine target size: max(base_size, rewards_min*1.05) when rewards exist
-        if auto_tune and self.rewards_min_size > 0:
-            rewards_target = max(5.0, round(self.rewards_min_size * 1.05, 1))
-            target_size = max(self.base_size, rewards_target)
-        else:
-            target_size = self.base_size
+        # 1. Strategy size only; incentive metadata must not increase risk.
+        target_size = self.base_size
 
         # 2. Risk Check: Total exposure cost for this engine's grid levels
         # (Approximate check: target_size * grid_levels should not exceed max_exposure)
@@ -438,15 +436,7 @@ class QuotingEngine:
             if target_size > max_shares:
                 target_size = max_shares
 
-        # 4. Rewards-mode guardrail: avoid charity quoting when shrunk below rewards_min_size.
-        if auto_tune and self.rewards_min_size > 0 and target_size < self.rewards_min_size:
-            logger.warning(
-                f"[{self.token_id[:6]}] [REWARDS] Shrunk size {target_size:.1f} below rewards_min_size "
-                f"{self.rewards_min_size:.1f}. Dropping BUY order to avoid charity quoting."
-            )
-            return 0.0
-
-        # 5. Final floor check (Polymarket minimum)
+        # 4. Final floor check (Polymarket minimum)
         if target_size < 5.0:
             if target_size > 0:
                 logger.warning(
@@ -482,7 +472,17 @@ class QuotingEngine:
             )
         else:
             anchor = await redis_client.get_state(anchor_key)
-            if anchor and "fv_yes" in anchor:
+            anchor_age = float("inf")
+            if anchor and anchor.get("updated_at") is not None:
+                try:
+                    anchor_age = time.time() - float(anchor["updated_at"])
+                except (TypeError, ValueError):
+                    anchor_age = float("inf")
+            if (
+                anchor
+                and "fv_yes" in anchor
+                and 0.0 <= anchor_age <= float(settings.MARKET_DATA_MAX_AGE_SEC)
+            ):
                 fv_yes = max(0.01, min(0.99, float(anchor["fv_yes"])))
                 dynamic_spread = float(anchor.get("dynamic_spread", self.alpha_model.base_spread))
             else:
@@ -490,8 +490,13 @@ class QuotingEngine:
                 if not self.yes_token_id:
                     return None
                 yes_snap = await redis_client.get_state(f"ob:{self.yes_token_id}")
-                if not yes_snap:
-                    logger.debug(f"[{self.token_id[:6]}] Unified anchor missing; waiting for YES snapshot.")
+                health = self._market_data_health(yes_snap)
+                if not health.healthy:
+                    logger.warning(
+                        "[%s] Unified YES anchor is unsafe: %s",
+                        self.token_id[:6],
+                        health.reason,
+                    )
                     return None
                 yes_bids = yes_snap.get("bids", [])
                 yes_asks = yes_snap.get("asks", [])
@@ -516,94 +521,20 @@ class QuotingEngine:
         """Evaluate orderbook, apply unified FV + inventory state machine, execute dynamic spread."""
         bids = tick_data.get("bids", [])
         asks = tick_data.get("asks", [])
+        book_health = self._market_data_health(tick_data)
         
         await self._load_rewards_config()
 
         async with self._trade_lock:
-            # Block while peer engine runs wallet cancel_all + local cancel + reconcile (debounce lock is too short alone).
-            await _hard_reset_peer_gate.wait()
-
-            # If Periodic Hard Reset runs and REST reconcile fails, freeze NEW BUYs for this tick only.
-            freeze_buys_post_reset_reconcile_fail = False
-
-            # Ghost Order TTL Hard Reset (Every 5 minutes)
-            if not self.exit_mode and time.time() - self.last_grid_reset_time > 300:
-                skip_peer_reset = False
-                run_wallet_reset = False
-                async with _hard_reset_condition_lock:
-                    now_mono = time.monotonic()
-                    last_mono = _hard_reset_condition_last_mono.get(self.condition_id, 0.0)
-                    if now_mono - last_mono < HARD_RESET_CONDITION_DEBOUNCE_SEC:
-                        skip_peer_reset = True
-                    else:
-                        _hard_reset_condition_last_mono[self.condition_id] = now_mono
-                        _hard_reset_peer_gate.clear()
-                        run_wallet_reset = True
-
-                if skip_peer_reset:
-                    logger.info(
-                        f"[{self.token_id[:6]}] Periodic Hard Reset skipped: same condition_id ran within "
-                        f"{HARD_RESET_CONDITION_DEBOUNCE_SEC:.0f}s (peer engine likely triggered cancel-all)."
-                    )
-                    self.last_grid_reset_time = time.time()
-                else:
-                    logger.warning(
-                        f"[{self.token_id[:6]}] Periodic Hard Reset: Clearing potential ghost orders to free up budget."
-                    )
-                    # V6.4: Wallet-wide CLOB cancel_all FIRST (kills exchange-side ghosts), then settle sleep,
-                    # then local OMS cleanup + REST inventory reconcile.
-                    hard_reset_usdc_balance_label = "unknown"
-                    try:
-                        try:
-                            hr = await oms.physical_clob_cancel_all_for_hard_reset()
-                            hard_reset_usdc_balance_label = str(
-                                hr.get("usdc_balance_label", "unknown")
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"[{self.token_id[:6]}] [HARD RESET] physical_clob_cancel_all_for_hard_reset error: {e}",
-                                exc_info=True,
-                            )
-
-                        await self.cancel_all_orders(force_evict=True)
-                        reconcile_ok = False
-                        try:
-                            reconcile_ok = await watchdog.reconcile_single_market(
-                                self.condition_id, force=True
-                            )
-                            if reconcile_ok:
-                                logger.info(
-                                    f"[{self.token_id[:6]}] Post-reset REST inventory sync completed for condition."
-                                )
-                            else:
-                                logger.warning(
-                                    f"[{self.token_id[:6]}] Post-reset REST sync skipped or failed; "
-                                    "verify FUNDER_ADDRESS and InventoryLedger row."
-                                )
-                        except Exception as e:
-                            logger.error(
-                                f"[{self.token_id[:6]}] Post-reset reconcile_single_market error: {e}",
-                                exc_info=True,
-                            )
-                            reconcile_ok = False
-
-                        if not reconcile_ok:
-                            freeze_buys_post_reset_reconcile_fail = True
-                            logger.error(
-                                f"[{self.token_id[:6]}] FREEZE NEW BUYS (this tick only): post-reset reconciliation "
-                                "did not succeed — will not place BUY grid on uncertain inventory; SELL/unwind still allowed."
-                            )
-
-                        logger.info(
-                            f"[{self.token_id[:6]}] [HARD RESET] Local state synced. "
-                            f"Fresh USDC balance available: ${hard_reset_usdc_balance_label}. Resuming quoting."
-                        )
-                    finally:
-                        if run_wallet_reset:
-                            _hard_reset_peer_gate.set()
-
-                    self.last_grid_reset_time = time.time()
-                    # Removed early return: proceed to rebuild the grid in the current tick.
+            if not book_health.healthy:
+                logger.error(
+                    "[%s] Market data rejected: %s. Canceling known orders and pausing quotes.",
+                    self.token_id[:6],
+                    book_health.reason,
+                )
+                await self.cancel_all_orders()
+                await self._publish_engine_mode("MARKET_DATA_INVALID")
+                return
 
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:
@@ -620,12 +551,6 @@ class QuotingEngine:
             opposite_exposure = no_exposure if self.is_yes_token else yes_exposure
             # Dust immunity: treat exposure < 1.0 as 0 for mode decisions (is_long, cross_token_locked)
             current_exposure_for_logic = self._dust_filter(current_exposure)
-            opposite_exposure_for_logic = self._dust_filter(opposite_exposure)
-
-            actual_capital_used = (
-                float(snap.get("yes_capital_used", 0.0))
-                + float(snap.get("no_capital_used", 0.0))
-            )
             my_pending_notional = (
                 float(snap.get("pending_yes_buy_notional", 0.0))
                 if self.is_yes_token
@@ -664,61 +589,10 @@ class QuotingEngine:
             # 2. Unified pricing (YES anchor + NO derived from 1-FV_yes)
             unified = await self._get_unified_fair_value(bids, asks)
             if unified is None:
+                await self.cancel_all_orders()
+                await self._publish_engine_mode("MARKET_DATA_INVALID")
                 return
             fair_value, dynamic_spread, fv_yes = unified
-
-            # V8.0: Single-sided cheap-side gate — only BUY tokens priced below CHEAP_SIDE_MAX_PRICE
-            cheap_side_only = getattr(settings, "SINGLE_SIDE_CHEAP_ONLY", False)
-            cheap_max = float(getattr(settings, "CHEAP_SIDE_MAX_PRICE", 0.45))
-            cheap_side_blocked = cheap_side_only and fair_value >= cheap_max
-
-            if cheap_side_blocked and current_exposure_for_logic < 5.0 and not self.exit_mode:
-                # No exposure to unwind and this is the expensive side → nothing to do
-                await self._publish_engine_mode(
-                    "CHEAP_SIDE_GATE", fair_value=fair_value, fv_yes=fv_yes,
-                    current_exposure=current_exposure, opposite_exposure=opposite_exposure,
-                )
-                logger.debug(
-                    f"[{self.token_id[:6]}] CHEAP_SIDE_GATE: FV {fair_value:.4f} >= {cheap_max}. "
-                    "No BUY on expensive side, no exposure to unwind. Skip."
-                )
-                return
-
-            # V8.0: Hedge SELL lifecycle — if waiting, count ticks and decay price toward breakeven
-            if self.hedge_sell_pending and not self.exit_mode:
-                self._hedge_ticks_waited += 1
-                hedge_order_id = self.hedge_sell_pending.get("order_id")
-                # Check if hedge order was already filled/canceled
-                if hedge_order_id and hedge_order_id not in self.active_orders:
-                    logger.info(f"[{self.token_id[:6]}] [HEDGE] Hedge order resolved (filled/canceled). Clearing tracker.")
-                    self.hedge_sell_pending = None
-                    self._hedge_ticks_waited = 0
-                elif self._hedge_ticks_waited > int(getattr(settings, "HEDGE_DECAY_TICKS", 10)):
-                    # Decay: lower hedge price toward cost_basis (breakeven)
-                    cost_basis = float(self.hedge_sell_pending.get("cost_basis", 0))
-                    original_margin = float(getattr(settings, "HEDGE_MARGIN_CENTS", 0.02))
-                    decay_steps = int(getattr(settings, "HEDGE_DECAY_TICKS", 10))
-                    ticks_past = self._hedge_ticks_waited - decay_steps
-                    decay_factor = max(0.0, 1.0 - (ticks_past / max(1, decay_steps * 2)))
-                    new_price = round(cost_basis + original_margin * decay_factor, 2)
-                    new_price = max(0.01, min(0.99, new_price))
-                    old_price = self.hedge_sell_pending.get("price", 0)
-                    if abs(new_price - old_price) >= 0.01 and hedge_order_id:
-                        logger.info(
-                            f"[{self.token_id[:6]}] [HEDGE DECAY] Lowering hedge SELL: "
-                            f"{old_price} -> {new_price} (cost_basis={cost_basis})"
-                        )
-                        # Cancel old hedge and let sync_orders_diff place new one
-                        await oms.cancel_order(hedge_order_id)
-                        self.active_orders.pop(hedge_order_id, None)
-                        self.hedge_sell_pending["price"] = new_price
-                        self.hedge_sell_pending["order_id"] = None
-                    if decay_factor <= 0:
-                        logger.warning(
-                            f"[{self.token_id[:6]}] [HEDGE] Decay exhausted at breakeven. Clearing hedge tracker."
-                        )
-                        self.hedge_sell_pending = None
-                        self._hedge_ticks_waited = 0
 
             # Strict per-market "used" budget: MTM inventory + all active BUY notional (bulletproof vs stale capital_used).
             fv_y_anchor = max(0.01, min(0.99, float(fv_yes)))
@@ -735,9 +609,8 @@ class QuotingEngine:
             if not self.exit_mode and self.last_anchor_mid_price is not None:
                 price_diff = abs(fair_value - self.last_anchor_mid_price)
                 if price_diff <= self.price_offset_threshold:
-                    # After a Periodic Hard Reset, active_orders may be empty.
-                    # In that case, we must NOT early-return, otherwise the engine will
-                    # stay with no orders on the book.
+                    # If local active orders are empty after confirmed cancels/restart,
+                    # do not debounce the rebuild or the engine would stay idle.
                     if len(self.active_orders) > 0:
                         logger.debug(
                             f"[{self.token_id[:6]}] Tick ignored: Fair Value diff ({price_diff:.4f}) "
@@ -748,29 +621,9 @@ class QuotingEngine:
             # Update the baseline anchor mid-price for future comparisons
             self.last_anchor_mid_price = fair_value
             
-            # [AUTOTUNE] Auto-Spread 动态点差决策
-            auto_tune = getattr(settings, "AUTO_TUNE_FOR_REWARDS", False)
-            if auto_tune and self.rewards_min_size > 0 and self.rewards_max_spread > 0:
-                logger.info(
-                    f"[{self.token_id[:6]}] [AUTOTUNE] Market has rewards! "
-                    f"MinSize: {self.rewards_min_size}, MaxSpread: {self.rewards_max_spread:.4f}."
-                )
-                target_spread = self.rewards_max_spread * 0.95  # 5% safety margin
-                base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
-
-                # Force dynamic_spread to be AT LEAST base_spread, but NEVER EXCEED target_spread
-                dynamic_spread = min(max(dynamic_spread, base_spread), target_spread)
-
-                target_size_log = max(5.0, round(self.rewards_min_size * 1.05, 1))
-                logger.info(
-                    f"[{self.token_id[:6]}] [AUTOTUNE] Auto-adjusting -> "
-                    f"Size: {target_size_log:.1f} | Spread: {dynamic_spread:.4f}."
-                )
-
             # 4. Calculate optimal grid bounds based on Skewed Fair Value and Dynamic Spread
             anchor_distance = dynamic_spread / 2.0
             bid_1 = round(fair_value - anchor_distance, 2)
-            ask_1 = round(fair_value + anchor_distance, 2)
 
             # Construct grid orders JSON
             orders_payload: List[dict] = []
@@ -800,30 +653,44 @@ class QuotingEngine:
             # --- Line 1: SELL side (unwind / take profit / stop loss) ---
             if current_exposure_for_logic >= 5.0 or force_taker_exit:
                 if is_extreme_long or force_taker_exit:
-                    if force_taker_exit:
+                    exit_intent = plan_bounded_sell(
+                        bids=bids,
+                        requested_size=min(
+                            current_exposure, max(self.base_size, 5.0)
+                        ),
+                        exposure=current_exposure,
+                        capital_used=my_capital_used,
+                        max_book_impact=float(settings.EXIT_MAX_BOOK_IMPACT),
+                        max_realized_loss_fraction=float(
+                            settings.EXIT_MAX_REALIZED_LOSS_FRACTION
+                        ),
+                    )
+                    if exit_intent is None:
                         logger.warning(
-                            f"[{self.token_id[:6]}] GRACEFUL EXIT: forcing EXTREME TAKER (exposure {current_exposure:.2f}). "
-                            "Funds must be recovered within seconds."
+                            "[%s] Bounded exit is waiting: visible bid depth does not satisfy "
+                            "impact/loss floors.",
+                            self.token_id[:6],
                         )
+                        ask_price = None
                     else:
+                        ask_price = exit_intent.limit_price
                         logger.warning(
-                            f"[{self.token_id[:6]}] EXTREME INVENTORY (strict_used ${strict_local_used_dollars:.2f} >= ${extreme_threshold_dollars:.2f}). "
-                            "Entering EXTREME TAKER LIQUIDATION."
+                            "[%s] Bounded depth-aware exit: limit=%s size=%s "
+                            "impact_floor=%s loss_floor=%s",
+                            self.token_id[:6],
+                            exit_intent.limit_price,
+                            exit_intent.size,
+                            exit_intent.impact_floor,
+                            exit_intent.loss_floor,
                         )
-                    ask_price = max(0.01, min(0.99, round(best_bid_price - 0.02, 2)))
                 else:
                     logger.warning(
                         f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
-                        "MAKER UNWINDING (earn spread + ask-side rewards)."
+                        "MAKER UNWINDING (earn spread)."
                     )
                     ask_price = round(fair_value + anchor_distance, 2)
                     safe_maker_floor = round(best_bid_price + self.tick_size, 2)
                     ask_price = max(safe_maker_floor, ask_price)
-                    # V8.0: Clamp SELL price within rewards band to earn ask-side rewards
-                    if self.rewards_max_spread > 0:
-                        rewards_ceil = round(fair_value + self.rewards_max_spread / 2.0, 2)
-                        if ask_price > rewards_ceil:
-                            ask_price = max(safe_maker_floor, rewards_ceil)
                     
                     if ask_price > 0.99:
                         logger.warning(
@@ -840,10 +707,11 @@ class QuotingEngine:
                             f"[{self.token_id[:6]}] Inventory too small to sell (${current_exposure:.2f} < $5.0). Skipping."
                         )
                     else:
-                        sell_size = min(current_exposure, max(self.base_size, 5.0))
-                        # V8.0: Ensure SELL size meets rewards_min_size for ask-side rewards
-                        if self.rewards_min_size > 0 and sell_size < self.rewards_min_size and current_exposure >= self.rewards_min_size:
-                            sell_size = min(current_exposure, self.rewards_min_size)
+                        sell_size = (
+                            exit_intent.size
+                            if (is_extreme_long or force_taker_exit)
+                            else min(current_exposure, max(self.base_size, 5.0))
+                        )
                         orders_payload.append(
                             {
                                 "condition_id": self.condition_id,
@@ -860,7 +728,13 @@ class QuotingEngine:
                         )
 
             # --- Line 2: BUY side (build position / take liquidity when safe) ---
+            new_risk_blocked = not bool(settings.OFFLINE_VALIDATED_ALPHA_ENABLED)
             strict_budget_block_buys = strict_local_used_dollars >= max_exposure_per_market - 1e-6
+            if new_risk_blocked and not self.exit_mode:
+                logger.warning(
+                    "[%s] New BUY risk disabled: no offline-validated alpha is armed.",
+                    self.token_id[:6],
+                )
             if strict_budget_block_buys and not self.exit_mode:
                 if self.outcome_count > 2:
                     logger.warning(
@@ -873,16 +747,11 @@ class QuotingEngine:
                         f"[{self.token_id[:6]}] STRICT BUDGET CAP: MTM+pending ${strict_local_used_dollars:.2f} "
                         f">= MAX_EXPOSURE_PER_MARKET ${max_exposure_per_market:.2f} — no new BUY orders."
                     )
-            if freeze_buys_post_reset_reconcile_fail and not self.exit_mode:
-                logger.warning(
-                    f"[{self.token_id[:6]}] Post-reset reconcile freeze active — skipping BUY grid build."
-                )
             if (
                 not is_extreme_long
                 and not self.exit_mode
                 and not strict_budget_block_buys
-                and not freeze_buys_post_reset_reconcile_fail
-                and not cheap_side_blocked
+                and not new_risk_blocked
             ):
                 if cross_token_locked:
                     logger.warning(
@@ -921,6 +790,28 @@ class QuotingEngine:
                             continue
                         seen_bid_prices.add(bid_price)
 
+                        economics = evaluate_quote_economics(
+                            side=OrderSide.BUY.value,
+                            limit_price=bid_price,
+                            fair_value=fair_value,
+                            execution_cost_buffer=float(
+                                settings.EXECUTION_COST_BUFFER
+                            ),
+                            adverse_selection_buffer=float(
+                                settings.ADVERSE_SELECTION_BUFFER
+                            ),
+                            minimum_net_edge=float(settings.MIN_EXPECTED_NET_EDGE),
+                        )
+                        if not economics.allowed:
+                            logger.info(
+                                "[%s] BUY@%s rejected by net-edge gate: net=%s min=%s",
+                                self.token_id[:6],
+                                bid_price,
+                                f"{economics.net_edge:.4f}",
+                                f"{float(settings.MIN_EXPECTED_NET_EDGE):.4f}",
+                            )
+                            continue
+
                         effective_size = self._compute_effective_size(
                             bid_price, max_additional_notional=buy_budget_remaining
                         )
@@ -939,40 +830,14 @@ class QuotingEngine:
                             0.0, buy_budget_remaining - effective_size * bid_price
                         )
 
-            # V8.0: Inject hedge SELL into orders_payload if pending and needs (re-)placement
-            if (
-                self.hedge_sell_pending
-                and not self.exit_mode
-                and self.hedge_sell_pending.get("order_id") is None
-                and current_exposure >= 5.0
-            ):
-                h_price = float(self.hedge_sell_pending["price"])
-                h_size = min(float(self.hedge_sell_pending["size"]), current_exposure)
-                if h_size >= 5.0:
-                    orders_payload.append({
-                        "condition_id": self.condition_id,
-                        "token_id": self.token_id,
-                        "side": OrderSide.SELL,
-                        "price": max(0.01, min(0.99, h_price)),
-                        "size": h_size,
-                    })
-                    logger.info(
-                        f"[{self.token_id[:6]}] [HEDGE] Injecting hedge SELL into grid: "
-                        f"price={h_price}, size={h_size}"
-                    )
-
             if self.exit_mode:
                 mode = "GRACEFUL_EXIT"
             elif is_extreme_long:
                 mode = "EXTREME_LIQUIDATING"
-            elif freeze_buys_post_reset_reconcile_fail:
-                mode = "POST_RESET_RECONCILE_FREEZE"
+            elif new_risk_blocked:
+                mode = "NO_VALIDATED_ALPHA"
             elif cross_token_locked:
                 mode = "LOCKED_BY_OPPOSITE"
-            elif cheap_side_blocked:
-                mode = "CHEAP_SIDE_GATE"
-            elif self.hedge_sell_pending:
-                mode = "HEDGING"
             else:
                 mode = "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
 
@@ -1016,9 +881,6 @@ class QuotingEngine:
                 f"{mode}"
             )
             # 5b. Balance pre-check: trim BUY orders if budget exceeded (all in Dollars)
-            if freeze_buys_post_reset_reconcile_fail:
-                orders_payload = [o for o in orders_payload if o["side"] != OrderSide.BUY]
-
             global_other_markets_dollars = await inventory_state.get_global_used_dollars_excluding(self.condition_id)
             orders_payload = self._apply_balance_precheck(
                 orders_payload,
@@ -1042,7 +904,17 @@ class QuotingEngine:
             logger.info("=========================================================================")
             
             # 6. Diff Quoting: keep unchanged orders, cancel stale, create missing
-            await self.sync_orders_diff(orders_payload, fair_value=fair_value)
+            await self.sync_orders_diff(
+                orders_payload,
+                fair_value=fair_value,
+                force_cancel_undesired_buys=(
+                    new_risk_blocked
+                    or strict_budget_block_buys
+                    or self.exit_mode
+                    or is_extreme_long
+                    or cross_token_locked
+                ),
+            )
 
     def _apply_balance_precheck(
         self,
@@ -1061,9 +933,9 @@ class QuotingEngine:
         cap = (
             float(per_market_cap)
             if per_market_cap is not None
-            else float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+            else float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 40.0))
         )
-        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 1000.0))
+        global_max_budget = float(getattr(settings, "GLOBAL_MAX_BUDGET", 280.0))
 
         local_available = max(0.0, cap - local_used_dollars_excluding_me)
         global_used = global_other_markets_dollars + local_used_dollars_excluding_me
@@ -1151,19 +1023,6 @@ class QuotingEngine:
             notional=total_buy_notional
         )
 
-    def _is_within_rewards_spread(self, price: float, fair_value: Optional[float]) -> bool:
-        """
-        Keep-live guard:
-        if order price is still within rewards max spread around FV, prefer not to churn.
-        """
-        if fair_value is None:
-            return False
-        rewards_max_spread = float(getattr(self, "rewards_max_spread", 0.0) or 0.0)
-        if rewards_max_spread <= 0:
-            return False
-        # rewards_max_spread is full spread; price distance is half-spread distance from FV.
-        return abs(float(price) - float(fair_value)) <= (rewards_max_spread / 2.0)
-
     def _consume_compatible_desired_order(
         self,
         desired_by_sig: Dict[Tuple[str, float, float], List[dict]],
@@ -1187,7 +1046,13 @@ class QuotingEngine:
                     desired_by_sig.pop(sig, None)
                 return
 
-    async def sync_orders_diff(self, desired_orders: List[dict], fair_value: Optional[float] = None):
+    async def sync_orders_diff(
+        self,
+        desired_orders: List[dict],
+        fair_value: Optional[float] = None,
+        *,
+        force_cancel_undesired_buys: bool = False,
+    ):
         desired_by_sig: Dict[Tuple[str, float, float], List[dict]] = defaultdict(list)
         for o in desired_orders:
             sig = self._order_signature(o["side"].value, o["price"], o["size"])
@@ -1197,7 +1062,6 @@ class QuotingEngine:
         to_cancel: List[str] = []
         kept_for_lifetime = 0
         kept_for_price_offset = 0
-        kept_for_rewards_band = 0
         now_ts = time.time()
         reconciliation_buffer_seconds = float(
             getattr(settings, "RECONCILIATION_BUFFER_SECONDS", 8.0)
@@ -1206,6 +1070,11 @@ class QuotingEngine:
             getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.01)
         )
         for order_id, meta in list(self.active_orders.items()):
+            if force_cancel_undesired_buys and str(
+                meta.get("side", "")
+            ).upper() == OrderSide.BUY.value:
+                to_cancel.append(order_id)
+                continue
             sig = self._order_signature(
                 str(meta.get("side", "")),
                 float(meta.get("price", 0.0)),
@@ -1217,8 +1086,13 @@ class QuotingEngine:
                 if not bucket:
                     desired_by_sig.pop(sig, None)
             else:
-                # Anti-churn gates for non-exact replacement:
-                # 1) minimum life-time, 2) FV price offset, 3) rewards-band keep-alive.
+                # Never preserve an undesired BUY for queue priority/rewards. A risk or
+                # economics contraction must remove old new-risk intents immediately.
+                if str(meta.get("side", "")).upper() == OrderSide.BUY.value:
+                    to_cancel.append(order_id)
+                    continue
+                # Anti-churn gates for non-exact SELL replacement: minimum lifetime and
+                # fair-value proximity only. Incentives never keep stale risk-reduction orders.
                 created_ts = float(meta.get("created_ts", now_ts))
                 if "created_ts" not in meta:
                     # Older cache entries: initialize to "now" to avoid immediate churn.
@@ -1230,10 +1104,6 @@ class QuotingEngine:
                 price_diff_from_fv = (
                     abs(order_price - float(fair_value)) if fair_value is not None else float("inf")
                 )
-                keep_rewards = (not self.exit_mode) and self._is_within_rewards_spread(
-                    order_price, fair_value
-                )
-
                 if age_sec < reconciliation_buffer_seconds:
                     kept_for_lifetime += 1
                     self._consume_compatible_desired_order(
@@ -1246,22 +1116,14 @@ class QuotingEngine:
                         desired_by_sig, side, order_price, price_offset_threshold
                     )
                     continue
-                if keep_rewards:
-                    kept_for_rewards_band += 1
-                    self._consume_compatible_desired_order(
-                        desired_by_sig, side, order_price, price_offset_threshold
-                    )
-                    continue
-
                 to_cancel.append(order_id)
 
         # 2) Cancel only stale orders.
-        if kept_for_lifetime or kept_for_price_offset or kept_for_rewards_band:
+        if kept_for_lifetime or kept_for_price_offset:
             logger.info(
                 f"[{self.token_id[:6]}] Diff quoting anti-churn keep: "
                 f"lifetime={kept_for_lifetime}, "
-                f"price_offset={kept_for_price_offset}, "
-                f"rewards_band={kept_for_rewards_band} "
+                f"price_offset={kept_for_price_offset} "
                 f"(buffer={reconciliation_buffer_seconds:.2f}s, "
                 f"offset={price_offset_threshold:.4f})"
             )
@@ -1276,6 +1138,17 @@ class QuotingEngine:
                     logger.warning(
                         f"[{self.token_id[:6]}] Diff cancel failed for {order_id}: {success}"
                     )
+            if any(result is not True for result in results):
+                trading_safety.set_readiness(
+                    "open_orders_reconciled",
+                    False,
+                    "quote replacement cancel was not confirmed",
+                )
+                trading_safety.halt(
+                    f"quote replacement cancel failed for {self.token_id[:12]}"
+                )
+                await self._update_pending_buy_notional()
+                return
 
         # 3) Create only missing desired orders.
         to_create = [o for bucket in desired_by_sig.values() for o in bucket]
@@ -1308,26 +1181,30 @@ class QuotingEngine:
                     "size": float(order_req["size"]),
                     "created_ts": time.time(),
                 }
-                # V8.0: Track hedge SELL order_id for lifecycle management
-                if (
-                    self.hedge_sell_pending
-                    and order_req["side"] == OrderSide.SELL
-                    and self.hedge_sell_pending.get("order_id") is None
-                    and abs(float(order_req["price"]) - self.hedge_sell_pending.get("price", -1)) < 0.005
-                ):
-                    self.hedge_sell_pending["order_id"] = res
-                    logger.info(f"[{self.token_id[:6]}] [HEDGE] Hedge SELL order tracked: {res[:10]}")
+            elif isinstance(res, Exception):
+                logger.error(
+                    "[%s] Order placement task crashed for %s %s@%s: %s",
+                    self.token_id[:6],
+                    order_req["side"].value,
+                    order_req["size"],
+                    order_req["price"],
+                    res,
+                )
+            else:
+                logger.warning(
+                    "[%s] Order placement was rejected/blocked for %s %s@%s",
+                    self.token_id[:6],
+                    order_req["side"].value,
+                    order_req["size"],
+                    order_req["price"],
+                )
 
-    async def cancel_all_orders(self, force_evict: bool = False):
-        """Cancel current active grid and ensure no orphan orders remain."""
-        # V8.0: Clear hedge tracker — the hedge order will be canceled below
-        self.hedge_sell_pending = None
-        self._hedge_ticks_waited = 0
-
+    async def cancel_all_orders(self):
+        """Cancel the cached grid and return True only when every cancel is confirmed."""
         if not self.active_orders:
             # Still update notional to 0 just to be sure
             await self._update_pending_buy_notional()
-            return
+            return True
             
         order_ids = list(self.active_orders.keys())
         logger.info(f"[{self.token_id[:6]}] Canceling {len(order_ids)} active orders...")
@@ -1336,7 +1213,7 @@ class QuotingEngine:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for order_id, success in zip(order_ids, results):
-            if success is True or force_evict:
+            if success is True:
                 self.active_orders.pop(order_id, None)
             else:
                 # Downgraded from CRITICAL: OMS already handles matched-order scenarios
@@ -1344,6 +1221,7 @@ class QuotingEngine:
                 logger.warning(f"[{self.token_id[:6]}] Cancel failed for order {order_id} (reason: {success}). Will retry next tick.")
                 
         await self._update_pending_buy_notional()
+        return not self.active_orders
 
 async def start_quoting_engine(condition_id: str, token_id: str):
     engine = QuotingEngine(condition_id, token_id)

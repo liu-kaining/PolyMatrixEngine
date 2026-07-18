@@ -16,7 +16,7 @@ def exposure_cap_usd_for_outcome_count(outcome_count: int) -> float:
     n = int(outcome_count) if outcome_count else 2
     if n > 2:
         return float(getattr(settings, "MAX_EXPOSURE_CATEGORICAL", 30.0))
-    return float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 50.0))
+    return float(getattr(settings, "MAX_EXPOSURE_PER_MARKET", 40.0))
 
 
 def _parse_outcome_count_from_redis(payload: Optional[Dict[str, Any]]) -> Optional[int]:

@@ -1,0 +1,52 @@
+name: Offline Safety Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TRADING_MODE: disabled
+      LIVE_TRADING_ENABLED: "False"
+      LIVE_FEE_ACCOUNTING_VALIDATED: "False"
+      AUTO_ROUTER_ENABLED: "False"
+      OFFLINE_VALIDATED_ALPHA_ENABLED: "False"
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres_password@localhost:5432/polymatrix
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt ruff
+
+      - name: Static checks
+        run: |
+          ruff check . --exclude venv
+          python -m compileall -q app dashboard tests alembic/versions
+
+      - name: Offline unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Render all migrations without a database
+        run: |
+          python -m alembic heads
+          python -m alembic upgrade base:head --sql
+
+      - name: Parse Compose configuration without starting services
+        run: |
+          cp .env.example .env
+          docker compose config -q

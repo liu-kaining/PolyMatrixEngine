@@ -3,6 +3,8 @@ services:
     build: .
     container_name: polymatrix_api
     restart: always
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:
@@ -13,8 +15,18 @@ services:
       - PM_CHAIN_ID=137
       - PK=${PK}
       - FUNDER_ADDRESS=${FUNDER_ADDRESS}
+      - TRADING_MODE=${TRADING_MODE:-disabled}
       - LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-False}
-      - MAX_EXPOSURE_PER_MARKET=${MAX_EXPOSURE_PER_MARKET:-50.0}
+      - LIVE_ARM_TOKEN=${LIVE_ARM_TOKEN:-}
+      - LIVE_ARM_EXPIRES_AT=${LIVE_ARM_EXPIRES_AT:-}
+      - LIVE_ALLOWED_FUNDER_ADDRESSES=${LIVE_ALLOWED_FUNDER_ADDRESSES:-}
+      - LIVE_BUDGET_CAP_USD=${LIVE_BUDGET_CAP_USD:-100.0}
+      - LIVE_FEE_ACCOUNTING_VALIDATED=${LIVE_FEE_ACCOUNTING_VALIDATED:-False}
+      - APP_CODE_COMMIT=${APP_CODE_COMMIT:-}
+      - ALPHA_STRATEGY_ID=${ALPHA_STRATEGY_ID:-maker-alpha-v2}
+      - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
+      - ENABLE_ADMIN_WIPE=${ENABLE_ADMIN_WIPE:-False}
+      - MAX_EXPOSURE_PER_MARKET=${MAX_EXPOSURE_PER_MARKET:-40.0}
       - EXPOSURE_TOLERANCE=${EXPOSURE_TOLERANCE:-0.01}
       - RECONCILIATION_BUFFER_SECONDS=${RECONCILIATION_BUFFER_SECONDS:-8.0}
       - TRADING_LOG_PATH=/app/data/logs/trading.log
@@ -24,7 +36,6 @@ services:
       redis:
         condition: service_started
     volumes:
-      - ./.env:/app/.env
       # Shared log volume so dashboard can read trading.log
       - logs_data:/app/data/logs
 
@@ -38,9 +49,9 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres_password@postgres:5432/polymatrix
       - API_URL=http://api:8000
+      - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
       - TRADING_LOG_PATH=/app/data/logs/trading.log
     volumes:
-      - ./.env:/app/.env
       # Mount the same logs volume used by the API so we can read trading.log
       - logs_data:/app/data/logs
     depends_on:

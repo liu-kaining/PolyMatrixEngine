@@ -1,4 +1,4 @@
-# PolyMatrix Engine V6.4 系统概览
+# PolyMatrix Engine 安全整改后系统概览
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -10,7 +10,7 @@
 flowchart TB
     subgraph Client["客户端层"]
         Dashboard["Streamlit 驾驶舱<br/>监控 + 控制"]
-        API["FastAPI 控制面<br/>/start /stop /liquidate"]
+        API["FastAPI 控制面<br/>/start /stop /halt /audit"]
     end
 
     subgraph Infra["基础设施"]
@@ -34,10 +34,10 @@ flowchart TB
         subgraph Risk["风控平面"]
             Watchdog["Watchdog<br/>每秒检查"]
             KillSwitch["Kill Switch<br/>硬熔断"]
-            Reconciler["对账引擎<br/>reconcile_positions<br/>间隔默认 3600s"]
+            Reconciler["对账引擎<br/>reconcile_positions<br/>间隔默认 300s"]
         end
 
-        InvState["InventoryStateManager<br/>内存优先 + 异步持久化"]
+        InvState["InventoryStateManager<br/>已提交版本化快照"]
     end
 
     subgraph Execution["执行平面"]
@@ -124,11 +124,11 @@ flowchart LR
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| MAX_EXPOSURE_PER_MARKET | $50 | 单市场敞口上限 |
+| MAX_EXPOSURE_PER_MARKET | $40 | 单市场敞口上限 |
 | GLOBAL_MAX_BUDGET | $1000 | 全局资金上限 |
 | EXPOSURE_TOLERANCE | 1% | 对账容差 |
 | RECONCILIATION_BUFFER | 8s | 时间保护窗口 |
-| RECONCILIATION_INTERVAL_SEC | 3600s（默认） | Watchdog 全量对账；`.env` 可改 |
+| RECONCILIATION_INTERVAL_SEC | 300s（默认） | Watchdog 全量比较；`.env` 可改 |
 | HARD_RESET_INTERVAL | 5min | 硬重置间隔 |
 | EVENT_HORIZON | 24h | 事件地平线 |
 | CIRCUIT_BREAKER_FAILURES | 5次 | 熔断阈值 |

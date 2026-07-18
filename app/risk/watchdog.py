@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 import httpx
-from typing import Dict, Optional
 from sqlalchemy.future import select
 
 from app.db.session import AsyncSessionLocal
@@ -12,63 +11,56 @@ from app.core.exposure_limits import exposure_cap_usd_for_condition_redis_only
 from app.oms.core import oms
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
+from app.core.trading_safety import trading_safety
+from app.core.position_reconciliation import (
+    build_actual_inventory_from_positions,
+    normalize_condition_id,
+    reconcile_capital_used,
+)
+from app.risk.reservations import risk_reservations
 
 logger = logging.getLogger(__name__)
 
-def _norm_cid(cid: Optional[str]) -> Optional[str]:
-    if not cid or not isinstance(cid, str):
-        return None
-    s = cid.strip()
-    if s.startswith("0x"):
-        return s.lower()
-    return s
-
-
-def _build_actual_inventory_from_positions(positions: list) -> Dict[str, Dict[str, float]]:
-    """Group Polymarket Data API positions by normalized conditionId -> {yes, no} sizes."""
-    actual_inventory: Dict[str, Dict[str, float]] = {}
-    for p in positions:
-        cid = p.get("conditionId")
-        if not cid:
-            continue
-        key = _norm_cid(cid)
-        if key is None:
-            continue
-        if key not in actual_inventory:
-            actual_inventory[key] = {"yes": 0.0, "no": 0.0}
-        outcome_idx = p.get("outcomeIndex")
-        size = float(p.get("size", 0.0))
-        if outcome_idx == 0 or str(p.get("outcome")).upper() == "YES":
-            actual_inventory[key]["yes"] += size
-        else:
-            actual_inventory[key]["no"] += size
-    return actual_inventory
-
-
 class RiskMonitor:
     def __init__(self):
-        self.reconciliation_interval = int(getattr(settings, "RECONCILIATION_INTERVAL_SEC", 60))
+        self.reconciliation_interval = max(
+            60, int(getattr(settings, "RECONCILIATION_INTERVAL_SEC", 60))
+        )
         self.exposure_tolerance = settings.EXPOSURE_TOLERANCE
         self.reconciliation_buffer_seconds = float(
             getattr(settings, "RECONCILIATION_BUFFER_SECONDS", 8.0)
         )
+        self._global_kill_triggered = False
 
     async def run(self):
         """Background daemon polling risk metrics and reconciling"""
         logger.info("Watchdog started: Monitoring Delta Exposure & Reconciliation")
-        
-        # Start the reconciliation loop as a background task
-        asyncio.create_task(self.reconciliation_loop())
-        
-        while True:
-            try:
-                await self.check_exposure()
-                await asyncio.sleep(1) # Poll every second
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Watchdog error: {e}")
-                await asyncio.sleep(5)
+        trading_safety.set_readiness("risk_monitor", False, "risk monitor is starting")
+
+        reconciliation_task = asyncio.create_task(self.reconciliation_loop())
+        try:
+            while True:
+                try:
+                    await self.check_exposure()
+                    trading_safety.set_readiness(
+                        "risk_monitor", True, "risk monitor completed its latest cycle"
+                    )
+                    await asyncio.sleep(1)  # Poll every second
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    trading_safety.set_readiness(
+                        "risk_monitor", False, "risk monitor cycle failed"
+                    )
+                    trading_safety.halt(f"risk monitor cycle failed: {e}")
+                    logger.exception("Watchdog cycle failed closed: %s", e)
+                    await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            trading_safety.set_readiness("risk_monitor", False, "risk monitor stopped")
+            reconciliation_task.cancel()
+            await asyncio.gather(reconciliation_task, return_exceptions=True)
 
     async def check_exposure(self):
         """
@@ -78,85 +70,51 @@ class RiskMonitor:
         # 1. Get all active condition_ids from the EngineSupervisor
         from app.core.market_lifecycle import get_active_router_markets
         active_cids = get_active_router_markets()
+        known_cids = await inventory_state.get_all_market_ids()
+        global_reserved, reserved_by_market = await risk_reservations.totals()
 
-        for cid in active_cids:
-            snap = await inventory_state.get_snapshot(cid)
-            # ONLY use actual spent capital for the hard kill switch
-            actual_used_dollars = (
-                float(snap.get("yes_capital_used", 0.0))
-                + float(snap.get("no_capital_used", 0.0))
-            )
+        all_cids = known_cids.union(active_cids).union(reserved_by_market)
+        for cid in all_cids:
+            capital_used = await inventory_state.get_market_capital_used(cid)
+            risk_used_dollars = capital_used + float(reserved_by_market.get(cid, 0.0))
 
             per_market_cap = await exposure_cap_usd_for_condition_redis_only(cid)
-            if actual_used_dollars <= per_market_cap:
+            if risk_used_dollars <= per_market_cap:
                 continue
 
-            # 3. Breach detected: Verify status in DB before triggering
+            # 3. Breach detected: hold a session for the suspend transaction.
             async with AsyncSessionLocal() as session:
-                stmt = select(MarketMeta).filter(MarketMeta.condition_id == cid)
-                result = await session.execute(stmt)
-                market = result.scalar_one_or_none()
-
-                if market and (market.status or "").lower() == "suspended":
-                    continue
-
                 logger.critical(
-                    f"RISK BREACH (Actual Capital): Market {cid[:12]} exceeded limit (${per_market_cap:.2f})! "
-                    f"actual_used_dollars: ${actual_used_dollars:.2f}"
+                    f"RISK BREACH: Market {cid[:12]} exceeded limit (${per_market_cap:.2f})! "
+                    f"capital_plus_reservations: ${risk_used_dollars:.2f}"
                 )
-                await self.trigger_kill_switch(cid, session)
+                if cid in active_cids:
+                    await self.trigger_kill_switch(cid, session)
+                else:
+                    trading_safety.halt(
+                        f"inactive/cold market {cid[:12]} exceeds its risk cap"
+                    )
+                    logger.critical(
+                        "Cold-position risk breach for %s; no engine is active, new risk halted.",
+                        cid[:12],
+                    )
 
-        # 4. V8.0: Per-market unrealized PnL stop-loss
-        stop_loss_usd = float(getattr(settings, "PER_MARKET_STOP_LOSS_USD", 5.0))
-        if stop_loss_usd > 0:
-            for cid in active_cids:
-                try:
-                    fv_anchor = await redis_client.get_state(f"fv_anchor:{cid}")
-                    if not fv_anchor or "fv_yes" not in fv_anchor:
-                        continue
-                    fv_yes = float(fv_anchor["fv_yes"])
-                    pnl_data = await inventory_state.get_unrealized_pnl(cid, fv_yes)
-                    total_unrealized = float(pnl_data.get("total_unrealized_pnl", 0.0))
-                    if total_unrealized < -stop_loss_usd:
-                        logger.critical(
-                            f"PER-MARKET STOP-LOSS: {cid[:12]} unrealized PnL ${total_unrealized:.2f} "
-                            f"< -${stop_loss_usd:.2f}. Triggering graceful_exit."
-                        )
-                        await redis_client.publish(f"control:{cid}", {"action": "graceful_exit"})
-                except Exception as e:
-                    logger.debug(f"PnL stop-loss check error for {cid[:12]}: {e}")
-
-        # 5. Global Budget Check (all in Dollars)
-        global_used_dollars = await inventory_state.get_global_used_dollars()
+        # 4. Global Budget Check (all in Dollars)
+        global_used_dollars = (
+            await inventory_state.get_global_capital_used()
+        ) + global_reserved
         global_max = float(getattr(settings, "GLOBAL_MAX_BUDGET", 280.0))
-        if global_used_dollars > global_max * 1.05:
+        if global_used_dollars > global_max:
             logger.critical(
                 f"GLOBAL RISK BREACH: Total used ${global_used_dollars:.2f} exceeds budget ${global_max:.2f}!"
             )
-            # V8.0: Actually take action — find worst-performing market and exit it
-            worst_cid = None
-            worst_pnl = 0.0
-            for cid in active_cids:
-                try:
-                    fv_anchor = await redis_client.get_state(f"fv_anchor:{cid}")
-                    if not fv_anchor or "fv_yes" not in fv_anchor:
-                        continue
-                    pnl_data = await inventory_state.get_unrealized_pnl(cid, float(fv_anchor["fv_yes"]))
-                    total_pnl = float(pnl_data.get("total_unrealized_pnl", 0.0))
-                    if total_pnl < worst_pnl:
-                        worst_pnl = total_pnl
-                        worst_cid = cid
-                except Exception:
-                    pass
-            if worst_cid:
-                logger.critical(
-                    f"GLOBAL BREACH ACTION: Exiting worst market {worst_cid[:12]} "
-                    f"(unrealized PnL: ${worst_pnl:.2f})"
-                )
-                await redis_client.publish(f"control:{worst_cid}", {"action": "graceful_exit"})
+            if not self._global_kill_triggered:
+                self._global_kill_triggered = True
+                await self.trigger_global_kill_switch(all_cids, active_cids)
                     
     async def trigger_kill_switch(self, condition_id: str, session):
         """Emergency procedure: cancel all orders, suspend quoting"""
+        trading_safety.halt(f"market risk cap breached for {condition_id[:12]}")
         logger.error(f"!!! KILL SWITCH ACTIVATED for {condition_id} !!!")
         
         # 1. Suspend Quoting (Communicate to QuotingEngine via DB and Redis)
@@ -167,18 +125,64 @@ class RiskMonitor:
         if market and market.status != "suspended":
             market.status = "suspended"
             await session.commit()
-            
-            # Send pub/sub message to tell engine to halt immediately
-            await redis_client.publish(f"control:{condition_id}", {"action": "suspend"})
-            logger.info(f"Published suspend signal for {condition_id}")
+
+        # The database may already say suspended while a stale/restarted engine is still
+        # running. Always publish the immediate control signal for an active breach.
+        await redis_client.publish(f"control:{condition_id}", {"action": "suspend"})
+        logger.info(f"Published suspend signal for {condition_id}")
         
         # 2. Soft Cancel via Relayer (Cancel all active orders for this market)
-        await oms.cancel_market_orders(condition_id)
+        cancel_safe = await oms.cancel_market_orders(condition_id)
+        if cancel_safe is not True:
+            trading_safety.halt(
+                f"market kill switch could not confirm every cancel for {condition_id[:12]}"
+            )
+            logger.critical(
+                "Market kill switch cancellation incomplete for %s", condition_id[:12]
+            )
+
+    async def trigger_global_kill_switch(self, target_cids, active_cids):
+        """Block new risk globally, suspend every engine and cancel every known active order."""
+        trading_safety.halt("GLOBAL_MAX_BUDGET breached")
+        results = {}
+        for condition_id in sorted(target_cids):
+            try:
+                if condition_id in active_cids:
+                    await redis_client.publish(
+                        f"control:{condition_id}", {"action": "suspend"}
+                    )
+                results[condition_id] = await oms.cancel_market_orders(condition_id)
+            except Exception as exc:
+                results[condition_id] = False
+                logger.exception(
+                    "Global kill failed while suspending/canceling %s: %s",
+                    condition_id[:12],
+                    exc,
+                )
+        if target_cids:
+            async with AsyncSessionLocal() as session:
+                rows = (
+                    await session.execute(
+                        select(MarketMeta).filter(MarketMeta.condition_id.in_(target_cids))
+                    )
+                ).scalars().all()
+                for market in rows:
+                    market.status = "suspended"
+                await session.commit()
+        failed = [cid for cid, success in results.items() if success is not True]
+        if failed:
+            logger.critical(
+                "GLOBAL KILL INCOMPLETE for %d market(s): %s",
+                len(failed),
+                ", ".join(cid[:12] for cid in failed),
+            )
+        else:
+            logger.critical("GLOBAL KILL completed for %d active market(s).", len(results))
 
     async def reconciliation_loop(self):
         """
         Periodically sync actual on-chain positions from Polymarket Data API.
-        Default interval is 3600s (see RECONCILIATION_INTERVAL_SEC) to avoid hammering data-api;
+        Default interval is 300s (see RECONCILIATION_INTERVAL_SEC);
         intraday risk uses in-memory inventory + User WS fills.
         """
         if not settings.FUNDER_ADDRESS:
@@ -195,114 +199,21 @@ class RiskMonitor:
             except Exception as e:
                 logger.error(f"Reconciliation loop error: {e}")
 
-    async def reconcile_single_market(self, condition_id: str, *, force: bool = False) -> bool:
-        """
-        REST sync for one condition_id (e.g. after Periodic Hard Reset).
-        When force=True, skip RECONCILIATION_BUFFER_SECONDS guard so WS drops cannot block truth.
-        """
-        if not settings.FUNDER_ADDRESS:
-            logger.warning("reconcile_single_market: FUNDER_ADDRESS not set; skip.")
-            return False
-        url = f"https://data-api.polymarket.com/positions?user={settings.FUNDER_ADDRESS}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, timeout=15.0)
-                if resp.status_code != 200:
-                    logger.error(f"reconcile_single_market: positions HTTP {resp.status_code}")
-                    return False
-                positions = resp.json()
-        except Exception as e:
-            logger.error(f"reconcile_single_market: fetch failed: {e}")
-            return False
-        if not isinstance(positions, list):
-            logger.error(f"reconcile_single_market: bad positions type {type(positions)}")
-            return False
-
-        actual_inventory = _build_actual_inventory_from_positions(positions)
-        key = _norm_cid(condition_id)
-        actual = actual_inventory.get(key, {"yes": 0.0, "no": 0.0}) if key else {"yes": 0.0, "no": 0.0}
-
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(InventoryLedger)
-                .filter(InventoryLedger.market_id == condition_id)
-                .with_for_update()
-            )
-            db_inv = result.scalar_one_or_none()
-            if not db_inv:
-                logger.warning(
-                    "reconcile_single_market: no InventoryLedger row for %s; cannot sync",
-                    condition_id[:12],
-                )
-                return False
-
-            db_yes = float(db_inv.yes_exposure)
-            db_no = float(db_inv.no_exposure)
-            diff_yes = abs(db_yes - actual["yes"])
-            diff_no = abs(db_no - actual["no"])
-
-            if diff_yes <= self.exposure_tolerance and diff_no <= self.exposure_tolerance:
-                # Memory can still be wrong (WS drops) while DB/API agree — re-push truth.
-                if force:
-                    await inventory_state.apply_reconciliation_snapshot(
-                        market_id=condition_id,
-                        yes_exposure=actual["yes"],
-                        no_exposure=actual["no"],
-                        yes_capital_used=float(db_inv.yes_capital_used),
-                        no_capital_used=float(db_inv.no_capital_used),
-                    )
-                return True
-
-            if not force:
-                last_local_fill_ts = await inventory_state.get_last_local_fill_timestamp(condition_id)
-                if (
-                    last_local_fill_ts > 0
-                    and (time.time() - last_local_fill_ts) < self.reconciliation_buffer_seconds
-                ):
-                    logger.info(
-                        "reconcile_single_market: skipped (recent local fill, not force) %s",
-                        condition_id[:12],
-                    )
-                    return False
-
-            logger.warning(
-                "reconcile_single_market: overwriting ledger for %s API YES=%.4f NO=%.4f (was YES=%.4f NO=%.4f) force=%s",
-                condition_id[:12],
-                actual["yes"],
-                actual["no"],
-                db_yes,
-                db_no,
-                force,
-            )
-            db_inv.yes_exposure = actual["yes"]
-            db_inv.no_exposure = actual["no"]
-            if actual["yes"] <= 0.001:
-                db_inv.yes_capital_used = 0.0
-            elif db_yes > 1e-9:
-                db_inv.yes_capital_used = float(db_inv.yes_capital_used) * (actual["yes"] / db_yes)
-            if actual["no"] <= 0.001:
-                db_inv.no_capital_used = 0.0
-            elif db_no > 1e-9:
-                db_inv.no_capital_used = float(db_inv.no_capital_used) * (actual["no"] / db_no)
-
-            await inventory_state.apply_reconciliation_snapshot(
-                market_id=condition_id,
-                yes_exposure=actual["yes"],
-                no_exposure=actual["no"],
-                yes_capital_used=float(db_inv.yes_capital_used),
-                no_capital_used=float(db_inv.no_capital_used),
-            )
-            await session.commit()
-        return True
-
-    async def reconcile_positions(self, *, force: bool = False):
+    async def reconcile_positions(self):
         """
         Full REST reconciliation vs Data API for all ledger rows.
-        When force=True (e.g. User WS reconnect), skip RECONCILIATION_BUFFER_SECONDS so missed fills can be repaired.
+        The recent-fill guard is mandatory because the Data API can lag local commits.
         """
         if not settings.FUNDER_ADDRESS:
             logger.debug("reconcile_positions: FUNDER_ADDRESS not set; skip.")
-            return
+            trading_safety.set_readiness(
+                "positions_reconciled", False, "FUNDER_ADDRESS is not configured"
+            )
+            return False
+
+        trading_safety.set_readiness(
+            "positions_reconciled", False, "full position reconciliation in progress"
+        )
 
         # 1. Fetch real on-chain positions
         url = f"https://data-api.polymarket.com/positions?user={settings.FUNDER_ADDRESS}"
@@ -311,29 +222,62 @@ class RiskMonitor:
             resp = await client.get(url, timeout=10.0)
             if resp.status_code != 200:
                 logger.error(f"Failed to fetch positions. Status: {resp.status_code}")
-                return
+                trading_safety.set_readiness(
+                    "positions_reconciled", False, "positions API returned a non-200 status"
+                )
+                return False
                 
             positions = resp.json()
             
         if not isinstance(positions, list):
             logger.error(f"Unexpected positions format: {type(positions)}")
-            return
+            trading_safety.set_readiness(
+                "positions_reconciled", False, "positions API response format is invalid"
+            )
+            return False
 
-        actual_inventory = _build_actual_inventory_from_positions(positions)
+        actual_inventory = build_actual_inventory_from_positions(positions)
 
         # 2. Compare with DB Ledger (row-level lock to prevent dirty writes from concurrent handle_fill)
         async with AsyncSessionLocal() as session:
             stmt = select(InventoryLedger).with_for_update()
             result = await session.execute(stmt)
             db_inventories = result.scalars().all()
+            reconciliation_safe = True
+            db_condition_keys = {
+                normalize_condition_id(inv.market_id)
+                for inv in db_inventories
+                if normalize_condition_id(inv.market_id)
+            }
+            unknown_external = {
+                key: value
+                for key, value in actual_inventory.items()
+                if key not in db_condition_keys
+                and (value["yes"] > 0.001 or value["no"] > 0.001)
+            }
+            if unknown_external:
+                reconciliation_safe = False
+                trading_safety.halt(
+                    f"{len(unknown_external)} external positions have no local ledger"
+                )
+                logger.critical(
+                    "[SAFETY] External positions without local ledgers: %s",
+                    ", ".join(key[:12] for key in sorted(unknown_external)),
+                )
             
             for db_inv in db_inventories:
                 cid = db_inv.market_id
-                key = _norm_cid(cid)
+                key = normalize_condition_id(cid)
+                empty_actual = {
+                    "yes": 0.0,
+                    "no": 0.0,
+                    "yes_cost": 0.0,
+                    "no_cost": 0.0,
+                }
                 actual = (
-                    actual_inventory.get(key, {"yes": 0.0, "no": 0.0})
+                    actual_inventory.get(key, empty_actual)
                     if key
-                    else {"yes": 0.0, "no": 0.0}
+                    else empty_actual
                 )
                 
                 db_yes = float(db_inv.yes_exposure)
@@ -342,13 +286,19 @@ class RiskMonitor:
                 diff_yes = abs(db_yes - actual["yes"])
                 diff_no = abs(db_no - actual["no"])
                 
-                if diff_yes > self.exposure_tolerance or diff_no > self.exposure_tolerance:
+                capital_missing = (
+                    (actual["yes"] > 0.001 and float(db_inv.yes_capital_used or 0.0) <= 0)
+                    or (actual["no"] > 0.001 and float(db_inv.no_capital_used or 0.0) <= 0)
+                )
+                if (
+                    diff_yes > self.exposure_tolerance
+                    or diff_no > self.exposure_tolerance
+                    or capital_missing
+                ):
                     last_local_fill_ts = await inventory_state.get_last_local_fill_timestamp(cid)
-                    if (
-                        not force
-                        and last_local_fill_ts > 0
-                        and (time.time() - last_local_fill_ts) < self.reconciliation_buffer_seconds
-                    ):
+                    if last_local_fill_ts > 0 and (
+                        time.time() - last_local_fill_ts
+                    ) < self.reconciliation_buffer_seconds:
                         logger.info(
                             "本地刚刚发生真实成交，暂不信任远端 REST API 延迟数据，跳过本次对账"
                         )
@@ -357,6 +307,7 @@ class RiskMonitor:
                             f"(age={time.time() - last_local_fill_ts:.2f}s < "
                             f"buffer={self.reconciliation_buffer_seconds:.2f}s)"
                         )
+                        reconciliation_safe = False
                         continue
 
                     logger.error(f"RECONCILIATION MISMATCH for {cid[:8]}!")
@@ -365,17 +316,27 @@ class RiskMonitor:
                     
                     db_inv.yes_exposure = actual["yes"]
                     db_inv.no_exposure = actual["no"]
+                    db_inv.state_version = int(db_inv.state_version or 0) + 1
 
-                    # Zero-out or proportionally adjust phantom capital
-                    if actual["yes"] <= 0.001:
-                        db_inv.yes_capital_used = 0.0
-                    elif db_yes > 1e-9:
-                        db_inv.yes_capital_used = float(db_inv.yes_capital_used) * (actual["yes"] / db_yes)
-
-                    if actual["no"] <= 0.001:
-                        db_inv.no_capital_used = 0.0
-                    elif db_no > 1e-9:
-                        db_inv.no_capital_used = float(db_inv.no_capital_used) * (actual["no"] / db_no)
+                    yes_capital, _ = reconcile_capital_used(
+                        actual_size=actual["yes"],
+                        reported_cost=actual["yes_cost"],
+                        previous_size=db_yes,
+                        previous_capital_used=float(db_inv.yes_capital_used or 0.0),
+                    )
+                    no_capital, _ = reconcile_capital_used(
+                        actual_size=actual["no"],
+                        reported_cost=actual["no_cost"],
+                        previous_size=db_no,
+                        previous_capital_used=float(db_inv.no_capital_used or 0.0),
+                    )
+                    db_inv.yes_capital_used = yes_capital
+                    db_inv.no_capital_used = no_capital
+                    reconciliation_safe = False
+                    db_inv.accounting_version = "unverified_external"
+                    trading_safety.halt(
+                        f"external position mismatch invalidated accounting for {cid[:12]}"
+                    )
 
                     logger.info(f"Local ledger overwritten with on-chain data for {cid[:8]}")
 
@@ -386,8 +347,19 @@ class RiskMonitor:
                         no_exposure=actual["no"],
                         yes_capital_used=float(db_inv.yes_capital_used),
                         no_capital_used=float(db_inv.no_capital_used),
+                        state_version=int(db_inv.state_version or 0),
                     )
             
             await session.commit()
+        trading_safety.set_readiness(
+            "positions_reconciled",
+            reconciliation_safe,
+            (
+                "full position reconciliation completed"
+                if reconciliation_safe
+                else "reconciliation found untracked positions requiring offline recovery"
+            ),
+        )
+        return reconciliation_safe
 
 watchdog = RiskMonitor()

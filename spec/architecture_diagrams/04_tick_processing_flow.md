@@ -111,7 +111,7 @@ flowchart TB
     class Y,Z,AA,AB,AC exec
 ```
 
-## 热路径关键指标
+## 热路径与事实层边界
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
@@ -121,16 +121,14 @@ flowchart TB
   'lineColor': '#64748b'
 }}%%
 flowchart LR
-    subgraph Metrics["性能指标"]
-        A["端到端延迟<br/>< 10ms"]
-        B["内存读取<br/>InventoryStateManager"]
-        C["并发发单<br/>asyncio.gather"]
-        D["异步持久化<br/>maxsize=1000"]
+    subgraph Metrics["可验证边界"]
+        A["报价 tick<br/>只读已提交快照"]
+        B["订单准入<br/>DB 原子 reservation"]
+        C["成交处理<br/>DB 原子事实事务"]
+        D["提交后<br/>按 state_version 更新内存"]
     end
 
-    A -->|"热路径零DB"| B
-    B -->|"批量并发"| C
-    C -->|"有界队列"| D
+    A --> B --> C --> D
 
     classDef metric fill:#1e3a5f,stroke:#334155,color:#fff
     class A,B,C,D metric

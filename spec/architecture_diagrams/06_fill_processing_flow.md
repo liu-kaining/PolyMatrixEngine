@@ -1,227 +1,43 @@
-# 成交处理流程
+# 当前成交处理流程
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e3a5f',
-  'primaryTextColor': '#ffffff',
-  'primaryBorderColor': '#334155',
-  'lineColor': '#64748b'
-}}%%
-flowchart TB
-    subgraph WS["WebSocket 事件"]
-        A["User WebSocket<br/>wss://ws-subscriptions-clob.polymarket.com/ws/user"]
-        B["消息类型:<br/>trade / order"]
-    end
-
-    subgraph Parse["消息解析"]
-        C["process_message()<br/>JSON 解析"]
-        D{"event_type?"}
-        E["handle_fill()<br/>成交处理"]
-        F["handle_cancellation()<br/>撤单处理"]
-    end
-
-    subgraph FillHandler["UserStreamGateway 成交处理"]
-        H["DB 更新 OrderJournal<br/>filled_size, status"]
-        I["直接调用<br/>inventory_state.apply_fill()"]
-        J["异步队列持久化"]
-    end
-
-    subgraph InvUpdate["库存状态更新（apply_fill）"]
-        K["yes/no_exposure<br/>capital_used / realized_pnl"]
-    end
-
-    subgraph AsyncPersist["异步持久化"]
-        O["有界队列<br/>maxsize=1000"]
-        P{"队列满?"}
-        Q["尾部丢弃<br/>(极少发生)"]
-        R["异步写入<br/>InventoryLedger"]
-    end
-
-    subgraph Notify["状态通知"]
-        S["Redis PubSub<br/>order_status:{cid}:{token}"]
-        T["QuotingEngine 订阅<br/>清理 active_orders"]
-    end
-
-    %% 连接
-    A --> B
-    B --> C
-    C --> D
-    D -->|trade| E
-    D -->|order| F
-
-    E --> H
-    F --> H
-
-    H --> I
-    I --> K
-    K --> O
-    O --> P
-    P -->|Yes| Q
-    P -->|No| R
-    Q --> R
-
-    R --> S
-    S --> T
-
-    %% 样式 - 专业沉稳配色
-    classDef ws fill:#0891b2,stroke:#0e7490,color:#fff
-    classDef handler fill:#7c3aed,stroke:#6d28d9,color:#fff
-    classDef memory fill:#475569,stroke:#334155,color:#fff
-    classDef persist fill:#059669,stroke:#047857,color:#fff
-    classDef notify fill:#dc2626,stroke:#b91c1c,color:#fff
-
-    class A,B ws
-    class E,F,H handler
-    class I,J,K memory
-    class O,P,Q,R persist
-    class S,T notify
-```
-
-## 成交处理核心代码
-
-```python
-async def handle_fill(self, order_id: str, filled_size: float, fill_price: float):
-    """
-    UserStreamGateway 成交处理核心逻辑
-    1. DB 持久化 (同步) - 更新 OrderJournal
-    2. 内存更新 (同步) - 直接调用 inventory_state.apply_fill()
-    3. 异步队列持久化 - 通过 inventory_state 内部队列
-    4. Redis PubSub 通知 QuotingEngine
-    """
-    # 1. DB 更新
-    async with AsyncSessionLocal() as session:
-        order = await session.get(OrderJournal, order_id)
-        # ... 更新 filled_size, status
-        await session.commit()
-        market_id = order.market_id
-        side = order.side.value
-        token_id = payload.get("token_id")
-
-    # 2. 内存优先更新 (直接调用，不是通过 OMS)
-    tokens = await self._resolve_market_tokens(session, market_id)
-    if tokens and token_id:
-        is_yes = token_id == tokens["yes_token_id"]
-        updated = await inventory_state.apply_fill(
-            market_id=market_id,
-            is_yes=is_yes,
-            side=side,
-            filled_size=filled_size,
-            fill_price=fill_price,
-        )
-
-    # 3. Redis PubSub 通知 QuotingEngine 清理 active_orders
-    await self._publish_order_status_event(market_id, token_id, order_id, "FILLED")
-```
-
-## 内存优先设计
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e3a5f',
-  'primaryTextColor': '#ffffff',
-  'primaryBorderColor': '#334155',
-  'lineColor': '#64748b'
-}}%%
-flowchart LR
-    subgraph Traditional["传统方案"]
-        A1["DB 写入"]
-        A2["返回成功"]
-        A3["更新内存"]
-        A1 --> A2 --> A3
-    end
-
-    subgraph PolyMatrix["内存优先方案"]
-        B1["内存更新"]
-        B2["返回成功"]
-        B3["异步队列"]
-        B4["DB 持久化"]
-        B1 --> B2 --> B3 --> B4
-    end
-
-    classDef traditional fill:#dc2626,stroke:#b91c1c,color:#fff
-    classDef good fill:#059669,stroke:#047857,color:#fff
-
-    class A1,A2,A3 traditional
-    class B1,B2,B3,B4 good
-```
-
-## 异步持久化队列
-
-```python
-class InventoryStateManager:
-    def __init__(self):
-        self._persist_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-
-    async def apply_fill(self, ...):
-        """同步: 内存更新"""
-        # 更新内存状态
-        self.yes_exposure += size  # BUY YES
-        self.capital_used[token_id] += size * price
-
-        # 异步持久化入队
-        try:
-            self._persist_queue.put_nowait({
-                "action": "fill",
-                "condition_id": condition_id,
-                "token_id": token_id,
-                "side": side,
-                "size": size,
-                "price": price,
-                "timestamp": now()
-            })
-        except asyncio.QueueFull:
-            logger.warning("Persist queue full, dropping tail")
-
-    async def _persist_drain_loop(self):
-        """后台持久化循环"""
-        while not self._shutdown:
-            try:
-                batch = []
-                # 批量获取 (最多 100 条或超时 1s)
-                for _ in range(100):
-                    try:
-                        item = self._persist_queue.get_nowait()
-                        batch.append(item)
-                    except asyncio.QueueEmpty:
-                        break
-
-                if batch:
-                    await self._batch_persist(batch)
-
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Persist error: {e}")
-```
-
-## 连接、认证与断线修补（与 `user_stream.py` 一致）
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {
-  'primaryColor': '#1e3a5f',
-  'primaryTextColor': '#ffffff',
-  'primaryBorderColor': '#334155',
-  'lineColor': '#64748b'
-}}%%
 sequenceDiagram
-    participant WS as UserStreamGateway
-    participant OMS as oms ClobClient
-    participant WD as watchdog
+    participant WS as User WebSocket
+    participant Own as Local order ownership filter
+    participant Inbox as fill_events
+    participant DB as Postgres transaction
+    participant Cash as fill_cash_ledger
+    participant Inv as InventoryLedger
+    participant Mem as InventoryStateManager
 
-    WS->>OMS: 等待 client.creds 就绪
-    WS->>WS: websockets.connect<br/>ping_interval 20
-
-    WS->>WS: _authenticate() 订阅 user
-    WS->>WD: reconcile_positions(force=True)<br/>修补断线窗口
-    WD-->>WS: async task 已投递
-
-    loop _listen
-        WS->>WS: wait_for(ws.recv, 45s)
-        WS->>WS: process_message / handle_fill
+    WS->>Own: trade candidate (maker/taker rows)
+    Own->>Own: local/exchange order id lookup + bounded race retry
+    alt 非本地订单
+        Own-->>WS: ignore counterparty row
+    else 本地订单
+        Own->>Inbox: deterministic event_id, insert RECEIVED
+        Inbox->>DB: lock fill/order/reservation/inventory
+        DB->>DB: validate token, side, price, cumulative size
+        DB->>DB: decrement BUY/SELL reservation
+        DB->>Cash: signed gross cash + explicit fee or UNKNOWN
+        DB->>Inv: fee-aware average-cost accounting
+        DB->>DB: increment state_version; mark fill PROCESSED
+        DB-->>Inbox: atomic commit
+        Inbox->>Mem: apply exact committed state_version snapshot
     end
-
-    Note over WS: recv 超时或断连 → 退出 with 块 →<br/>退避重连（指数上限 60s）
 ```
 
----
+## 不变量
 
-*设计亮点: 内存优先保证热路径零延迟，有界队列保证内存安全，关闭排空保证不丢数据*
+- `event_id` 对同一 exchange trade/order/role 是确定性的；重复消息不会重复记账。
+- User WS payload 中的对手方 maker/taker row 必须先证明属于本地 OrderJournal。
+- fill、reservation、cash、inventory、order 与 inbox 状态在同一事务内提交。
+- BUY fill 不得高于订单 limit；累计 fill 不得超过原始订单 size；SELL 不得超过已知持仓。
+- 明确 BUY fee 进入成本，明确 SELL fee 从收入扣除；不明确的 fee 保留 `UNKNOWN`，不按 0。
+- 每个成功 fill 记录其 `accounting_state_version`，启动/管理端可从零重放并核对最终账本。
+- 数据库提交成功后才更新内存；内存拒绝旧 `state_version` 覆盖新状态。
+- `UNMAPPED`、`FAILED`、缺 cash、版本断档或 replay mismatch 都会阻止会计 readiness。
+
+## 断线边界
+
+User WS 重连只触发 Data API 仓位比较，并继续遵守 recent-fill delay guard。仓位 API 不能恢复成交顺序和手续费，因此差异会使会计降级并 Halt；完整恢复仍依赖后续认证 trade-history backfill。

@@ -1,5 +1,7 @@
 # 自动路由与组合管理
 
+> **安全边界：仅限 paper/research。** 当前路由按 rewards 评分，不是经过验证的交易 alpha；`TradingSafetyGate.assert_router_start_allowed()` 在 live 模式无条件拒绝启动，且不存在可解锁它的 live arm。
+
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {
   'primaryColor': '#1e3a5f',

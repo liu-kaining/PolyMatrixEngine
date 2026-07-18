@@ -1,221 +1,103 @@
-# PolyMatrix Engine 架构总览
+# PolyMatrix Engine 当前架构总览
 
-## 构建目标
-PolyMatrix Engine 是一个面向 Polymarket 的自动做市引擎，它将实时市场数据、用户成交流、做市策略、风控守护与可视化监控统一编排在一个全栈系统内。
+> 实盘结论：**NO-GO**。当前代码已经建立 fail-closed 工程边界，但真实数据契约、历史成交/账本恢复和策略盈利统计仍未完成。
 
-## 核心模块
-1. **Data Plane（数据面）**
-   - `market_data/` 负责消费 Polymarket 的 Market WS 与 User WS，维护本地 Orderbook 快照、同步成交和撤单，并持续更新 `OrderJournal` 与 `InventoryLedger`。
-   - `gamma_client` 为 condition_id 提供 token_id 解析，并支持市场筛选功能。
-2. **Quoting & Execution Plane（做市与执行）**
-   - `quoting/engine.py` 中的 AlphaModel 结合订单簿平衡 + 库存偏移，驱动智能定价与动态 spread，再交由 `oms/core.py` 进行风险感知的下单/撤单循环。
-   - OMS 中包含 Dry-Run 模式、Circuit Breaker 熔断和对接 py-clob-client 的真实下单。
-3. **Risk Plane（风控）**
-   - `risk/watchdog.py` 每秒检查风险敞口（以 `capital_used` 为准），超限时 suspend/cancel；并按 `RECONCILIATION_INTERVAL_SEC`（默认 60s）周期与 Polymarket **Data API** 对账；`quoting/engine.py` 在 **Periodic Hard Reset** 后调用 `reconcile_single_market(..., force=True)`，失败则本 tick 冻结新 BUY。
-4. **API Plane（控制面）**
-   - `main.py` 提供 REST 接口：`/markets/{id}/start|stop|liquidate` 等控制做市生命周期，和管理员命令如 `/admin/wipe`。
-5. **Dashboard（监控与控制）**
-   - `dashboard/app.py` 基于 Streamlit 展示库存、订单、日志、Gamma 筛选器，并提供一键 start/stop/liquidate/Wipe 等操作。
+## 运行平面
 
-## 数据持久层
-- PostgreSQL 存储 `MarketMeta`、`OrderJournal`、`InventoryLedger`；Schema 由 Alembic 管理。
-- Redis 作为 pub/sub 总线与 KV 缓存：`tick:{token}` 推送行情快照，`control:{condition_id}` 传达 start/stop/liq 等指令。
+```mermaid
+flowchart LR
+    subgraph Control["Control Plane"]
+        API["FastAPI<br/>auth start/stop/halt/audit"]
+        UI["Streamlit<br/>verified PnL / risk / logs"]
+    end
+    subgraph Data["Data Plane"]
+        MWS["Market WS"]
+        UWS["User WS"]
+        REST["CLOB/Gamma/Data REST"]
+        GW["Orderbook integrity gateway"]
+    end
+    subgraph Core["Trading Core"]
+        QE["QuotingEngine"]
+        OMS["OMS + order state"]
+        RR["Atomic risk reservations"]
+        FP["Durable fill processor"]
+        WD["Watchdog"]
+    end
+    subgraph Facts["Durable Facts"]
+        PG["PostgreSQL<br/>orders/fills/cash/inventory/audits"]
+        R["Redis<br/>ticks/control/status"]
+        MEM["Versioned committed inventory snapshot"]
+    end
 
-## 架构图（ASCII）
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                            PolyMatrix Engine 架构图                                  │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────── Polymarket External Services ─────────────────────────┐
-  │                                                                               │
-  │  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐  ┌────────────┐  │
-  │  │ Market WS       │  │ User WS         │  │ CLOB REST    │  │ Gamma API  │  │
-  │  │ (Orderbook)     │  │ (Fills/Cancels) │  │ (Orders)     │  │ (Markets)  │  │
-  │  │ wss://.../market │  │ wss://.../user  │  │ clob.poly... │  │ gamma-api  │  │
-  │  └────────┬────────┘  └────────┬────────┘  └──────┬───────┘  └─────┬──────┘  │
-  │           │                    │                   │                │          │
-  └───────────┼────────────────────┼───────────────────┼────────────────┼──────────┘
-              │ WebSocket          │ WebSocket          │ HTTP           │ HTTP
-              ▼                    ▼                   ▼                ▼
-┌─────────────────────────────── App Layer ───────────────────────────────────────────┐
-│                                                                                     │
-│  ┌─────────────────────┐    ┌─────────────────────┐         ┌───────────────────┐  │
-│  │  MarketDataGateway  │    │  UserStreamGateway   │         │  GammaAPIClient   │  │
-│  │  (gateway.py)       │    │  (user_stream.py)    │         │  (gamma_client.py)│  │
-│  │                     │    │                      │         │                   │  │
-│  │  ┌───────────────┐  │    │  • handle_fill()     │         │  • get_market_    │  │
-│  │  │LocalOrderbook │  │    │    → OrderJournal    │         │    tokens_by_     │  │
-│  │  │ • seed()      │  │    │    → InventoryLedger │         │    condition_id() │  │
-│  │  │ • apply_event │  │    │  • handle_cancel()   │         └───────────────────┘  │
-│  │  │ • snapshot()  │  │    │    → OrderJournal    │                                │
-│  │  └───────┬───────┘  │    └──────────┬───────────┘                                │
-│  │          │          │               │                                            │
-│  │   publish snap      │          DB write (FOR UPDATE)                             │
-│  └──────────┼──────────┘               │                                            │
-│             │                          │                                            │
-│             ▼                          ▼                                            │
-│  ┌──────────────────────────────────────────────────────────────────────┐           │
-│  │                         Redis (Message Bus)                          │           │
-│  │                                                                      │           │
-│  │   ┌─────────────┐   ┌──────────────────┐   ┌─────────────────────┐  │           │
-│  │   │ ob:{token}   │   │ tick:{token}     │   │ control:{cond_id}  │  │           │
-│  │   │ (KV Cache)   │   │ (PubSub Channel) │   │ (PubSub Channel)   │  │           │
-│  │   └─────────────┘   └────────┬─────────┘   └──────────┬──────────┘  │           │
-│  └──────────────────────────────┼────────────────────────┼──────────────┘           │
-│                                 │                        │                          │
-│                    subscribe    │           subscribe     │                          │
-│                                 ▼                        ▼                          │
-│  ┌──────────────────────────────────────────────────────────────────────┐           │
-│  │                      QuotingEngine (engine.py)                       │           │
-│  │                   (每个 token_id 一个实例)                            │           │
-│  │                                                                      │           │
-│  │   on_tick(data)                          on_control_message(data)    │           │
-│  │      │                                       │                      │           │
-│  │      ▼                                       ▼                      │           │
-│  │   ┌──────────────────────┐            ┌──────────────┐              │           │
-│  │   │     AlphaModel       │            │  suspend →   │              │           │
-│  │   │                      │            │  cancel_all  │              │           │
-│  │   │  mid = (bid+ask)/2   │            │              │              │           │
-│  │   │  OBI skew            │            │  resume →    │              │           │
-│  │   │  Inventory skew      │            │  flag=false  │              │           │
-│  │   │  → fair_value        │            └──────────────┘              │           │
-│  │   │  → dynamic_spread    │                                          │           │
-│  │   └──────────┬───────────┘                                          │           │
-│  │              │                                                      │           │
-│  │              ▼                                                      │           │
-│  │   ┌──────────────────────────────────────────────┐                  │           │
-│  │   │          Strategy State Machine              │                  │           │
-│  │   │                                              │                  │           │
-│  │   │  exposure < 5 ?                              │                  │           │
-│  │   │    ├── YES → Mode A: NEUTRAL_ACCUMULATE      │                  │           │
-│  │   │    │         (BUY-only grid, 少而精)          │                  │           │
-│  │   │    │                                         │                  │           │
-│  │   │    └── NO  → Mode B: LIQUIDATE_LONG          │                  │           │
-│  │   │              (SELL-only, aggressive unwind)   │                  │           │
-│  │   └──────────────────────┬───────────────────────┘                  │           │
-│  │                          │                                          │           │
-│  │              ① cancel_all_orders()                                  │           │
-│  │              ② place_orders(new_grid)                               │           │
-│  └──────────────────────────┼──────────────────────────────────────────┘           │
-│                             │                                                      │
-│                             ▼                                                      │
-│  ┌──────────────────────────────────────────────────────────────────────┐           │
-│  │                   OMS - OrderManagementSystem (oms/core.py)          │           │
-│  │                                                                      │           │
-│  │   create_order()                        cancel_order()              │           │
-│  │      │                                     │                        │           │
-│  │      ▼                                     ▼                        │           │
-│  │   DB: PENDING ──┐                    CLOB cancel() ──┐              │           │
-│  │                 │                                    │              │           │
-│  │                 ▼                                    ▼              │           │
-│  │   ┌──────────────────┐                 DB: CANCELED                 │           │
-│  │   │  CircuitBreaker   │                + check size_matched         │           │
-│  │   │  (5 failures →   │                  (dust detection)            │           │
-│  │   │   OPEN → block)  │                                              │           │
-│  │   └────────┬─────────┘                                              │           │
-│  │            │                                                        │           │
-│  │    ┌───────┴────────┐                                               │           │
-│  │    │  LIVE_TRADING?  │                                               │           │
-│  │    ├── No  → DRY-RUN │  (simulate OPEN in DB)                       │           │
-│  │    └── Yes → py-clob │──→ asyncio.to_thread() ──→ CLOB API POST    │           │
-│  │              -client  │                                              │           │
-│  │               │       │                                              │           │
-│  │               ▼       │                                              │           │
-│  │         DB: OPEN      │  (real orderID from CLOB)                   │           │
-│  │         or FAILED     │                                              │           │
-│  └──────────────────────────────────────────────────────────────────────┘           │
-│                                                                                     │
-│  ┌──────────────────────────────────────────────────────────────────────┐           │
-│  │                   RiskMonitor / Watchdog (risk/watchdog.py)          │           │
-│  │                                                                      │           │
-│  │   ┌─────────────────────┐      ┌─────────────────────────────┐      │           │
-│  │   │ check_exposure()    │      │ reconciliation_loop()       │      │           │
-│  │   │ (every 1s)          │      │ (RECONCILIATION_INTERVAL_   │      │           │
-│  │   │                     │      │  SEC, default 60s)          │      │           │
-│  │   │ IF capital_used >   │      │ Fetch real positions from   │      │           │
-│  │   │    MAX_EXPOSURE:    │      │ Polymarket Data API         │      │           │
-│  │   │                     │      │ Compare with DB ledger      │      │           │
-│  │   │ → publish suspend   │      │ Overwrite if diff > 1 USDC │      │           │
-│  │   │ → cancel_market_    │      └─────────────────────────────┘      │           │
-│  │   │   orders()          │                                           │           │
-│  │   └─────────────────────┘                                           │           │
-│  └──────────────────────────────────────────────────────────────────────┘           │
-│                                                                                     │
-│  ┌──────────────────────────────────────────────────────────────────────┐           │
-│  │                   FastAPI (main.py) — REST Endpoints                 │           │
-│  │                                                                      │           │
-│  │  POST /markets/{id}/start     → subscribe WS + start engines        │           │
-│  │  POST /markets/{id}/stop      → suspend + cancel all                │           │
-│  │  POST /markets/{id}/liquidate → suspend + cancel + dump @ 0.01      │           │
-│  │  GET  /markets/{id}/risk      → read InventoryLedger                │           │
-│  │  GET  /orders/active          → read OrderJournal (OPEN/PENDING)    │           │
-│  │  POST /admin/wipe             → truncate DB + flush Redis           │           │
-│  └──────────────────────────────┬───────────────────────────────────────┘           │
-│                                 │ HTTP :8000                                        │
-└─────────────────────────────────┼───────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     Dashboard (Streamlit) — :8501                                    │
-│                                                                                     │
-│  ┌────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────┐ ┌────────────────┐  │
-│  │ Control    │ │ Inventory &  │ │ Market       │ │ Active  │ │ System Logs    │  │
-│  │ Panel      │ │ Risk Panel   │ │ Screener     │ │ Orders  │ │ (Tail+Search)  │  │
-│  │            │ │              │ │ (Gamma API)  │ │         │ │                │  │
-│  │ • Start    │ │ • Metrics    │ │ • 4-mode     │ │ • Table │ │ • 500 lines    │  │
-│  │ • Stop     │ │ • Bar Chart  │ │   filter     │ │ • TZ=   │ │ • Level filter │  │
-│  │ • Liquidate│ │ • Ledger     │ │ • Score/Star │ │   +0800 │ │ • Keyword      │  │
-│  │ • Wipe     │ │ • Links      │ │ • 1-click    │ │         │ │   search       │  │
-│  └────────────┘ └──────────────┘ │   start      │ └─────────┘ └────────────────┘  │
-│                                  └──────────────┘                                   │
-│                                  i18n: EN / ZH                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────── Persistence ─────────────────────────────────────────┐
-│                                                                                     │
-│  ┌──────────────────────────────┐      ┌──────────────────────────────┐             │
-│  │  PostgreSQL :5432             │      │  Redis :6379                  │             │
-│  │                              │      │                              │             │
-│  │  ┌────────────────────────┐  │      │  KV:  ob:{token_id}  (snap) │             │
-│  │  │ markets_meta           │  │      │  Pub:  tick:{token_id}       │             │
-│  │  │  • condition_id (PK)   │  │      │  Pub:  control:{cond_id}    │             │
-│  │  │  • yes_token_id        │  │      │                              │             │
-│  │  │  • no_token_id         │  │      └──────────────────────────────┘             │
-│  │  │  • status              │  │                                                   │
-│  │  └────────────┬───────────┘  │                                                   │
-│  │               │ 1:N          │                                                   │
-│  │  ┌────────────▼───────────┐  │                                                   │
-│  │  │ orders_journal         │  │                                                   │
-│  │  │  • order_id (PK)       │  │                                                   │
-│  │  │  • market_id (FK)      │  │                                                   │
-│  │  │  • side / price / size │  │                                                   │
-│  │  │  • status (enum)       │  │                                                   │
-│  │  │  • payload (JSON)      │  │                                                   │
-│  │  └────────────────────────┘  │                                                   │
-│  │               │ 1:1          │                                                   │
-│  │  ┌────────────▼───────────┐  │                                                   │
-│  │  │ inventory_ledger       │  │                                                   │
-│  │  │  • market_id (PK/FK)   │  │                                                   │
-│  │  │  • yes_exposure        │  │                                                   │
-│  │  │  • no_exposure         │  │                                                   │
-│  │  │  • realized_pnl        │  │                                                   │
-│  │  └────────────────────────┘  │                                                   │
-│  └──────────────────────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-                            ┌─────────────────────┐
-                            │  Docker Compose      │
-                            │                     │
-                            │  api        :8000   │
-                            │  dashboard  :8501   │
-                            │  postgres   :5433   │
-                            │  redis      :6380   │
-                            └─────────────────────┘
+    UI --> API
+    MWS --> GW --> R --> QE
+    UWS --> FP --> PG --> MEM --> QE
+    REST --> GW
+    QE --> OMS --> RR --> PG
+    OMS --> PG
+    WD --> PG
+    WD --> OMS
+    API --> QE
 ```
 
-## 数据流概述
-1. Market WS → MarketDataGateway → Redis tick:{token} → QuotingEngine
-2. QuotingEngine 调用 AlphaModel 计算 fair value & spread → Strategy 状态机判定挂单方向 → OMS 发单到 CLOB
-3. User WS → UserStreamGateway → OrderJournal/InventoryLedger 更新 ∞ Watchdog 风控上下文
-4. REST API 提供控制与遥测，Dashboard 通过 HTTP/RDS 可视化与执行手动操作
+## 核心边界
+
+### 安全授权
+
+- 默认 `TRADING_MODE=disabled`，不启动交易网络服务。
+- live 需要 wallet allowlist、24h 内 arm、预算 ceiling、费用 adapter 契约确认和全部 runtime readiness。
+- `OFFLINE_VALIDATED_ALPHA_ENABLED` 不是充分条件；必须由内置评估器生成 hash 固定的 `alpha-evidence-v2`，并与策略 ID、运行参数、关键源码哈希及构建 commit 完全匹配。
+- 奖励排名 Auto-Router 永久限制为 paper-only；reward 元数据不能改变 size、spread、旧单保留或报价准入。
+- Dashboard 奖励/流动性榜单仅作研究观测，不再宣称收益/安全，也不能从榜单直接启动策略。
+- live 启动还会校验所有运行策略参数的有限性和安全范围；非法订单量、网格、点差、缓冲、退出或限额配置直接拒绝。
+- 管理写接口需要至少 32 字符 Bearer Token；wipe 还要求 disabled、无引擎、无未决订单、无非零仓位、显式开关和精确确认头。
+
+### 订单与风险
+
+- BUY 在提交前用 Postgres wallet singleton 行锁预占 USDC；SELL 预占可卖 shares。
+- local order primary key 永不被 exchange ID 替换。
+- 提交/撤单结果不确定时进入 `UNKNOWN`/`CANCEL_PENDING_RECONCILE`，reservation 不释放。
+- 交易 SDK/凭据只在本地审计和静态 arm 通过后延迟加载；模块导入不会接触交易所。
+- 撤旧单未确认时禁止创建替代单；引擎异常、stop、halt 和进程 shutdown 都先尝试确认撤单，失败即 sticky Halt。
+- 开放订单权威对账使用 `get_orders` + 逐单 `get_order`；只有 matched/local fills/reservation/identity 全部一致才关闭并释放。
+- wallet-wide Hard Reset、force-evict 和 0.01 liquidation 已删除。
+
+### 成交与会计
+
+- 确定性 fill event ID 保证重放幂等。
+- fill、reservation、cash、fee、inventory、order 与 inbox 状态同事务提交。
+- 明确 BUY fee 资本化、SELL fee 费用化；缺失 fee 保持 `UNKNOWN`，不会当 0。
+- 每个 fill 绑定 `accounting_state_version`；启动/管理端从零重放 v2 fills 并核对 exposure/cost/net realized PnL。
+- REST 仓位数量差异会把账本降级为 `unverified_external`；Risk API/Dashboard 只在最新 audit `SAFE` 时显示 PnL。
+
+### 行情与报价
+
+- 盘口校验有限数、价格/数量、双边流动性、cross/lock、sequence、exchange time 和 freshness。
+- 无效/陈旧/gap 行情会发布 invalid tick，撤已知订单并暂停报价。
+- 新 BUY 默认关闭；开启后还要通过 risk reservation 和 reward-independent net-edge gate。
+- 自动 SELL 只使用损失下限与最大价格冲击范围内的可见深度。
+- Watchdog 是 live 必须 readiness；监控循环异常、单市场/全局越线或 Kill 撤单不完整都会 sticky Halt。
+
+## 数据模型
+
+当前迁移 head 为 `009`。核心表：
+
+- `orders_journal`
+- `fill_events`
+- `fill_cash_ledger`
+- `inventory_ledger`
+- `risk_reservations`
+- `portfolio_risk_state`
+- `order_reconciliation_runs` / `exchange_order_snapshots`
+- `accounting_audit_runs`
+
+详见 [`architecture_diagrams/11_database_erd.md`](./architecture_diagrams/11_database_erd.md)。
+
+## 仍然阻塞实盘
+
+- User WS/CLOB/fee payload 的真实契约确认（当前按要求不做在线验证）。
+- `MISSING_FILLS` 的认证 trade-history 回填与无 exchange ID 的人工恢复。
+- 历史 v1 账本需要完整 fills/fees 后才可离线重建，不能猜测。
+- 行情 checksum、YES/NO 互补校验与故障注入回放。
+- 尚未提供可复现的真实离线数据集，因此内置评估器还无法生成一份合格证据；当前示例报告故意无效。
+- 当前 OBI-mid 策略尚未通过扣除费用/奖励后的样本外统计门槛。

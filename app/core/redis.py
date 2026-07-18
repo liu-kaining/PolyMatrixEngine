@@ -1,10 +1,8 @@
-import asyncio
 import json
 import logging
-from typing import Callable, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 import redis.asyncio as redis
-import websockets
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)

@@ -1,5 +1,7 @@
 ## PolyMatrix Engine V1.0 架构与功能实现全景白皮书
 
+> **ARCHIVED：整改前 V1.0 文档。** 其中 liquidation、memory-first fill、旧 PnL、Hard Reset 与未认证控制面均已失效；当前实现以根目录 README、[`LIVE_TRADING_REMEDIATION_PLAN.md`](./LIVE_TRADING_REMEDIATION_PLAN.md) 和代码为准。当前实盘状态：NO-GO。
+
 > 面向对象：CTO / 架构师  
 > 代码基线：当前工作区 `main` 分支，包含 `app/` 全部模块 + 数据库 + Streamlit Dashboard
 

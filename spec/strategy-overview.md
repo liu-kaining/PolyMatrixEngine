@@ -194,7 +194,7 @@ stars = 1 + int(score/20),  capped [1,5]
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| MAX_EXPOSURE_PER_MARKET | 50 | 单市场敞口上限，超则 Kill Switch |
+| MAX_EXPOSURE_PER_MARKET | 40 | 单市场敞口上限，超则 Kill Switch |
 | BASE_ORDER_SIZE | 10 | 单笔订单 size（USDC） |
 | GRID_LEVELS | 2 | 每侧网格档数 |
 | QUOTE_BASE_SPREAD | 0.02 | 基础 spread，影响 bid/ask 距 fair_value 的距离 |

@@ -1,5 +1,7 @@
 ## PolyMatrix Engine: 技术架构说明
 
+> **ARCHIVED：整改前技术设计。** liquidation、memory-first fill、旧订单/PnL 语义已被替换；当前实现以 [`LIVE_TRADING_REMEDIATION_PLAN.md`](./LIVE_TRADING_REMEDIATION_PLAN.md)、当前架构图和代码为准。
+
 ### 1. 总体架构
 
 系统采用一个主 FastAPI 进程 + 多个后台异步任务的结构：
