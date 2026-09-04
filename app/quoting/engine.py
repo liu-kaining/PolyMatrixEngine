@@ -3,12 +3,18 @@ import json
 import logging
 import time
 from collections import defaultdict
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.exposure_limits import resolve_outcome_count
 from app.core.redis import redis_client
 from app.core.inventory_state import inventory_state
 from app.core.exit_policy import plan_bounded_sell
+from app.core.pricing_model import (
+    PricingModelError,
+    calculate_binary_fair_value,
+    pair_time_skew_seconds,
+)
 from app.core.quote_economics import evaluate_quote_economics
 from app.core.trading_safety import TradingMode, trading_safety
 from app.market_data.integrity import assess_snapshot
@@ -17,37 +23,34 @@ from app.models.db_models import OrderSide, OrderStatus, OrderJournal
 
 logger = logging.getLogger(__name__)
 
-class AlphaPricingModel:
-    """Calculates baseline probability based on inputs"""
-    def __init__(self):
-        self.external_sources = []
-        
-    async def get_baseline_probability(self, market_id: str) -> float:
-        # Default 50/50 for MVP. In reality, query AI or sportsbook data.
-        return 0.50
-
 class AlphaModel:
-    """Unified pricing oracle anchored by YES orderbook."""
+    """Cross-book, depth-aware binary probability model."""
     def __init__(self):
         self.base_spread = float(getattr(settings, "QUOTE_BASE_SPREAD", 0.02))
 
-    def calculate_yes_anchor(self, bids: list, asks: list) -> Tuple[float, float, float]:
-        """
-        Unified pricing anchor from YES orderbook.
-        FV_yes = clamp(mid_yes + OBI_yes * 0.015, 0.01, 0.99)
-        Returns (fv_yes, dynamic_spread, obi_yes)
-        """
-        best_bid_price = float(bids[0]["price"])
-        best_ask_price = float(asks[0]["price"])
-        best_bid_size = float(bids[0]["size"])
-        best_ask_size = float(asks[0]["size"])
-
-        mid_yes = (best_bid_price + best_ask_price) / 2.0
-        total_size = best_bid_size + best_ask_size
-        obi_yes = (best_bid_size - best_ask_size) / total_size if total_size > 0 else 0.0
-        fv_yes = max(0.01, min(0.99, mid_yes + (obi_yes * 0.015)))
-        dynamic_spread = self.base_spread * (1.0 + abs(obi_yes))
-        return fv_yes, dynamic_spread, obi_yes
+    def calculate_yes_anchor(
+        self,
+        yes_snapshot: dict,
+        no_snapshot: dict,
+        *,
+        yes_inventory_value: float,
+        no_inventory_value: float,
+        inventory_cap: float,
+    ):
+        return calculate_binary_fair_value(
+            yes_bids=yes_snapshot.get("bids"),
+            yes_asks=yes_snapshot.get("asks"),
+            no_bids=no_snapshot.get("bids"),
+            no_asks=no_snapshot.get("asks"),
+            base_spread=self.base_spread,
+            depth_levels=int(settings.ALPHA_BOOK_DEPTH_LEVELS),
+            depth_decay=float(settings.ALPHA_BOOK_DEPTH_DECAY),
+            max_parity_error=float(settings.ALPHA_MAX_BINARY_PARITY_ERROR),
+            yes_inventory_value=yes_inventory_value,
+            no_inventory_value=no_inventory_value,
+            inventory_cap=inventory_cap,
+            max_inventory_skew=float(settings.ALPHA_MAX_INVENTORY_SKEW),
+        )
 
 
 class QuotingEngine:
@@ -60,16 +63,21 @@ class QuotingEngine:
         # Grid settings (number of price levels per side)
         # Configurable via .env → GRID_LEVELS
         self.grid_levels = int(getattr(settings, "GRID_LEVELS", 1))
-        self.tick_size = 0.01  # $0.01 per share offset
+        self.tick_size = 0.01
+        self.min_order_size = 5.0
         # Per-order size in OUTCOME SHARES (CLOB `OrderArgs.size`), from .env BASE_ORDER_SIZE.
         # Not USDC: BUY notional ≈ price × size. Polymarket min order size is 5 shares.
-        self.base_size = max(5.0, float(getattr(settings, "BASE_ORDER_SIZE", 10.0)))
+        self.configured_base_size = float(getattr(settings, "BASE_ORDER_SIZE", 10.0))
+        self.base_size = max(self.min_order_size, self.configured_base_size)
         # Panic threshold: exposure >= this triggers unwind. base_size * 2.0 = hold 2 orders before defense.
         self.liquidate_threshold = self.base_size * 2.0
         
         # Debounce/Throttle Settings (smaller threshold = refresh grid more often, stay closer to touch)
         self.price_offset_threshold = float(getattr(settings, "QUOTE_PRICE_OFFSET_THRESHOLD", 0.005))
         self.last_anchor_mid_price = None   # Base anchor price
+        self._last_raw_fv_yes: Optional[float] = None
+        self._ewma_abs_fv_move = 0.0
+        self._volatility_cooldown_until = 0.0
         
         self.is_yes_token = None # Resolved dynamically
         self.yes_token_id = None
@@ -112,7 +120,50 @@ class QuotingEngine:
                 is_live
                 and bool(settings.MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE)
             ),
+            require_snapshot_id=(
+                is_live and bool(settings.MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE)
+            ),
         )
+
+    def _apply_market_constraints(self, snapshot: dict) -> bool:
+        """Accept only venue constraints delivered with the authoritative book."""
+        raw_tick = snapshot.get("tick_size")
+        raw_min = snapshot.get("min_order_size")
+        neg_risk = snapshot.get("neg_risk")
+        if raw_tick in (None, "") or raw_min in (None, "") or not isinstance(neg_risk, bool):
+            return trading_safety.mode is not TradingMode.LIVE
+        try:
+            tick = float(raw_tick)
+            minimum = float(raw_min)
+        except (TypeError, ValueError):
+            return False
+        # Keep this set aligned with the pinned SDK's exact rounding contract.
+        if tick not in {0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001} or minimum <= 0:
+            return False
+        changed = tick != self.tick_size or minimum != self.min_order_size
+        self.tick_size = tick
+        self.min_order_size = minimum
+        self.base_size = max(self.min_order_size, self.configured_base_size)
+        self.liquidate_threshold = self.base_size * 2.0
+        if changed:
+            self.last_anchor_mid_price = None
+            logger.info(
+                "[%s] Venue constraints updated: tick=%s min_size=%s neg_risk=%s",
+                self.token_id[:6],
+                self.tick_size,
+                self.min_order_size,
+                neg_risk,
+            )
+        return True
+
+    def _quantize_price(self, price: float, side: OrderSide) -> float:
+        tick = Decimal(str(self.tick_size))
+        value = Decimal(str(price))
+        rounding = ROUND_FLOOR if side == OrderSide.BUY else ROUND_CEILING
+        steps = (value / tick).to_integral_value(rounding=rounding)
+        lower = tick
+        upper = Decimal("1") - tick
+        return float(max(lower, min(upper, steps * tick)))
 
     async def run(self):
         """Main loop for the quoting engine"""
@@ -223,6 +274,7 @@ class QuotingEngine:
                     )
                 )
                 rows = res.scalars().all()
+                paper_orders_to_restore = []
                 for o in rows:
                     payload = o.payload or {}
                     if payload.get("token_id") != self.token_id:
@@ -234,14 +286,45 @@ class QuotingEngine:
                         except Exception:
                             created_ts = time.time()
                     active_id = o.exchange_order_id or o.order_id
+                    filled_size = float(payload.get("filled_size", 0.0) or 0.0)
+                    remaining_size = max(0.0, float(o.size) - filled_size)
+                    if remaining_size <= 1e-9:
+                        continue
                     self.active_orders[active_id] = {
                         "side": o.side.value,
                         "price": float(o.price),
-                        "size": float(o.size),
+                        "size": remaining_size,
                         "created_ts": created_ts,
+                        "post_only": bool(payload.get("post_only", True)),
                     }
+                    if (
+                        trading_safety.mode is TradingMode.PAPER
+                        and o.status in {OrderStatus.OPEN, OrderStatus.PENDING}
+                    ):
+                        if o.status == OrderStatus.PENDING:
+                            o.status = OrderStatus.OPEN
+                        paper_orders_to_restore.append(
+                            {
+                                "order_id": o.order_id,
+                                "condition_id": self.condition_id,
+                                "token_id": self.token_id,
+                                "side": o.side.value,
+                                "price": float(o.price),
+                                "size": remaining_size,
+                                "post_only": bool(payload.get("post_only", True)),
+                                "created_at": created_ts,
+                            }
+                        )
+                if paper_orders_to_restore:
+                    await session.commit()
         if not ok:
             return False
+
+        if trading_safety.mode is TradingMode.PAPER:
+            from app.oms.paper_execution import paper_execution
+
+            for paper_order in paper_orders_to_restore:
+                await paper_execution.register(**paper_order)
 
         snap = await inventory_state.ensure_loaded(self.condition_id)
         self.local_yes_exposure = float(snap.get("yes_exposure", 0.0))
@@ -437,85 +520,97 @@ class QuotingEngine:
                 target_size = max_shares
 
         # 4. Final floor check (Polymarket minimum)
-        if target_size < 5.0:
+        if target_size < self.min_order_size:
             if target_size > 0:
                 logger.warning(
-                    f"[{self.token_id[:6]}] [BUDGET] Final size {target_size:.1f} < 5.0. Dropping BUY order."
+                    f"[{self.token_id[:6]}] [BUDGET] Final size {target_size:.4f} "
+                    f"< venue minimum {self.min_order_size:.4f}. Dropping order."
                 )
             return 0.0
 
-        return round(target_size, 1)
+        return round(target_size, 8)
 
-    async def _get_unified_fair_value(self, bids: list, asks: list) -> Optional[Tuple[float, float, float]]:
-        """
-        Unified Pricing Oracle:
-        - YES engine computes anchor FV_yes and publishes it.
-        - NO engine consumes anchor and derives FV_no = 1 - FV_yes.
-        Returns: (fv_current_token, dynamic_spread, fv_yes)
-        """
-        if self.is_yes_token is None:
+    async def _get_unified_fair_value(
+        self,
+        current_snapshot: dict,
+        *,
+        yes_exposure: float,
+        no_exposure: float,
+        inventory_cap: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Fuse independent YES/NO books; never infer one side from the other alone."""
+        if self.is_yes_token is None or not self.yes_token_id or not self.no_token_id:
+            return None
+        other_token = self.no_token_id if self.is_yes_token else self.yes_token_id
+        other_snapshot = await redis_client.get_state(f"ob:{other_token}")
+        yes_snapshot = current_snapshot if self.is_yes_token else other_snapshot
+        no_snapshot = other_snapshot if self.is_yes_token else current_snapshot
+        for label, snapshot in (("YES", yes_snapshot), ("NO", no_snapshot)):
+            health = self._market_data_health(snapshot)
+            if not health.healthy:
+                logger.warning(
+                    "[%s] %s book cannot support binary pricing: %s",
+                    self.token_id[:6],
+                    label,
+                    health.reason,
+                )
+                return None
+        try:
+            pair_skew = pair_time_skew_seconds(yes_snapshot, no_snapshot)
+            if pair_skew > float(settings.ALPHA_MAX_PAIR_SKEW_SEC):
+                raise PricingModelError(
+                    f"paired book time skew {pair_skew:.3f}s exceeds limit"
+                )
+            yes_mid = (
+                float(yes_snapshot["bids"][0]["price"])
+                + float(yes_snapshot["asks"][0]["price"])
+            ) / 2.0
+            no_mid = (
+                float(no_snapshot["bids"][0]["price"])
+                + float(no_snapshot["asks"][0]["price"])
+            ) / 2.0
+            signal = self.alpha_model.calculate_yes_anchor(
+                yes_snapshot,
+                no_snapshot,
+                yes_inventory_value=yes_exposure * yes_mid,
+                no_inventory_value=no_exposure * no_mid,
+                inventory_cap=inventory_cap,
+            )
+        except (KeyError, TypeError, ValueError, PricingModelError) as exc:
+            logger.warning("[%s] Binary pricing rejected: %s", self.token_id[:6], exc)
             return None
 
-        anchor_key = f"fv_anchor:{self.condition_id}"
-
-        if self.is_yes_token:
-            fv_yes, dynamic_spread, obi_yes = self.alpha_model.calculate_yes_anchor(bids, asks)
-            await redis_client.set_state(
-                anchor_key,
-                {
-                    "fv_yes": fv_yes,
-                    "dynamic_spread": dynamic_spread,
-                    "obi_yes": obi_yes,
-                    "updated_at": time.time(),
-                },
-                ex=30,
-            )
-        else:
-            anchor = await redis_client.get_state(anchor_key)
-            anchor_age = float("inf")
-            if anchor and anchor.get("updated_at") is not None:
-                try:
-                    anchor_age = time.time() - float(anchor["updated_at"])
-                except (TypeError, ValueError):
-                    anchor_age = float("inf")
-            if (
-                anchor
-                and "fv_yes" in anchor
-                and 0.0 <= anchor_age <= float(settings.MARKET_DATA_MAX_AGE_SEC)
-            ):
-                fv_yes = max(0.01, min(0.99, float(anchor["fv_yes"])))
-                dynamic_spread = float(anchor.get("dynamic_spread", self.alpha_model.base_spread))
-            else:
-                # Fallback: derive from latest YES orderbook snapshot if anchor not ready yet.
-                if not self.yes_token_id:
-                    return None
-                yes_snap = await redis_client.get_state(f"ob:{self.yes_token_id}")
-                health = self._market_data_health(yes_snap)
-                if not health.healthy:
-                    logger.warning(
-                        "[%s] Unified YES anchor is unsafe: %s",
-                        self.token_id[:6],
-                        health.reason,
-                    )
-                    return None
-                yes_bids = yes_snap.get("bids", [])
-                yes_asks = yes_snap.get("asks", [])
-                if not yes_bids or not yes_asks:
-                    return None
-                fv_yes, dynamic_spread, obi_yes = self.alpha_model.calculate_yes_anchor(yes_bids, yes_asks)
-                await redis_client.set_state(
-                    anchor_key,
-                    {
-                        "fv_yes": fv_yes,
-                        "dynamic_spread": dynamic_spread,
-                        "obi_yes": obi_yes,
-                        "updated_at": time.time(),
-                    },
-                    ex=30,
-                )
-
+        fv_yes = signal.yes_fair_value
+        dynamic_spread = min(
+            0.25,
+            signal.dynamic_spread
+            + self._ewma_abs_fv_move
+            * float(settings.ALPHA_VOLATILITY_SPREAD_MULTIPLIER),
+        )
         fv_current = fv_yes if self.is_yes_token else max(0.01, min(0.99, 1.0 - fv_yes))
         return fv_current, dynamic_spread, fv_yes
+
+    def _volatility_guard_allows(self, fv_yes: float) -> bool:
+        """Cancel/pause after an abrupt probability move or persistent turbulence."""
+        current = float(fv_yes)
+        if self._last_raw_fv_yes is None:
+            self._last_raw_fv_yes = current
+            return True
+        absolute_move = abs(current - self._last_raw_fv_yes)
+        self._last_raw_fv_yes = current
+        alpha = float(settings.ALPHA_VOLATILITY_EWMA_ALPHA)
+        self._ewma_abs_fv_move = (
+            alpha * absolute_move + (1.0 - alpha) * self._ewma_abs_fv_move
+        )
+        if (
+            absolute_move > float(settings.ALPHA_MAX_TICK_MOVE)
+            or self._ewma_abs_fv_move > float(settings.ALPHA_MAX_EWMA_ABS_MOVE)
+        ):
+            self._volatility_cooldown_until = max(
+                self._volatility_cooldown_until,
+                time.monotonic() + float(settings.ALPHA_VOLATILITY_COOLDOWN_SEC),
+            )
+        return time.monotonic() >= self._volatility_cooldown_until
                 
     async def on_tick(self, tick_data: dict):
         """Evaluate orderbook, apply unified FV + inventory state machine, execute dynamic spread."""
@@ -535,6 +630,18 @@ class QuotingEngine:
                 await self.cancel_all_orders()
                 await self._publish_engine_mode("MARKET_DATA_INVALID")
                 return
+            if not self._apply_market_constraints(tick_data):
+                logger.error(
+                    "[%s] Venue tick/min-size constraints are missing or invalid; pausing quotes.",
+                    self.token_id[:6],
+                )
+                await self.cancel_all_orders()
+                await self._publish_engine_mode("MARKET_CONSTRAINTS_INVALID")
+                return
+            if trading_safety.mode is TradingMode.PAPER:
+                from app.oms.paper_execution import paper_execution
+
+                await paper_execution.on_book(self.token_id, tick_data)
 
             # 1. Memory-only inventory read path (no DB I/O in on_tick).
             if self.is_yes_token is None:
@@ -564,10 +671,10 @@ class QuotingEngine:
                     return
                 
                 # Check for dust below minimum exchange order size
-                if current_exposure < 5.0:
+                if current_exposure < self.min_order_size:
                     logger.warning(
                         f"[QuotingEngine {self.condition_id[:10]}] Residual exposure {current_exposure:.4f} "
-                        "is below Polymarket min size (5.0). Executing DUST_EXIT to prevent deadlock."
+                        f"is below venue min size ({self.min_order_size}). Executing DUST_EXIT."
                     )
                     await self._complete_graceful_exit("DUST_EXIT")
                     return
@@ -587,12 +694,24 @@ class QuotingEngine:
                 return
 
             # 2. Unified pricing (YES anchor + NO derived from 1-FV_yes)
-            unified = await self._get_unified_fair_value(bids, asks)
+            max_exposure_per_market = self._per_market_exposure_cap()
+            unified = await self._get_unified_fair_value(
+                tick_data,
+                yes_exposure=yes_exposure,
+                no_exposure=no_exposure,
+                inventory_cap=max_exposure_per_market,
+            )
             if unified is None:
                 await self.cancel_all_orders()
                 await self._publish_engine_mode("MARKET_DATA_INVALID")
                 return
             fair_value, dynamic_spread, fv_yes = unified
+            if not self._volatility_guard_allows(fv_yes):
+                await self.cancel_all_orders()
+                await self._publish_engine_mode(
+                    "VOLATILITY_COOLDOWN", fair_value=fair_value, fv_yes=fv_yes
+                )
+                return
 
             # Strict per-market "used" budget: MTM inventory + all active BUY notional (bulletproof vs stale capital_used).
             fv_y_anchor = max(0.01, min(0.99, float(fv_yes)))
@@ -601,7 +720,6 @@ class QuotingEngine:
             pending_no_n = float(snap.get("pending_no_buy_notional", 0.0))
             strict_local_used_dollars = held_inventory_value + pending_yes_n + pending_no_n
             strict_local_used_excluding_me = strict_local_used_dollars - my_pending_notional
-            max_exposure_per_market = self._per_market_exposure_cap()
             # Balance precheck: MTM inventory + opposite side's pending BUYs (this side's pending excluded — we replace our own quotes).
             local_used_dollars_excluding_me = strict_local_used_excluding_me
 
@@ -623,7 +741,9 @@ class QuotingEngine:
             
             # 4. Calculate optimal grid bounds based on Skewed Fair Value and Dynamic Spread
             anchor_distance = dynamic_spread / 2.0
-            bid_1 = round(fair_value - anchor_distance, 2)
+            bid_1 = self._quantize_price(
+                fair_value - anchor_distance, OrderSide.BUY
+            )
 
             # Construct grid orders JSON
             orders_payload: List[dict] = []
@@ -651,12 +771,12 @@ class QuotingEngine:
             best_ask_price = float(asks[0]["price"])
 
             # --- Line 1: SELL side (unwind / take profit / stop loss) ---
-            if current_exposure_for_logic >= 5.0 or force_taker_exit:
+            if current_exposure_for_logic >= self.min_order_size or force_taker_exit:
                 if is_extreme_long or force_taker_exit:
                     exit_intent = plan_bounded_sell(
                         bids=bids,
                         requested_size=min(
-                            current_exposure, max(self.base_size, 5.0)
+                            current_exposure, max(self.base_size, self.min_order_size)
                         ),
                         exposure=current_exposure,
                         capital_used=my_capital_used,
@@ -674,6 +794,7 @@ class QuotingEngine:
                         ask_price = None
                     else:
                         ask_price = exit_intent.limit_price
+                        ask_price = self._quantize_price(ask_price, OrderSide.SELL)
                         logger.warning(
                             "[%s] Bounded depth-aware exit: limit=%s size=%s "
                             "impact_floor=%s loss_floor=%s",
@@ -685,32 +806,41 @@ class QuotingEngine:
                         )
                 else:
                     logger.warning(
-                        f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} >= 5.0). "
+                        f"[{self.token_id[:6]}] INVENTORY HIGH ({current_exposure:.2f} "
+                        f">= {self.min_order_size}). "
                         "MAKER UNWINDING (earn spread)."
                     )
-                    ask_price = round(fair_value + anchor_distance, 2)
-                    safe_maker_floor = round(best_bid_price + self.tick_size, 2)
+                    ask_price = self._quantize_price(
+                        fair_value + anchor_distance, OrderSide.SELL
+                    )
+                    safe_maker_floor = self._quantize_price(
+                        best_bid_price + self.tick_size, OrderSide.SELL
+                    )
                     ask_price = max(safe_maker_floor, ask_price)
                     
-                    if ask_price > 0.99:
+                    if ask_price > 1.0 - self.tick_size:
                         logger.warning(
                             f"[{self.token_id[:6]}] MAKER SELL blocked: required price {ask_price} > 0.99 "
                             f"(best_bid={best_bid_price}). Waiting for book to shift."
                         )
                         ask_price = None  # Use None to signal skipping this order
                     else:
-                        ask_price = max(0.01, ask_price)
+                        ask_price = max(self.tick_size, ask_price)
 
                 if ask_price is not None:
-                    if current_exposure < 5.0:
+                    if current_exposure < self.min_order_size:
                         logger.debug(
-                            f"[{self.token_id[:6]}] Inventory too small to sell (${current_exposure:.2f} < $5.0). Skipping."
+                            f"[{self.token_id[:6]}] Inventory too small to sell "
+                            f"({current_exposure:.2f} < {self.min_order_size}). Skipping."
                         )
                     else:
                         sell_size = (
                             exit_intent.size
                             if (is_extreme_long or force_taker_exit)
-                            else min(current_exposure, max(self.base_size, 5.0))
+                            else min(
+                                current_exposure,
+                                max(self.base_size, self.min_order_size),
+                            )
                         )
                         orders_payload.append(
                             {
@@ -719,6 +849,7 @@ class QuotingEngine:
                                 "side": OrderSide.SELL,
                                 "price": ask_price,
                                 "size": sell_size,
+                                "post_only": not (is_extreme_long or force_taker_exit),
                             }
                         )
                         mode_label = "EXTREME TAKER" if (is_extreme_long or force_taker_exit) else "MAKER UNWINDING"
@@ -766,22 +897,31 @@ class QuotingEngine:
                         0.0, max_exposure_per_market - strict_local_used_excluding_me
                     )
                     for i in range(self.grid_levels):
-                        raw = round(bid_1 - (i * self.tick_size), 2)
-                        bid_price = max(0.01, min(0.99, raw))
-                        if one_tick_below and i == 0 and bid_price < best_bid_price - 0.01:
-                            bid_price = round(max(bid_price, best_bid_price - 0.01), 2)
-                            bid_price = max(0.01, min(0.99, bid_price))
+                        raw = bid_1 - (i * self.tick_size)
+                        bid_price = self._quantize_price(raw, OrderSide.BUY)
+                        if (
+                            one_tick_below
+                            and i == 0
+                            and bid_price < best_bid_price - self.tick_size
+                        ):
+                            bid_price = self._quantize_price(
+                                max(bid_price, best_bid_price - self.tick_size),
+                                OrderSide.BUY,
+                            )
 
-                        max_buy = round(best_ask_price - self.tick_size, 2)
+                        max_buy = self._quantize_price(
+                            best_ask_price - self.tick_size, OrderSide.BUY
+                        )
                         if bid_price > max_buy:
                             logger.warning(
                                 f"[{self.token_id[:6]}] 触发价格极值保护: BUY {bid_price} > best_ask-tick {max_buy}"
                             )
                             bid_price = max_buy
                         
-                        if bid_price < 0.01:
+                        if bid_price < self.tick_size:
                             logger.warning(
-                                f"[{self.token_id[:6]}] BUY price dropped below 0.01 (best_ask={best_ask_price}). "
+                                f"[{self.token_id[:6]}] BUY price dropped below tick {self.tick_size} "
+                                f"(best_ask={best_ask_price}). "
                                 "Skipping order to avoid crossing book."
                             )
                             continue
@@ -824,6 +964,7 @@ class QuotingEngine:
                                 "side": OrderSide.BUY,
                                 "price": bid_price,
                                 "size": effective_size,
+                                "post_only": True,
                             }
                         )
                         buy_budget_remaining = max(
@@ -839,7 +980,11 @@ class QuotingEngine:
             elif cross_token_locked:
                 mode = "LOCKED_BY_OPPOSITE"
             else:
-                mode = "TWO_WAY_QUOTING" if current_exposure_for_logic >= 5.0 else "QUOTING_BIDS_ONLY"
+                mode = (
+                    "TWO_WAY_QUOTING"
+                    if current_exposure_for_logic >= self.min_order_size
+                    else "QUOTING_BIDS_ONLY"
+                )
 
             # Rewards eligibility: check size and spread vs official requirements
             rewards_size_ok = True
@@ -980,9 +1125,9 @@ class QuotingEngine:
                 if o["price"] > 0:
                     max_size = remaining / o["price"]
                     # Polymarket min order size is 5
-                    if max_size >= 5.0:
+                    if max_size >= self.min_order_size:
                         shrunk = dict(o)
-                        shrunk["size"] = round(max_size, 1)
+                        shrunk["size"] = round(max_size, 8)
                         kept.append(shrunk)
                         logger.warning(
                             f"[{self.token_id[:6]}] 缩减 BUY@{o['price']} size: "
@@ -991,18 +1136,21 @@ class QuotingEngine:
                     else:
                         logger.warning(
                             f"[{self.token_id[:6]}] 跳过 BUY@{o['price']}: "
-                            f"余额不足最小单量 5"
+                            f"余额不足最小单量 {self.min_order_size}"
                         )
                 break  # no budget left for further levels
 
         return sell_orders + kept
 
     @staticmethod
-    def _order_signature(side: str, price: float, size: float) -> Tuple[str, float, float]:
+    def _order_signature(
+        side: str, price: float, size: float, post_only: bool
+    ) -> Tuple[str, float, float, bool]:
         return (
             side,
             round(float(price), 4),
             round(float(size), 4),
+            bool(post_only),
         )
 
     async def _update_pending_buy_notional(self):
@@ -1025,7 +1173,7 @@ class QuotingEngine:
 
     def _consume_compatible_desired_order(
         self,
-        desired_by_sig: Dict[Tuple[str, float, float], List[dict]],
+        desired_by_sig: Dict[Tuple[str, float, float, bool], List[dict]],
         side: str,
         price: float,
         price_offset_threshold: float,
@@ -1035,7 +1183,7 @@ class QuotingEngine:
         so we don't create a near-duplicate replacement in the same tick.
         """
         for sig in list(desired_by_sig.keys()):
-            sig_side, sig_price, _sig_size = sig
+            sig_side, sig_price, _sig_size, _post_only = sig
             if str(sig_side).upper() != str(side).upper():
                 continue
             if abs(float(sig_price) - float(price)) <= price_offset_threshold:
@@ -1053,9 +1201,14 @@ class QuotingEngine:
         *,
         force_cancel_undesired_buys: bool = False,
     ):
-        desired_by_sig: Dict[Tuple[str, float, float], List[dict]] = defaultdict(list)
+        desired_by_sig: Dict[Tuple[str, float, float, bool], List[dict]] = defaultdict(list)
         for o in desired_orders:
-            sig = self._order_signature(o["side"].value, o["price"], o["size"])
+            sig = self._order_signature(
+                o["side"].value,
+                o["price"],
+                o["size"],
+                o.get("post_only", True),
+            )
             desired_by_sig[sig].append(o)
 
         # 1) Keep exact matches to preserve time-priority.
@@ -1079,6 +1232,7 @@ class QuotingEngine:
                 str(meta.get("side", "")),
                 float(meta.get("price", 0.0)),
                 float(meta.get("size", 0.0)),
+                bool(meta.get("post_only", True)),
             )
             bucket = desired_by_sig.get(sig)
             if bucket:
@@ -1168,7 +1322,8 @@ class QuotingEngine:
                 token_id=o["token_id"],
                 side=o["side"],
                 price=o["price"],
-                size=o["size"]
+                size=o["size"],
+                post_only=bool(o.get("post_only", True)),
             ))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1180,6 +1335,7 @@ class QuotingEngine:
                     "price": float(order_req["price"]),
                     "size": float(order_req["size"]),
                     "created_ts": time.time(),
+                    "post_only": bool(order_req.get("post_only", True)),
                 }
             elif isinstance(res, Exception):
                 logger.error(

@@ -22,7 +22,7 @@
 
 - **PostgreSQL**：订单状态机与 inventory 账本。
 - **Redis**：订单簿 cache 与高频 tick 通道。
-- **Polymarket CLOB**：通过 `py-clob-client` 完成实际下单/撤单。
+- **Polymarket CLOB**：通过固定版本 `polymarket-client==0.6.0` 的统一 V2 adapter 完成下单/撤单；业务层不接触 SDK 原始响应。
 - **Gamma API**：解析 condition → CLOB tokenIds、slug 等元数据。
 
 ### 2. 关键组件设计
@@ -293,7 +293,7 @@
 
 - 所有环境变量通过 `pydantic-settings` 的 `Settings` 类集中管理。
 - Dockerfile：
-  - 安装 Python 依赖（包括 `py-clob-client`, `httpx`, `streamlit`, `psycopg2-binary` 等）。
+  - 安装 Python 依赖（包括 `polymarket-client==0.6.0`, `httpx`, `streamlit`, `psycopg2-binary` 等）。
   - 启动顺序：`alembic upgrade head` → `uvicorn app.main:app`。
 - `docker-compose.yml`：
   - 暴露 API (`8000`) 和 Dashboard (`8501`)。
@@ -301,8 +301,8 @@
 
 ### 5. 未来扩展点（与旧文档对齐说明）
 
-- **Builder Relayer 客户端**
-  - 现有实现只用 `py-clob-client` 与 CLOB API 通信。
+- **Builder 归因**
+  - 统一 SDK 通过每单 `POLY_BUILDER_CODE` 归因；旧本地 Builder credential 三元组已禁用。
   - 早期文档中提到的 `py-builder-relayer-client` 可作为未来优化：在 Maker 日常路径上走 relayer，在 Kill Switch 时可直连 CLOB 或合约。
 
 - **链上 Kill Switch (Alchemy RPC)**

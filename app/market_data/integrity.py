@@ -131,6 +131,7 @@ def assess_snapshot(
     max_age_seconds: float,
     require_sequence: bool,
     require_exchange_timestamp: bool,
+    require_snapshot_id: bool = False,
 ) -> SnapshotHealth:
     if not isinstance(snapshot, dict):
         return SnapshotHealth(False, "snapshot is missing or malformed", math.inf)
@@ -154,6 +155,8 @@ def assess_snapshot(
         return SnapshotHealth(False, "exchange sequence is unavailable", age)
     if require_exchange_timestamp and snapshot.get("exchange_timestamp") is None:
         return SnapshotHealth(False, "exchange timestamp is unavailable", age)
+    if require_snapshot_id and not str(snapshot.get("snapshot_id") or "").strip():
+        return SnapshotHealth(False, "exchange snapshot hash is unavailable", age)
     try:
         validate_book_levels(snapshot.get("bids", []), snapshot.get("asks", []))
     except BookIntegrityError as exc:

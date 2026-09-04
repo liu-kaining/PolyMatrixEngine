@@ -112,6 +112,39 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
                 "Safety gate rejects categorical markets: only outcome_count == 2 is supported"
             )
 
+        venue_constraints = None
+        if trading_safety.mode is TradingMode.LIVE:
+            from app.oms.core import oms
+
+            if oms.client is None:
+                raise ValueError("Live pre-flight failed: V2 adapter is not initialized")
+            try:
+                balance = float(await oms.client.get_balance())
+                if not math.isfinite(balance) or balance < MIN_REQUIRED_USDC:
+                    raise ValueError(
+                        f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, "
+                        f"Available: {balance} USDC"
+                    )
+                constraints = await asyncio.gather(
+                    oms.client.get_market_constraints(gamma_info.yes_token_id),
+                    oms.client.get_market_constraints(gamma_info.no_token_id),
+                )
+                if any(item.condition_id != condition_id for item in constraints):
+                    raise ValueError("CLOB order book condition id does not match market")
+                first, second = constraints
+                if (
+                    first.tick_size != second.tick_size
+                    or first.min_order_size != second.min_order_size
+                    or first.neg_risk != second.neg_risk
+                ):
+                    raise ValueError("CLOB token constraints disagree within binary market")
+                venue_constraints = first
+                logger.info("Live pre-flight balance and market constraints verified")
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"Live V2 pre-flight verification failed: {exc}") from exc
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(MarketMeta).filter(MarketMeta.condition_id == condition_id))
             market = result.scalar_one_or_none()
@@ -136,6 +169,21 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
                         rewards_min_size=gamma_info.rewards_min_size,
                         rewards_max_spread=gamma_info.rewards_max_spread,
                         reward_rate_per_day=gamma_info.reward_rate_per_day,
+                        minimum_order_size=(
+                            venue_constraints.min_order_size
+                            if venue_constraints
+                            else gamma_info.minimum_order_size
+                        ),
+                        tick_size=(
+                            venue_constraints.tick_size
+                            if venue_constraints
+                            else gamma_info.minimum_tick_size
+                        ),
+                        neg_risk=(
+                            venue_constraints.neg_risk
+                            if venue_constraints
+                            else gamma_info.neg_risk
+                        ),
                     )
                     new_inventory = InventoryLedger(market_id=condition_id)
                     session.add(market)
@@ -147,6 +195,21 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
                     market.rewards_min_size = gamma_info.rewards_min_size
                     market.rewards_max_spread = gamma_info.rewards_max_spread
                     market.reward_rate_per_day = gamma_info.reward_rate_per_day
+                    market.minimum_order_size = (
+                        venue_constraints.min_order_size
+                        if venue_constraints
+                        else gamma_info.minimum_order_size
+                    )
+                    market.tick_size = (
+                        venue_constraints.tick_size
+                        if venue_constraints
+                        else gamma_info.minimum_tick_size
+                    )
+                    market.neg_risk = (
+                        venue_constraints.neg_risk
+                        if venue_constraints
+                        else gamma_info.neg_risk
+                    )
                 await session.commit()
 
                 rewards_payload = {
@@ -156,6 +219,16 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
                     "outcome_count": int(getattr(gamma_info, "outcome_count", 2) or 2),
                 }
                 await redis_client.set_state(f"rewards:{condition_id}", rewards_payload)
+                if market.tick_size and market.minimum_order_size:
+                    for token in (market.yes_token_id, market.no_token_id):
+                        await redis_client.set_state(
+                            f"market_constraints:{token}",
+                            {
+                                "tick_size": float(market.tick_size),
+                                "min_order_size": float(market.minimum_order_size),
+                                "neg_risk": bool(market.neg_risk),
+                            },
+                        )
             else:
                 market.status = "active"
                 await session.commit()
@@ -164,25 +237,6 @@ async def start_market_making_impl(condition_id: str) -> Dict[str, Any]:
             no_token_id = str(market.no_token_id)
             # No database connection is held during balance, stream, or snapshot I/O below.
             await session.close()
-
-            from app.oms.core import oms
-            if trading_safety.mode is TradingMode.LIVE:
-                if oms.client is None:
-                    raise ValueError("Live pre-flight failed: ClobClient is not initialized")
-                try:
-                    if hasattr(oms.client, "get_balance"):
-                        balance = float(await asyncio.to_thread(oms.client.get_balance))
-                        if not math.isfinite(balance) or balance < MIN_REQUIRED_USDC:
-                            raise ValueError(
-                                f"Insufficient funds. Required: {MIN_REQUIRED_USDC} USDC, Available: {balance} USDC"
-                            )
-                        logger.info(f"Pre-flight check passed. USDC Balance: {balance}")
-                    else:
-                        raise ValueError("Live pre-flight failed: balance check is unavailable")
-                except ValueError:
-                    raise
-                except Exception as e:
-                    raise ValueError(f"Live pre-flight balance verification failed: {e}") from e
 
             await md_gateway.subscribe([yes_token_id, no_token_id])
             await user_stream.subscribe(condition_id)

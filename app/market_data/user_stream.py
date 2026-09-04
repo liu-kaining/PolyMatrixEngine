@@ -1,10 +1,9 @@
 import asyncio
-import json
 import logging
 import time
-import websockets
 from typing import Dict, Optional, Set
 
+from app.core.config import settings
 from app.core.redis import redis_client
 from app.oms.core import oms
 from app.oms.fill_processor import derive_fill_event_id, fill_processor
@@ -13,83 +12,137 @@ from app.risk.watchdog import watchdog
 from app.core.trading_safety import trading_safety
 from app.db.session import AsyncSessionLocal
 from app.models.db_models import OrderJournal, OrderStatus
+from app.oms.polymarket_v2 import (
+    ExchangeContractError,
+    normalize_exchange_status,
+    normalize_sdk_stream_event,
+)
 from sqlalchemy import or_
 from sqlalchemy.future import select
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_create_task(coro):
-    """Fire-and-forget with exception logging to prevent silent failures."""
-    task = asyncio.create_task(coro)
-    def _done(t):
-        try:
-            t.result()
-        except Exception as e:
-            logger.exception("User WS fire-and-forget task failed: %s", e)
-    task.add_done_callback(_done)
-    return task
-
-
 class UserStreamGateway:
     def __init__(self):
-        self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         self.subscribed_markets: Set[str] = set() # Condition IDs
         self.market_tokens: Dict[str, Dict[str, str]] = {}
-        self.ws = None
+        self.stream = None
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
-        self.ping_task = None
+        self._sdk_subscription_active = False
+        self._authenticated_rest_confirmed = False
+
+    def _refresh_readiness(self) -> None:
+        ready = (
+            self._sdk_subscription_active
+            and self._authenticated_rest_confirmed
+        )
+        missing = []
+        if not self._sdk_subscription_active:
+            missing.append("SDK-authenticated subscription")
+        if not self._authenticated_rest_confirmed:
+            missing.append("authenticated REST reconciliation")
+        trading_safety.set_readiness(
+            "user_stream",
+            ready,
+            "SDK user subscription and authoritative REST reconciliation confirmed"
+            if ready
+            else f"awaiting {', '.join(missing) or 'connection'}",
+        )
+
+    def confirm_authenticated_rest(self) -> None:
+        """Bind WS readiness to a successful authenticated REST reconciliation."""
+        self._authenticated_rest_confirmed = True
+        self._refresh_readiness()
 
     async def connect(self):
-        # We need the client credentials to connect
-        while oms.client is None or not oms.client.creds:
-            logger.debug("UserStreamGateway waiting for ClobClient initialization...")
+        """Consume the pinned SDK's authenticated stream and reconcile every gap."""
+        while True:
+            if oms.client is not None:
+                break
+            logger.debug("UserStreamGateway waiting for V2 adapter...")
             await asyncio.sleep(2.0)
-            
+
         while True:
             connected_at = None
+            periodic_task = None
             try:
-                logger.debug(f"Connecting to Polymarket User WS: {self.ws_url}")
-                async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    close_timeout=10,
-                ) as ws:
-                    self.ws = ws
-                    connected_at = time.monotonic()
-                    logger.info("User WS connected.")
+                self.stream = await oms.client.subscribe_user()
+                connected_at = time.monotonic()
+                self._sdk_subscription_active = oms.client.user_stream_is_open()
+                if not self._sdk_subscription_active:
+                    raise ExchangeContractError("SDK user subscription is not open")
+                self._refresh_readiness()
+                logger.info("Pinned SDK user stream subscribed.")
 
-                    self.ping_task = asyncio.create_task(self._heartbeat())
-                    await self._authenticate()
-                    trading_safety.set_readiness(
-                        "user_stream",
-                        False,
-                        "subscription sent but authentication acknowledgement contract is unverified",
+                # Authoritative reads close the connect/subscribe race. The same pass is
+                # repeated periodically because the SDK transparently reconnects sockets.
+                from app.oms.order_reconciliation import order_reconciliation_service
+
+                await order_reconciliation_service.reconcile(oms.client)
+                if await watchdog.reconcile_positions() is not True:
+                    raise ExchangeContractError(
+                        "initial position reconciliation did not pass"
                     )
-                    # Compare positions after any WS gap, but retain the recent-fill
-                    # delay guard because the Data API can lag a committed local fill.
-                    _safe_create_task(watchdog.reconcile_positions())
-                    await self._listen()
-                    raise RuntimeError("User WS listen loop exited unexpectedly without exception.")
-                    
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.exception(
-                    "User WS connection closed. code=%s reason=%s clean=%s",
-                    getattr(e, "code", None),
-                    getattr(e, "reason", ""),
-                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
-                )
+                periodic_task = asyncio.create_task(self._periodic_reconciliation())
+
+                last_dropped = int(getattr(self.stream, "dropped", 0) or 0)
+                while True:
+                    if periodic_task.done():
+                        exc = periodic_task.exception()
+                        raise ExchangeContractError(
+                            f"periodic authenticated reconciliation stopped: {exc}"
+                        )
+                    try:
+                        event = await asyncio.wait_for(
+                            self.stream.__anext__(), timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        is_open = oms.client.user_stream_is_open()
+                        if not is_open and self._sdk_subscription_active:
+                            self._sdk_subscription_active = False
+                            self._authenticated_rest_confirmed = False
+                            self._refresh_readiness()
+                        elif is_open and not self._sdk_subscription_active:
+                            # The SDK reconnects internally. Close the missed-event gap
+                            # with authenticated REST before restoring readiness.
+                            self._sdk_subscription_active = True
+                            self._refresh_readiness()
+                            await order_reconciliation_service.reconcile(oms.client)
+                            if await watchdog.reconcile_positions() is not True:
+                                raise ExchangeContractError(
+                                    "post-reconnect position reconciliation did not pass"
+                                )
+                        continue
+
+                    dropped = int(getattr(self.stream, "dropped", 0) or 0)
+                    if dropped > last_dropped:
+                        self._sdk_subscription_active = False
+                        self._authenticated_rest_confirmed = False
+                        self._refresh_readiness()
+                        trading_safety.halt(
+                            f"authenticated user stream dropped {dropped - last_dropped} event(s)"
+                        )
+                        raise ExchangeContractError("SDK user stream queue overflowed")
+                    last_dropped = dropped
+                    self._sdk_subscription_active = oms.client.user_stream_is_open()
+                    self._refresh_readiness()
+                    await self.process_message(normalize_sdk_stream_event(event))
+
             except Exception as e:
-                logger.exception(f"User WS connect loop crashed: {e}")
+                logger.exception("SDK user stream loop failed: %s", e)
             finally:
-                if self.ping_task:
-                    self.ping_task.cancel()
-                    self.ping_task = None
-                self.ws = None
+                if periodic_task is not None:
+                    periodic_task.cancel()
+                    await asyncio.gather(periodic_task, return_exceptions=True)
+                if self.stream is not None:
+                    await self.stream.close()
+                    self.stream = None
+                self._sdk_subscription_active = False
+                self._authenticated_rest_confirmed = False
                 trading_safety.set_readiness(
-                    "user_stream", False, "user WebSocket disconnected"
+                    "user_stream", False, "SDK user stream is disconnected"
                 )
                 connected_for = 0.0
                 if connected_at is not None:
@@ -103,81 +156,33 @@ class UserStreamGateway:
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
 
-    async def _heartbeat(self):
-        """Send PING every 10 seconds"""
+    async def _periodic_reconciliation(self) -> None:
+        from app.oms.order_reconciliation import order_reconciliation_service
+
+        interval = max(
+            15.0,
+            float(getattr(settings, "ORDER_RECONCILIATION_INTERVAL_SEC", 60.0)),
+        )
         try:
             while True:
-                await asyncio.sleep(10)
-                if self.ws is not None and not getattr(self.ws, "closed", False):
-                    await self.ws.send("PING")
+                await asyncio.sleep(interval)
+                await order_reconciliation_service.reconcile(oms.client)
+                if await watchdog.reconcile_positions() is not True:
+                    raise ExchangeContractError(
+                        "periodic position reconciliation did not pass"
+                    )
         except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"User WS heartbeat error: {e}")
-
-    async def _authenticate(self):
-        """
-        Send subscription per Polymarket docs: type=user, auth={apiKey, secret, passphrase}.
-        WSS is TLS-encrypted; omit markets to receive all user order/trade events.
-        """
-        try:
-            creds = oms.client.creds
-            sub_msg = {
-                "type": "user",
-                "auth": {
-                    "apiKey": creds.api_key,
-                    "secret": creds.api_secret,
-                    "passphrase": creds.api_passphrase,
-                },
-            }
-            await self.ws.send(json.dumps(sub_msg))
-            logger.info("User WS authenticated (subscription sent).")
-        except Exception as e:
-            logger.exception("User WS auth failed: %s", e)
+            raise
+        except Exception as exc:
+            self._authenticated_rest_confirmed = False
+            self._refresh_readiness()
+            trading_safety.halt(f"periodic authenticated reconciliation failed: {exc}")
             raise
 
     async def subscribe(self, condition_id: str):
         """Track condition_id locally only. Do NOT send subscribe to User WS."""
         self.subscribed_markets.add(condition_id)
         logger.info("User WS: added condition_id to local tracking: %s", condition_id[:20] + "..." if len(condition_id) > 20 else condition_id)
-
-    async def _listen(self):
-        while True:
-            try:
-                # Add strict receive timeout. If no message (trade/order or PONG) arrives for 45s,
-                # the connection is a zombie. Force an exception to trigger reconnection.
-                # User stream is less chatty, so 45s is safer.
-                message = await asyncio.wait_for(self.ws.recv(), timeout=45.0)
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", errors="replace")
-                
-                if message == "PONG":
-                    continue
-                if message == "PING":
-                    await self.ws.send("PONG")
-                    continue
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError as e:
-                    logger.exception(
-                        f"User WS JSON decode failed: {e}. Raw message (first 200 chars): {str(message)[:200]}"
-                    )
-                    continue
-                await self.process_message(data)
-            except asyncio.TimeoutError:
-                logger.exception("User WS silent drop detected (45s without message). Forcing reconnect...")
-                raise
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.exception(
-                    "User WS recv closed. code=%s reason=%s clean=%s",
-                    getattr(e, "code", None),
-                    getattr(e, "reason", ""),
-                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
-                )
-                raise
-            except Exception as e:
-                logger.exception(f"Error processing User WS message: {e}")
-                raise
 
     async def process_message(self, data: dict):
         # We need to handle trades and cancellations carefully
@@ -191,12 +196,14 @@ class UserStreamGateway:
             await self._process_single_event(data)
 
     async def _process_single_event(self, data: dict):
-        event_type = data.get("event_type")
+        event_type = str(data.get("event_type") or "").lower()
         
         if event_type == "trade":
             # Match status is usually "MATCHED" for a fill
-            status = data.get("status")
-            if status == "MATCHED":
+            status = normalize_exchange_status(data.get("status"), "TRADE_STATUS_")
+            # Only terminal confirmation mutates cash/inventory. Earlier match/mined
+            # states can permanently fail and are recovered by the periodic REST pass.
+            if status == "CONFIRMED":
                 maker_orders = data.get("maker_orders", [])
                 taker_order_id = data.get("taker_order_id")
                 
@@ -208,15 +215,15 @@ class UserStreamGateway:
                     if order_id:
                         event_id = derive_fill_event_id(data, order_id, "maker")
                         token_id = maker.get("asset_id") or data.get("asset_id")
-                        _safe_create_task(
-                            self.handle_fill_if_local(
-                                event_id=event_id,
-                                order_id=order_id,
-                                filled_size=matched_amount,
-                                fill_price=price,
-                                raw_event=data,
-                                token_id=token_id,
-                            )
+                        await self.handle_fill_if_local(
+                            event_id=event_id,
+                            order_id=order_id,
+                            filled_size=matched_amount,
+                            fill_price=price,
+                            raw_event=data,
+                            token_id=token_id,
+                            liquidity_role="MAKER",
+                            fee_rate_bps=maker.get("fee_rate_bps"),
                         )
                         
                 # Check taker order (if we were the taker)
@@ -224,25 +231,31 @@ class UserStreamGateway:
                     size = float(data.get("size", 0))
                     price = float(data.get("price", 0))
                     event_id = derive_fill_event_id(data, taker_order_id, "taker")
-                    _safe_create_task(
-                        self.handle_fill_if_local(
-                            event_id=event_id,
-                            order_id=taker_order_id,
-                            filled_size=size,
-                            fill_price=price,
-                            raw_event=data,
-                            token_id=data.get("asset_id"),
-                        )
+                    await self.handle_fill_if_local(
+                        event_id=event_id,
+                        order_id=taker_order_id,
+                        filled_size=size,
+                        fill_price=price,
+                        raw_event=data,
+                        token_id=data.get("asset_id"),
+                        liquidity_role="TAKER",
+                        fee_rate_bps=data.get("fee_rate_bps"),
                     )
                     
         elif event_type == "order":
             # For CANCELLATION or CLOSED events, we check if it was partially filled before
-            status = data.get("status")
-            if status in ["CANCELLATION", "CLOSED", "CANCELED"]:
+            status = normalize_exchange_status(data.get("status"), "ORDER_STATUS_")
+            action = str(data.get("type") or "").strip().upper()
+            if action == "CANCELLATION" or status in {
+                "CANCELLATION",
+                "CLOSED",
+                "CANCELED",
+                "CANCELLED",
+            }:
                 order_id = data.get("id") or data.get("order_id")
                 
                 if order_id:
-                    _safe_create_task(self.handle_cancellation(order_id))
+                    await self.handle_cancellation(order_id)
 
     async def _publish_order_status_event(self, market_id: str, token_id: Optional[str], order_id: str, status: str):
         if not token_id:
@@ -264,6 +277,8 @@ class UserStreamGateway:
         fill_price: float,
         raw_event: dict,
         token_id: Optional[str] = None,
+        liquidity_role: Optional[str] = None,
+        fee_rate_bps: Optional[object] = None,
     ):
         result = await fill_processor.record_and_process(
             event_id=event_id,
@@ -272,6 +287,8 @@ class UserStreamGateway:
             fill_price=fill_price,
             raw_event=raw_event,
             token_id=token_id,
+            liquidity_role=liquidity_role,
+            fee_rate_bps=fee_rate_bps,
         )
         logger.info(
             "Fill event %s for order %s result=%s duplicate=%s",
@@ -300,6 +317,8 @@ class UserStreamGateway:
         fill_price: float,
         raw_event: dict,
         token_id: Optional[str] = None,
+        liquidity_role: Optional[str] = None,
+        fee_rate_bps: Optional[object] = None,
     ) -> None:
         """Reject counterparty maker/taker rows that are not in our order journal.
 
@@ -317,6 +336,8 @@ class UserStreamGateway:
                     fill_price=fill_price,
                     raw_event=raw_event,
                     token_id=token_id,
+                    liquidity_role=liquidity_role,
+                    fee_rate_bps=fee_rate_bps,
                 )
                 return
         logger.info(

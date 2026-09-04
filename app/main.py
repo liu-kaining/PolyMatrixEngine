@@ -19,6 +19,16 @@ from app.core.inventory_state import inventory_state
 from app.core.admin_auth import require_admin
 from app.core.accounting_integrity import accounting_integrity_service
 from app.core.alpha_evidence import refresh_alpha_evidence_readiness
+from app.core.execution_lease import live_execution_lease
+from app.core.geographic_eligibility import (
+    fetch_geographic_eligibility,
+    monitor_geographic_eligibility,
+)
+from app.core.safety_state import (
+    acknowledge_persistent_halt,
+    persist_halt,
+    restore_persistent_halt,
+)
 from app.core.trading_safety import (
     SafetyInterlockError,
     TradingMode,
@@ -38,6 +48,7 @@ from app.core.market_lifecycle import (
 from app.models.db_models import (
     AccountingAuditRun,
     ExchangeOrderSnapshot,
+    ExecutionLease,
     FillCashLedger,
     FillEvent,
     InventoryLedger,
@@ -106,6 +117,7 @@ async def lifespan(app: FastAPI):
     # 1. DB Initialization
     await init_db()
     trading_safety.set_readiness("database", True, "database initialization completed")
+    await restore_persistent_halt()
     
     # 2. Redis Connection
     await redis_client.connect()
@@ -169,7 +181,50 @@ async def lifespan(app: FastAPI):
     if trading_safety.mode is TradingMode.LIVE:
         from app.oms.core import oms
 
-        if trading_safety.is_static_live_armed() and not trading_safety.status()["halted"]:
+        preflight_ok = trading_safety.is_static_live_armed() and not trading_safety.status()[
+            "halted"
+        ]
+        if preflight_ok:
+            try:
+                lease_ok = await live_execution_lease.acquire(settings.FUNDER_ADDRESS)
+            except Exception as exc:
+                lease_ok = False
+                trading_safety.set_readiness(
+                    "executor_lease", False, "wallet lease acquisition failed"
+                )
+                trading_safety.halt(f"wallet lease acquisition failed: {exc}")
+                logger.exception("Live execution lease acquisition failed")
+            if lease_ok:
+                live_execution_lease.start_renewal()
+            else:
+                trading_safety.halt("another process may own the live execution wallet")
+            preflight_ok = lease_ok and not trading_safety.status()["halted"]
+
+        if preflight_ok:
+            try:
+                eligibility = await fetch_geographic_eligibility()
+                if eligibility.blocked:
+                    trading_safety.set_readiness(
+                        "geographic_eligibility",
+                        False,
+                        f"exchange reports blocked jurisdiction country={eligibility.country}",
+                    )
+                    trading_safety.halt("exchange geographic eligibility check is blocked")
+                else:
+                    trading_safety.set_readiness(
+                        "geographic_eligibility",
+                        True,
+                        f"exchange eligibility passed for country={eligibility.country}",
+                    )
+            except Exception as exc:
+                trading_safety.set_readiness(
+                    "geographic_eligibility", False, "geographic eligibility check failed"
+                )
+                trading_safety.halt(f"geographic eligibility check failed: {exc}")
+                logger.exception("Geographic eligibility preflight failed")
+            preflight_ok = not trading_safety.status()["halted"]
+
+        if preflight_ok:
             await oms.initialize_live_client()
         if oms.client is not None:
             try:
@@ -187,6 +242,14 @@ async def lifespan(app: FastAPI):
                 "live arm/client unavailable for authoritative reconciliation",
             )
     else:
+        trading_safety.set_readiness(
+            "executor_lease", True, "live wallet lease is not required outside live mode"
+        )
+        trading_safety.set_readiness(
+            "geographic_eligibility",
+            True,
+            "geographic execution check is not required outside live mode",
+        )
         trading_safety.set_readiness(
             "open_orders_reconciled",
             True,
@@ -222,6 +285,8 @@ async def lifespan(app: FastAPI):
         if trading_safety.mode is TradingMode.LIVE:
             task_user = asyncio.create_task(user_stream.connect())
             background_tasks.add(task_user)
+            task_geo = asyncio.create_task(monitor_geographic_eligibility())
+            background_tasks.add(task_geo)
 
         if getattr(settings, "AUTO_ROUTER_ENABLED", False):
             try:
@@ -259,6 +324,8 @@ async def lifespan(app: FastAPI):
     # 3.5 Close OMS httpx connection pool (avoids FD / connector leak on reload/shutdown)
     from app.oms.core import oms
     await oms.aclose()
+    await live_execution_lease.release()
+    await trading_safety.flush_halt_persistence()
 
     # 4. Disconnect Redis safely
     await redis_client.disconnect()
@@ -627,6 +694,7 @@ async def emergency_halt(db: AsyncSession = Depends(get_db)):
     from app.oms.core import oms
 
     trading_safety.halt("authenticated manual emergency halt")
+    await persist_halt("authenticated manual emergency halt")
     active = set(get_active_router_markets())
     journal_markets = set(
         (
@@ -667,6 +735,63 @@ async def emergency_halt(db: AsyncSession = Depends(get_db)):
         "status": "halted",
         "new_live_orders_blocked": True,
         "markets": results,
+    }
+
+
+@app.post("/admin/halt/acknowledge", dependencies=[Depends(require_admin)])
+async def acknowledge_halt(
+    confirmation: Optional[str] = Header(
+        default=None, alias="X-Confirm-Safety-Recovery"
+    ),
+):
+    """Acknowledge a durable halt only in disabled, locally flat state."""
+    if trading_safety.mode is not TradingMode.DISABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="persistent halt acknowledgement requires TRADING_MODE=disabled",
+        )
+    if confirmation != "ACKNOWLEDGE_PERSISTED_HALT":
+        raise HTTPException(
+            status_code=400,
+            detail="Missing exact X-Confirm-Safety-Recovery safety phrase",
+        )
+    if get_active_router_markets():
+        raise HTTPException(status_code=409, detail="stop all market engines first")
+    async with AsyncSessionLocal() as session:
+        unresolved = (
+            await session.execute(
+                select(OrderJournal.order_id)
+                .filter(
+                    OrderJournal.status.in_(
+                        [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.UNKNOWN]
+                    )
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        nonzero = (
+            await session.execute(
+                select(InventoryLedger.market_id)
+                .filter(
+                    (InventoryLedger.yes_exposure != 0)
+                    | (InventoryLedger.no_exposure != 0)
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if unresolved or nonzero:
+        raise HTTPException(
+            status_code=409,
+            detail="reconcile unresolved orders and flatten local inventory first",
+        )
+    try:
+        incident_id = await acknowledge_persistent_halt()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": "acknowledged",
+        "incident_id": incident_id,
+        "live_restart_requires_new_arm": True,
     }
 
 
@@ -731,6 +856,7 @@ async def wipe_all_data(
     await db.execute(delete(FillCashLedger))
     await db.execute(delete(FillEvent))
     await db.execute(delete(RiskReservation))
+    await db.execute(delete(ExecutionLease))
     await db.execute(delete(PortfolioRiskState))
     await db.execute(delete(OrderJournal))
     await db.execute(delete(InventoryLedger))

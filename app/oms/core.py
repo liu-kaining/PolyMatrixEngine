@@ -1,11 +1,8 @@
 import asyncio
-import inspect
 import logging
 import uuid
-from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-import httpx
 from sqlalchemy import or_
 from sqlalchemy.future import select
 
@@ -15,6 +12,11 @@ from app.core.config import settings
 from app.core.trading_safety import TradingMode, trading_safety
 from app.risk.reservations import ReservationRejected, risk_reservations
 from app.oms.validation import OrderValidationError, validate_order_intent
+from app.oms.polymarket_v2 import (
+    ExchangePreSubmissionError,
+    ExchangeRequestRejected,
+    PolymarketV2Adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,43 +49,9 @@ def classify_cancel_response(exchange_order_id: str, response: Any) -> str:
         return CANCEL_MATCHED_UNKNOWN
     return CANCEL_UNKNOWN
 
-def _try_build_polymarket_builder_config(
-    api_key: str,
-    secret: str,
-    passphrase: str,
-) -> Optional[Any]:
-    """
-    Lazy-load Polymarket builder signing SDK so missing/empty package __init__ or old layouts
-    never break app import. Uses a SimpleNamespace for creds (same duck-typing as BuilderApiKeyCreds).
-    """
-    BuilderConfig = None
-    try:
-        mod = __import__("py_builder_signing_sdk.config", fromlist=["BuilderConfig"])
-        BuilderConfig = getattr(mod, "BuilderConfig", None)
-    except Exception:
-        pass
-    if BuilderConfig is None:
-        try:
-            root = __import__("py_builder_signing_sdk", fromlist=["BuilderConfig"])
-            BuilderConfig = getattr(root, "BuilderConfig", None)
-        except Exception:
-            BuilderConfig = None
-    if BuilderConfig is None:
-        logger.warning(
-            "py_builder_signing_sdk has no BuilderConfig; Polymarket builder attribution disabled."
-        )
-        return None
-    creds = SimpleNamespace(key=api_key, secret=secret, passphrase=passphrase)
-    try:
-        return BuilderConfig(local_builder_creds=creds)
-    except Exception as e:
-        logger.warning("BuilderConfig init failed; builder attribution disabled: %s", e)
-        return None
-
-
 def _is_non_transient_error(e: Exception) -> bool:
     """403 geoblock / 400 balance: retrying won't help; don't count toward circuit breaker."""
-    sc = getattr(e, "status_code", None)
+    sc = getattr(e, "status", getattr(e, "status_code", None))
     if sc in (403, 400):
         return True
     s = str(e).lower()
@@ -145,49 +113,13 @@ class OrderManagementSystem:
                 
         self.circuit_breaker = CircuitBreaker()
 
-        # Long-lived HTTP client for OMS-owned REST (shared pool; avoid per-call AsyncClient).
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+    async def _build_live_client(self):
+        """Build the pinned V2 adapter after all local safety gates pass."""
+        return await PolymarketV2Adapter.create(
+            private_key=settings.PK,
+            wallet=settings.FUNDER_ADDRESS,
+            builder_code=str(getattr(settings, "POLY_BUILDER_CODE", "") or ""),
         )
-
-    def _build_live_client(self):
-        """Synchronous SDK setup, invoked only in a worker after local safety preflight."""
-        from py_clob_client.client import ClobClient
-
-        builder_config = None
-        builder_api_key = str(
-            getattr(settings, "POLY_BUILDER_API_KEY", "") or ""
-        ).strip()
-        builder_secret = str(getattr(settings, "POLY_BUILDER_SECRET", "") or "").strip()
-        builder_passphrase = str(
-            getattr(settings, "POLY_BUILDER_PASSPHRASE", "") or ""
-        ).strip()
-        if builder_api_key and builder_secret and builder_passphrase:
-            builder_config = _try_build_polymarket_builder_config(
-                builder_api_key, builder_secret, builder_passphrase
-            )
-        elif builder_api_key or builder_secret or builder_passphrase:
-            logger.warning(
-                "Incomplete POLY_BUILDER_* credentials; builder attribution disabled."
-            )
-
-        clob_kw: Dict[str, Any] = {
-            "key": settings.PK,
-            "chain_id": settings.PM_CHAIN_ID,
-            "signature_type": 2,
-            "funder": settings.FUNDER_ADDRESS,
-        }
-        if "builder_config" in inspect.signature(ClobClient.__init__).parameters:
-            clob_kw["builder_config"] = builder_config
-        elif builder_config is not None:
-            logger.warning(
-                "Installed py-clob-client has no builder_config; builder attribution disabled."
-            )
-        client = ClobClient(settings.PM_API_URL, **clob_kw)
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        return client
 
     async def initialize_live_client(self) -> bool:
         """Initialize exchange credentials only after local gates have passed."""
@@ -215,7 +147,7 @@ class OrderManagementSystem:
                 )
                 return False
             try:
-                self.client = await asyncio.to_thread(self._build_live_client)
+                self.client = await self._build_live_client()
             except Exception:
                 self.client = None
                 trading_safety.set_readiness(
@@ -231,26 +163,24 @@ class OrderManagementSystem:
             return True
 
     async def aclose(self) -> None:
-        """Close pooled HTTP resources (call from app shutdown if desired)."""
-        try:
-            await self.http_client.aclose()
-        except Exception as e:
-            logger.debug("OMS http_client aclose: %s", e)
+        """Close exchange resources without deleting credentials."""
+        client, self.client = self.client, None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:
+                logger.debug("OMS adapter close failed: %s", exc)
 
-    def create_auth_headers(self, method: str, request_path: str) -> Dict[str, str]:
-        """
-        Build L2 HMAC-signed headers for WebSocket auth (no plaintext secret).
-        Used by User Stream: GET /ws.
-        """
-        if not self.client or not self.client.signer or not self.client.creds:
-            raise RuntimeError("ClobClient not initialized or missing signer/creds")
-        from py_clob_client.clob_types import RequestArgs
-        from py_clob_client.headers.headers import create_level_2_headers
-
-        request_args = RequestArgs(method=method, request_path=request_path, body="")
-        return create_level_2_headers(self.client.signer, self.client.creds, request_args)
-
-    async def create_order(self, condition_id: str, token_id: str, side: OrderSide, price: float, size: float) -> Optional[str]:
+    async def create_order(
+        self,
+        condition_id: str,
+        token_id: str,
+        side: OrderSide,
+        price: float,
+        size: float,
+        *,
+        post_only: bool = True,
+    ) -> Optional[str]:
         """Creates an order: DB Pending -> API Call -> DB Open/Failed"""
 
         try:
@@ -281,6 +211,20 @@ class OrderManagementSystem:
             )
             return None
         if mode is TradingMode.LIVE:
+            from app.core.execution_lease import live_execution_lease
+
+            try:
+                lease_current = await live_execution_lease.renew()
+            except Exception as exc:
+                lease_current = False
+                logger.exception("Live execution lease check failed before order admission")
+                trading_safety.halt(f"live execution lease check failed: {exc}")
+            if not lease_current:
+                trading_safety.set_readiness(
+                    "executor_lease", False, "wallet lease is not current"
+                )
+                trading_safety.halt("live execution wallet lease is not current")
+                return None
             blockers = (
                 trading_safety.runtime_order_blockers()
                 if side == OrderSide.BUY
@@ -337,7 +281,16 @@ class OrderManagementSystem:
                     price=price,
                     size=size,
                     status=OrderStatus.PENDING,
-                    payload={"token_id": token_id, "reservation_id": reservation_id},
+                    payload={
+                        "token_id": token_id,
+                        "reservation_id": reservation_id,
+                        "post_only": bool(post_only),
+                        "executor_fencing_token": (
+                            live_execution_lease.fencing_token
+                            if mode is TradingMode.LIVE
+                            else None
+                        ),
+                    },
                 )
                 session.add(journal_entry)
                 await session.commit()
@@ -352,74 +305,124 @@ class OrderManagementSystem:
         
         # Paper mode never sends an exchange command.
         if mode is TradingMode.PAPER:
-            logger.info(f"[DRY-RUN] Simulating execution for local order: {order_id} (PENDING)")
-            await asyncio.sleep(0.5) # Simulate network delay non-blockingly
-            
-            # Simulated outcome
             api_status = OrderStatus.OPEN
-            api_payload = {"mock_response": "Success (Dry-Run)"}
-            logger.info(f"[DRY-RUN] Simulated success for order {order_id} -> OPEN")
+            api_payload = {
+                "paper_simulation": True,
+                "paper_model": "conservative-event-driven-v1",
+            }
+            logger.info("[PAPER] Registered local resting order %s", order_id)
                 
         # Real Execution Mode
         else:
+            from app.core.execution_lease import live_execution_lease
+
             try:
-                from py_clob_client.clob_types import OrderArgs
-
-                order_args = OrderArgs(
-                    price=price,
-                    size=size,
-                    side="BUY" if side == OrderSide.BUY else "SELL",
-                    token_id=token_id,
+                lease_current = await live_execution_lease.renew()
+            except Exception as exc:
+                lease_current = False
+                logger.exception("Live execution lease renewal failed before submit")
+                trading_safety.halt(f"live execution lease renewal failed: {exc}")
+            if not lease_current:
+                trading_safety.set_readiness(
+                    "executor_lease", False, "wallet lease expired before submit"
                 )
-
-                async def _place_order():
-                    # py-clob-client methods are synchronous HTTP; offload to thread
-                    # so we don't block the async event loop during signing + POST.
-                    return await asyncio.to_thread(
-                        self.client.create_and_post_order, order_args
+                trading_safety.halt("live execution lease expired before submit")
+                api_status = OrderStatus.FAILED
+                api_payload = {
+                    "error": "wallet lease expired before any exchange submission",
+                    "status_detail": "NOT_SUBMITTED_LEASE_EXPIRED",
+                }
+            else:
+                try:
+                    res = await self.circuit_breaker.execute(
+                        self.client.place_limit_order,
+                        token_id=token_id,
+                        price=price,
+                        size=size,
+                        side="BUY" if side == OrderSide.BUY else "SELL",
+                        post_only=bool(post_only),
                     )
                 
-                res = await self.circuit_breaker.execute(_place_order)
-                
-                if isinstance(res, dict) and res.get("success") and res.get("orderID"):
-                    api_status = OrderStatus.OPEN
-                    api_payload = res
-                    final_order_id = res["orderID"]
-                    logger.info(f"[LIVE] Order successfully posted to CLOB: {final_order_id}")
-                elif isinstance(res, dict) and res.get("success") is False:
-                    # An explicit exchange rejection is the only remote outcome for which
-                    # releasing the reservation is safe without an order reconciliation.
+                    if isinstance(res, dict) and res.get("success") and res.get("orderID"):
+                        exchange_status = str(res.get("status") or "").upper()
+                        if exchange_status not in {"LIVE", "MATCHED", "DELAYED"}:
+                            raise RuntimeError(
+                                f"adapter returned unsupported accepted status={exchange_status!r}"
+                            )
+                        api_status = (
+                            OrderStatus.OPEN
+                            if exchange_status in {"LIVE", "DELAYED"}
+                            else OrderStatus.UNKNOWN
+                        )
+                        api_payload = res
+                        final_order_id = res["orderID"]
+                        if exchange_status == "MATCHED":
+                            trading_safety.set_readiness(
+                                "open_orders_reconciled",
+                                False,
+                                "newly matched order awaits authenticated fill reconciliation",
+                            )
+                            if post_only:
+                                trading_safety.halt(
+                                    f"post-only order unexpectedly matched at submit {final_order_id[:12]}"
+                                )
+                        logger.info(
+                            "[LIVE] CLOB accepted order %s with status=%s",
+                            final_order_id,
+                            exchange_status,
+                        )
+                    elif isinstance(res, dict) and res.get("success") is False:
+                        # An explicit exchange rejection is the only remote outcome for which
+                        # releasing the reservation is safe without an order reconciliation.
+                        api_status = OrderStatus.FAILED
+                        api_payload = {
+                            "error": str(res.get("errorMsg", "exchange rejected order")),
+                            "exchange_response": res,
+                        }
+                    else:
+                        api_status = OrderStatus.UNKNOWN
+                        api_payload = {
+                            "error": "ambiguous exchange submit response",
+                            "exchange_response": res,
+                        }
+                        trading_safety.halt(
+                            f"ambiguous submit outcome for local order {order_id[:24]}"
+                        )
+                        logger.critical(
+                            "[SAFETY] Submit outcome is ambiguous for %s; reservation retained.",
+                            order_id,
+                        )
+
+                except (ExchangeRequestRejected, ExchangePreSubmissionError) as e:
+                    # A typed SDK validation/signing failure or an HTTP rejection proves
+                    # this submission was not accepted. Releasing its reservation is safe.
                     api_status = OrderStatus.FAILED
                     api_payload = {
-                        "error": str(res.get("errorMsg", "exchange rejected order")),
-                        "exchange_response": res,
+                        "error": str(e),
+                        "status_detail": "SUBMIT_REJECTED_NOT_ACCEPTED",
+                        "http_status": getattr(e, "status", None),
+                        "error_code": getattr(e, "code", None),
                     }
-                else:
+                    if getattr(e, "status", None) == 403:
+                        trading_safety.set_readiness(
+                            "geographic_eligibility",
+                            False,
+                            "exchange rejected order with HTTP 403",
+                        )
+                        trading_safety.halt("exchange rejected an order with HTTP 403")
+                    logger.warning("[LIVE] Order was explicitly rejected before acceptance: %s", e)
+                except Exception as e:
+                    # A timeout/transport exception can happen after the exchange accepted an
+                    # order. Never call it FAILED or release its budget without reconciliation.
+                    logger.exception("[LIVE] Order submit outcome is unknown: %s", e)
                     api_status = OrderStatus.UNKNOWN
                     api_payload = {
-                        "error": "ambiguous exchange submit response",
-                        "exchange_response": res,
+                        "error": str(e),
+                        "status_detail": "SUBMIT_OUTCOME_UNKNOWN",
                     }
                     trading_safety.halt(
-                        f"ambiguous submit outcome for local order {order_id[:24]}"
+                        f"unknown submit outcome for local order {order_id[:24]}"
                     )
-                    logger.critical(
-                        "[SAFETY] Submit outcome is ambiguous for %s; reservation retained.",
-                        order_id,
-                    )
-                    
-            except Exception as e:
-                # A timeout/transport exception can happen after the exchange accepted an
-                # order. Never call it FAILED or release its budget without reconciliation.
-                logger.exception("[LIVE] Order submit outcome is unknown: %s", e)
-                api_status = OrderStatus.UNKNOWN
-                api_payload = {
-                    "error": str(e),
-                    "status_detail": "SUBMIT_OUTCOME_UNKNOWN",
-                }
-                trading_safety.halt(
-                    f"unknown submit outcome for local order {order_id[:24]}"
-                )
                 
         # 4. State Machine: OPEN / FAILED (Session 2). A remote acceptance followed by
         # local persistence failure is an UNKNOWN exposure, never an ordinary exception.
@@ -463,9 +466,25 @@ class OrderManagementSystem:
                 )
             return None
 
-        if final_order_id != order_id and api_status == OrderStatus.OPEN:
+        if mode is TradingMode.PAPER and api_status == OrderStatus.OPEN:
+            await risk_reservations.mark_open(reservation_id, order_id)
+            from app.oms.paper_execution import paper_execution
+
+            await paper_execution.register(
+                order_id=order_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                side=side.value,
+                price=price,
+                size=size,
+                post_only=post_only,
+            )
+        elif final_order_id != order_id and api_status in {OrderStatus.OPEN, OrderStatus.UNKNOWN}:
             try:
-                await risk_reservations.mark_open(reservation_id, final_order_id)
+                if api_status == OrderStatus.OPEN:
+                    await risk_reservations.mark_open(reservation_id, final_order_id)
+                else:
+                    await risk_reservations.mark_unknown_for_order(order_id)
                 from app.oms.fill_processor import fill_processor
 
                 asyncio.create_task(
@@ -511,6 +530,9 @@ class OrderManagementSystem:
                     logger.info(f"[DRY-RUN] Simulated cancel success for order {order_id} -> CANCELED")
                     await session.commit()
             await risk_reservations.release(reservation_id, "CANCELED")
+            from app.oms.paper_execution import paper_execution
+
+            await paper_execution.unregister(order_id)
             return True
 
         if not self.client or not trading_safety.can_send_exchange_cancel():
@@ -545,12 +567,22 @@ class OrderManagementSystem:
             )
             return False
             
-        # Real Execution Mode
+        # Cancellation is a risk-reduction path. It deliberately bypasses the
+        # new-order circuit breaker so a placement outage cannot disable exits.
         try:
-            async def _cancel():
-                return await asyncio.to_thread(self.client.cancel, exchange_order_id)
-            
-            res = await self.circuit_breaker.execute(_cancel)
+            res = None
+            last_error = None
+            for attempt in range(2):
+                try:
+                    res = await self.client.cancel_order(order_id=exchange_order_id)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        await asyncio.sleep(0.1)
+            if last_error is not None:
+                raise last_error
 
             outcome = classify_cancel_response(exchange_order_id, res)
             cancel_success = outcome in {CANCEL_CONFIRMED, CANCEL_ALREADY_CLOSED}

@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     LIVE_BUDGET_CAP_USD: float = 100.0  # Explicit ceiling for GLOBAL_MAX_BUDGET in live mode.
     # Removed controls retained only so an older .env fails at the safety gate instead of import.
     AUTO_ROUTER_LIVE_ARMED: bool = False  # Ignored; reward-ranked router is always paper-only.
-    # Operator attestation that the deployed exchange adapter has contract-tested
-    # absolute fee facts. False is a mandatory live blocker, never a zero-fee default.
+    # Deprecated compatibility field. Fee accounting is now enforced in code from
+    # the pinned SDK's role/rate facts and the documented five-decimal USDC rule.
     LIVE_FEE_ACCOUNTING_VALIDATED: bool = False
     APP_CODE_COMMIT: str = ""  # Full build commit; must match alpha evidence in live mode.
 
@@ -31,8 +31,17 @@ class Settings(BaseSettings):
     PM_CHAIN_ID: int = 137 # Polygon
     MARKET_DATA_MAX_AGE_SEC: float = 5.0
     MARKET_DATA_MAX_FUTURE_SKEW_SEC: float = 2.0
-    MARKET_DATA_REQUIRE_SEQUENCE_LIVE: bool = True
+    # The documented CLOB market stream has timestamps/hashes but no sequence.
+    # Enabling sequence is supported for future contracts; current safety relies
+    # on snapshot hashes, strict timestamps and periodic authoritative REST resync.
+    MARKET_DATA_REQUIRE_SEQUENCE_LIVE: bool = False
     MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE: bool = True
+    MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE: bool = True
+    MARKET_DATA_REST_RESYNC_SEC: float = 30.0
+    EXECUTION_LEASE_TTL_SEC: float = 15.0
+    GEOBLOCK_URL: str = "https://polymarket.com/api/geoblock"
+    GEOBLOCK_RECHECK_SEC: float = 300.0
+    ORDER_RECONCILIATION_INTERVAL_SEC: float = 60.0
     
     # Credentials (Load from .env)
     PK: str = ""
@@ -74,10 +83,22 @@ class Settings(BaseSettings):
     GRID_LEVELS: int = 2                  # Default number of grid levels per side
     QUOTE_BASE_SPREAD: float = 0.02       # 兜底（Fallback）默认值
     QUOTE_PRICE_OFFSET_THRESHOLD: float = 0.01   # Refresh grid when mid moves this much; larger = orders sit longer, more chance to get filled
+    ALPHA_BOOK_DEPTH_LEVELS: int = 3
+    ALPHA_BOOK_DEPTH_DECAY: float = 0.65
+    ALPHA_MAX_BINARY_PARITY_ERROR: float = 0.03
+    ALPHA_MAX_PAIR_SKEW_SEC: float = 2.0
+    ALPHA_MAX_INVENTORY_SKEW: float = 0.02
+    ALPHA_VOLATILITY_EWMA_ALPHA: float = 0.20
+    ALPHA_MAX_TICK_MOVE: float = 0.05
+    ALPHA_MAX_EWMA_ABS_MOVE: float = 0.02
+    ALPHA_VOLATILITY_COOLDOWN_SEC: float = 5.0
+    ALPHA_VOLATILITY_SPREAD_MULTIPLIER: float = 2.0
     EXIT_MAX_BOOK_IMPACT: float = 0.02
     EXIT_MAX_REALIZED_LOSS_FRACTION: float = 0.10
     # When True, first bid is at most 1 tick below best_bid (more fills, still ~1¢ edge). When False, strictly at bid_1 only.
     QUOTE_BID_ONE_TICK_BELOW_TOUCH: bool = True
+    PAPER_MAKER_PARTICIPATION_RATE: float = 0.25
+    PAPER_TAKER_FEE_RATE: float = 0.25
 
     # Reward-ranked research router. It is hard-blocked in live mode.
     AUTO_ROUTER_ENABLED: bool = False
@@ -87,7 +108,9 @@ class Settings(BaseSettings):
     # V7.0 Auto-Router: minimum daily reward pool (USD); markets below are skipped entirely
     AUTO_ROUTER_MIN_REWARD_POOL: float = 50.0
 
-    # V7.1 Official Builder API credentials for Polymarket order attribution
+    # Unified SDK attribution uses a public builder code per order. The legacy
+    # local builder credential triplet is retained only to detect stale .env files.
+    POLY_BUILDER_CODE: str = ""
     POLY_BUILDER_API_KEY: str = ""
     POLY_BUILDER_SECRET: str = ""
     POLY_BUILDER_PASSPHRASE: str = ""

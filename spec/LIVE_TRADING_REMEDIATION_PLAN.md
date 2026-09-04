@@ -428,7 +428,7 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 
 - `TRADING_MODE=disabled|paper|live`，旧布尔变量不能单独解锁实盘。
 - wallet + expiry + budget 绑定的 24h 内短时 arm、钱包白名单和 live budget ceiling。
-- DB、Redis、OMS、Market WS、行情完整性、User WS、positions、open orders、risk reservations、risk monitor、accounting integrity、alpha evidence 十二项运行时 readiness。
+- DB、Redis、OMS、Market WS、行情完整性、User WS、positions、open orders、risk reservations、risk monitor、accounting integrity、alpha evidence、executor lease、geographic eligibility、exchange heartbeat 十五项运行时 readiness。
 - `open_orders_reconciled` 在权威订单对账落地前强制为 false，因此当前仍无法发送真实新增订单。
 - 管理写接口 Bearer Token；sticky `/admin/halt`；wipe 默认关闭并增加三重保护。
 - 旧 `0.01` liquidation 与 wallet-wide Periodic Hard Reset 执行路径均已删除。
@@ -454,12 +454,13 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - 网络异常或非确定提交响应进入 `UNKNOWN`；撤单后的剩余额度进入 `CANCEL_PENDING_RECONCILE`，在权威对账前不释放。
 - Watchdog 的硬限额口径统一为全部冷/热仓位 cost basis + durable BUY reservations。
 
-### 已完成：Phase 3 第一批行情完整性
+### 已完成：Phase 3 行情完整性与动态市场约束
 
 - 本地订单簿对全量快照和 delta 做有限数、价格/数量边界、双边流动性和 crossed/locked 检查。
-- 保存 receive timestamp、exchange timestamp、sequence 和 snapshot id；sequence 回退丢弃、gap 要求全量重同步。
+- 保存 receive timestamp、exchange timestamp、可选 sequence 和 snapshot hash；有 sequence 时回退丢弃、gap 要求全量重同步。
 - 行情超过最大年龄、WS 断开或完整性失败时，向引擎发布 invalid tick，撤已知订单并暂停报价。
-- live 默认要求 exchange sequence 与 timestamp；数据源不提供时 readiness 失败关闭。
+- 当前官方流没有文档化 sequence，因此 live 要求 exchange timestamp + snapshot hash，并默认每 30 秒从 REST 权威快照重建；两套完整性契约至少满足一套。
+- `tick_size_change`、`min_order_size` 和 `neg_risk` 进入完整快照；报价按方向安全地向 tick 取整，订单 size 不再硬编码 5 shares。
 
 ### 已完成：安全退出与新风险准入第一批
 
@@ -487,6 +488,9 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - Watchdog 加入 live readiness；循环异常、限额突破或撤单不完整均 fail-closed；最近 fill 导致 REST 对账延期时 positions readiness 保持 false。
 - 活跃市场越线时即使数据库已经是 `suspended` 也会重新广播暂停，避免重启/陈旧引擎漏掉 Kill 信号。
 - `/admin/wipe` 禁止在存在未决订单或非零持仓时清除本地恢复证据。
+- sticky halt 持久化到 Postgres 并跨进程重启恢复；清除必须使用 `TRADING_MODE=disabled`、无活动引擎/未决订单/非零持仓及精确确认头，wipe 不删除事故状态。
+- 钱包级执行 lease + fencing token 阻止双实例同时下单；每次下单前二次续租，租约丢失立即 halt，但撤单仍保持优先可用。
+- live 启动及运行中执行 geographic eligibility 检查；官方 exchange heartbeat 持续维持 cancel-on-disconnect，任一失败均阻止新增风险。
 
 ### 已完成：开放订单权威对账第一批
 
@@ -497,6 +501,10 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - 外部孤儿开放订单、缺失成交、identity/side/price/size 冲突、无 exchange id 与不支持的终态全部进入 `UNKNOWN` 并 Halt。
 - 新增认证管理入口用于无活动引擎时重新对账，以及不暴露 raw payload 的审计查询。
 - 新增 GitHub Actions 离线安全流水线：Ruff、compile、unit tests、全量 migration SQL 渲染和 Compose 配置解析。
+- 交易边界迁移到固定版本 `polymarket-client==0.6.0` 统一 SDK；业务层不再依赖旧 `py-clob-client`/Builder SDK 的内部结构。
+- SDK order union、`ORDER_STATUS_*`/`TRADE_STATUS_*`、异步分页、human/e6 数量单位和钱包类型全部在 adapter 边界严格归一化。
+- 认证 account trade history 在启动对账前幂等回填 User WS 漏失成交；maker/taker 角色与 fee-rate 事实持久化。
+- 撤单绕过新订单熔断器并做独立短重试，避免下单故障同时封死风险收缩路径。
 
 ### 已完成：会计完整性与 PnL 可信度第一批
 
@@ -509,23 +517,30 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - Data API 仓位差异不再被当作成功账务修复；任何外部数量覆盖都标记 `unverified_external` 并 Halt。
 - Risk API 和 Dashboard 仅在最新审计为 `SAFE` 且账本为 `v2` 时展示净已实现 PnL，否则返回/显示 `N/A`。
 - live 静态授权新增 `LIVE_FEE_ACCOUNTING_VALIDATED`，默认 false；未完成真实 adapter 费用字段契约测试前无法解锁。
+- 明确识别的 maker 成交依据当前官方“仅 taker 收费”契约记为确定 0；taker bps 在单位、payer、资产与舍入完成契约验证前仍不换算为绝对现金手续费。
 
-### 尚未完成
+### 已完成：保守 Paper 执行
 
-- 对 `MISSING_FILLS` 的认证 trade history 回填，以及无 exchange id 提交结果的人工恢复流程。
-- 真实 CLOB payload/状态契约验证；按用户要求当前未进行任何实盘或在线验证。
-- 真实成交 payload 的手续费字段、单位、payer 和舍入规则契约测试；当前仅实现明确绝对费用字段的保守 adapter。
-- 行情 checksum 独立计算、YES/NO 互补盘口校验与故障注入回放。
+- 删除“提交后睡眠并永久标记 OPEN”的伪模拟；paper 订单进入独立本地撮合器，绝不触发交易所写请求。
+- maker 只在观察到穿过限价的真实成交事件后，按保守参与率模拟；taker 只消耗可见最优档深度。
+- 所有 paper fill 明确写入 `_paper_simulation` 与模型版本，paper 手续费也明确标记，不能冒充实盘 Alpha 证据。
+
+### 尚未完成（继续构成实盘硬阻塞）
+
+- 真实 CLOB payload/状态/heartbeat/User WS 契约验证；按用户要求当前未进行任何实盘或在线验证。
+- 真实 taker 成交手续费的资产、单位、payer 和舍入规则契约测试；当前不会把 bps 猜成绝对现金费用。
+- 无 exchange id 的未知提交结果仍需要人工恢复 runbook；不得自动释放 reservation。
+- 行情 hash 只能作为服务端快照身份使用，官方未公布独立 checksum 算法；YES/NO 互补盘口校验与大规模故障注入回放仍待完成。
 - residual 人工恢复、退出成交跟踪和完整 lifecycle。
 - Quote Engine V2 的外部/独立 alpha、库存倾斜、毒性/波动率保护与统计验证。
 - Router V2 净收益评分和完整退出生命周期。
 - 历史 v1 账本离线重建工具（必须先取得完整历史 fills/fees）、端到端数据库故障注入和回放框架。
 
-### 本轮纯离线验收（2026-07-19）
+### 本轮纯离线验收（2026-08-26）
 
 - `ruff check . --exclude venv`：通过。
-- `python -m unittest discover -s tests -v`：104 项通过（含远端并发变更合并后的 fail-closed Router 盘口过滤测试）。
+- `python -m unittest discover -s tests -v`：114 项通过（最终数量以本轮 CI 输出为准）。
 - `python -m compileall -q app dashboard tests alembic`：通过。
-- Alembic 静态 SQL 从 `001` 连续渲染至唯一 head `009`：通过。
+- Alembic 静态 SQL从 `001` 连续渲染至唯一 head `010`：通过。
 - `docker compose config --quiet` 与 `git diff --check`：通过。
 - 未启动 API、Dashboard、Postgres、Redis 或容器，未连接 Polymarket，未提交/撤销任何真实订单。

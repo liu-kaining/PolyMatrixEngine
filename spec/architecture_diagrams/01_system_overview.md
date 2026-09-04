@@ -85,7 +85,7 @@ flowchart TB
 |------|------|----------|
 | **数据面** | WebSocket 订阅、REST 快照、消息分发 | `redis.asyncio` Pub/Sub |
 | **核心引擎层** | 定价、报价、风控、库存 | asyncio 热路径零 DB |
-| **执行平面** | OMS 状态机、CLOB 交互、签名 | py-clob-client |
+| **执行平面** | OMS 状态机、CLOB 交互、签名 | pinned unified polymarket-client V2 adapter |
 
 ### 关键设计原则
 

@@ -19,6 +19,7 @@ def make_settings(**overrides):
     values = {
         "TRADING_MODE": "live",
         "LIVE_TRADING_ENABLED": True,
+        "PK": "1" * 64,
         "FUNDER_ADDRESS": FUNDER,
         "LIVE_ALLOWED_FUNDER_ADDRESSES": FUNDER,
         "LIVE_ARM_EXPIRES_AT": expires_at,
@@ -37,6 +38,16 @@ def make_settings(**overrides):
         "QUOTE_BASE_SPREAD": 0.02,
         "QUOTE_PRICE_OFFSET_THRESHOLD": 0.01,
         "QUOTE_BID_ONE_TICK_BELOW_TOUCH": True,
+        "ALPHA_BOOK_DEPTH_LEVELS": 3,
+        "ALPHA_BOOK_DEPTH_DECAY": 0.65,
+        "ALPHA_MAX_BINARY_PARITY_ERROR": 0.03,
+        "ALPHA_MAX_PAIR_SKEW_SEC": 2.0,
+        "ALPHA_MAX_INVENTORY_SKEW": 0.02,
+        "ALPHA_VOLATILITY_EWMA_ALPHA": 0.20,
+        "ALPHA_MAX_TICK_MOVE": 0.05,
+        "ALPHA_MAX_EWMA_ABS_MOVE": 0.02,
+        "ALPHA_VOLATILITY_COOLDOWN_SEC": 5.0,
+        "ALPHA_VOLATILITY_SPREAD_MULTIPLIER": 2.0,
         "MIN_EXPECTED_NET_EDGE": 0.02,
         "EXECUTION_COST_BUFFER": 0.002,
         "ADVERSE_SELECTION_BUFFER": 0.01,
@@ -47,6 +58,15 @@ def make_settings(**overrides):
         "MARKET_DATA_MAX_FUTURE_SKEW_SEC": 2.0,
         "MARKET_DATA_REQUIRE_SEQUENCE_LIVE": True,
         "MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE": True,
+        "MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE": True,
+        "MARKET_DATA_REST_RESYNC_SEC": 30.0,
+        "PM_API_URL": "https://clob.polymarket.com",
+        "PM_WS_URL": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        "PM_CHAIN_ID": 137,
+        "GEOBLOCK_URL": "https://polymarket.com/api/geoblock",
+        "EXECUTION_LEASE_TTL_SEC": 15.0,
+        "GEOBLOCK_RECHECK_SEC": 300.0,
+        "ORDER_RECONCILIATION_INTERVAL_SEC": 60.0,
     }
     values.update(overrides)
     if "LIVE_ARM_TOKEN" not in overrides:
@@ -126,12 +146,20 @@ class TradingSafetyGateTests(unittest.TestCase):
         self.assertIn("SINGLE_SIDE_CHEAP_ONLY", rendered)
         self.assertIn("HEDGE_ON_FILL", rendered)
 
-    def test_unvalidated_fee_accounting_blocks_live(self):
+    def test_legacy_fee_attestation_no_longer_controls_live(self):
         gate = self.make_gate(LIVE_FEE_ACCOUNTING_VALIDATED=False)
-        self.assertIn(
-            "LIVE_FEE_ACCOUNTING_VALIDATED confirmation is false",
-            gate.static_live_errors(),
+        self.assertNotIn("LIVE_FEE_ACCOUNTING_VALIDATED", " ".join(gate.static_live_errors()))
+
+    def test_production_endpoint_chain_and_intervals_are_pinned(self):
+        gate = self.make_gate(
+            PM_API_URL="https://example.invalid",
+            PM_CHAIN_ID=1,
+            ORDER_RECONCILIATION_INTERVAL_SEC=600,
         )
+        rendered = " ".join(gate.static_live_errors())
+        self.assertIn("PM_API_URL", rendered)
+        self.assertIn("PM_CHAIN_ID", rendered)
+        self.assertIn("ORDER_RECONCILIATION_INTERVAL_SEC", rendered)
 
     def test_alpha_boolean_must_be_enabled_before_live_services(self):
         gate = self.make_gate(OFFLINE_VALIDATED_ALPHA_ENABLED=False)
@@ -151,11 +179,12 @@ class TradingSafetyGateTests(unittest.TestCase):
             BASE_ORDER_SIZE=1.0,
             QUOTE_BASE_SPREAD=-0.01,
             MARKET_DATA_REQUIRE_SEQUENCE_LIVE=False,
+            MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE=False,
         )
         rendered = " ".join(gate.static_live_errors())
         self.assertIn("base_order_size", rendered)
         self.assertIn("quote_base_spread", rendered)
-        self.assertIn("market_data_require_sequence_live", rendered)
+        self.assertIn("exchange sequence or snapshot hash", rendered)
 
     def test_halt_is_sticky_for_new_orders(self):
         gate = self.make_gate()

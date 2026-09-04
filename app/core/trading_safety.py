@@ -15,8 +15,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import math
 import re
 import threading
+import asyncio
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -81,6 +83,8 @@ class TradingSafetyGate:
         "risk_monitor",
         "accounting_integrity",
         "alpha_evidence",
+        "executor_lease",
+        "geographic_eligibility",
     )
 
     def __init__(
@@ -98,6 +102,7 @@ class TradingSafetyGate:
         }
         self._halted = False
         self._halt_reason: Optional[str] = None
+        self._persistence_tasks: set[asyncio.Task] = set()
 
     @property
     def mode(self) -> TradingMode:
@@ -126,8 +131,17 @@ class TradingSafetyGate:
             getattr(self._settings, "OFFLINE_VALIDATED_ALPHA_ENABLED", False)
         ):
             errors.append("OFFLINE_VALIDATED_ALPHA_ENABLED is false")
-        if not bool(getattr(self._settings, "LIVE_FEE_ACCOUNTING_VALIDATED", False)):
-            errors.append("LIVE_FEE_ACCOUNTING_VALIDATED confirmation is false")
+        if any(
+            str(getattr(self._settings, name, "") or "").strip()
+            for name in (
+                "POLY_BUILDER_API_KEY",
+                "POLY_BUILDER_SECRET",
+                "POLY_BUILDER_PASSPHRASE",
+            )
+        ):
+            errors.append(
+                "legacy POLY_BUILDER credential fields must be removed; use POLY_BUILDER_CODE"
+            )
         code_commit = str(getattr(self._settings, "APP_CODE_COMMIT", "") or "").lower()
         if not re.fullmatch(r"[0-9a-f]{40,64}", code_commit):
             errors.append("APP_CODE_COMMIT must be a full build commit hash")
@@ -135,9 +149,38 @@ class TradingSafetyGate:
             errors.append("ALPHA_STRATEGY_ID is empty")
         errors.extend(runtime_strategy_config_errors(self._settings))
 
+        expected_endpoints = {
+            "PM_API_URL": "https://clob.polymarket.com",
+            "PM_WS_URL": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            "GEOBLOCK_URL": "https://polymarket.com/api/geoblock",
+        }
+        for name, expected in expected_endpoints.items():
+            actual = str(getattr(self._settings, name, "") or "").strip()
+            if actual != expected:
+                errors.append(f"{name} must equal the pinned production endpoint")
+        if int(getattr(self._settings, "PM_CHAIN_ID", 0) or 0) != 137:
+            errors.append("PM_CHAIN_ID must be 137 (Polygon)")
+
+        interval_ranges = {
+            "EXECUTION_LEASE_TTL_SEC": (5.0, 120.0),
+            "GEOBLOCK_RECHECK_SEC": (30.0, 3600.0),
+            "ORDER_RECONCILIATION_INTERVAL_SEC": (15.0, 300.0),
+        }
+        for name, (minimum, maximum) in interval_ranges.items():
+            try:
+                value = float(getattr(self._settings, name))
+            except (AttributeError, TypeError, ValueError):
+                errors.append(f"{name} must be numeric")
+                continue
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                errors.append(f"{name} must be in [{minimum}, {maximum}]")
+
         funder = str(getattr(self._settings, "FUNDER_ADDRESS", "") or "").strip().lower()
-        if not funder:
-            errors.append("FUNDER_ADDRESS is missing")
+        if not re.fullmatch(r"0x[0-9a-f]{40}", funder):
+            errors.append("FUNDER_ADDRESS must be a 20-byte 0x address")
+        private_key = str(getattr(self._settings, "PK", "") or "").strip()
+        if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", private_key):
+            errors.append("PK must be a 32-byte hex private key")
 
         allowed_raw = str(
             getattr(self._settings, "LIVE_ALLOWED_FUNDER_ADDRESSES", "") or ""
@@ -145,6 +188,8 @@ class TradingSafetyGate:
         allowed = {item.strip().lower() for item in allowed_raw.split(",") if item.strip()}
         if not allowed:
             errors.append("LIVE_ALLOWED_FUNDER_ADDRESSES is empty")
+        elif any(not re.fullmatch(r"0x[0-9a-f]{40}", item) for item in allowed):
+            errors.append("LIVE_ALLOWED_FUNDER_ADDRESSES contains an invalid address")
         elif funder and funder not in allowed:
             errors.append("FUNDER_ADDRESS is not in LIVE_ALLOWED_FUNDER_ADDRESSES")
 
@@ -162,9 +207,9 @@ class TradingSafetyGate:
 
         global_budget = float(getattr(self._settings, "GLOBAL_MAX_BUDGET", 0.0) or 0.0)
         live_cap = float(getattr(self._settings, "LIVE_BUDGET_CAP_USD", 0.0) or 0.0)
-        if global_budget <= 0:
+        if not math.isfinite(global_budget) or global_budget <= 0:
             errors.append("GLOBAL_MAX_BUDGET must be positive")
-        if live_cap <= 0:
+        if not math.isfinite(live_cap) or live_cap <= 0:
             errors.append("LIVE_BUDGET_CAP_USD must be positive")
         elif global_budget > live_cap:
             errors.append("GLOBAL_MAX_BUDGET exceeds LIVE_BUDGET_CAP_USD")
@@ -189,9 +234,40 @@ class TradingSafetyGate:
             }
 
     def halt(self, reason: str) -> None:
+        halt_reason = str(reason or "manual safety halt")
         with self._lock:
             self._halted = True
-            self._halt_reason = str(reason or "manual safety halt")
+            self._halt_reason = halt_reason
+        if globals().get("trading_safety") is not self:
+            return
+        # Immediate memory state is the primary interlock; persistence is an
+        # asynchronous second layer so a restart cannot silently clear it.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        from app.core.safety_state import persist_halt
+
+        task = loop.create_task(persist_halt(halt_reason))
+        self._persistence_tasks.add(task)
+        task.add_done_callback(self._persistence_tasks.discard)
+
+    async def flush_halt_persistence(self) -> None:
+        """Wait for every scheduled durable halt write before DB shutdown."""
+        tasks = tuple(self._persistence_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def restore_persistent_halt(self, reason: str) -> None:
+        with self._lock:
+            self._halted = True
+            self._halt_reason = str(reason or "persisted safety halt")
+
+    def clear_persistent_halt_after_ack(self) -> None:
+        """Internal recovery hook; callers must first durably acknowledge the incident."""
+        with self._lock:
+            self._halted = False
+            self._halt_reason = None
 
     def clear_halt_for_tests(self) -> None:
         """Test-only reset; production recovery should require a process restart and fresh arm."""

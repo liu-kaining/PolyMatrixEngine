@@ -72,7 +72,7 @@ flowchart LR
 
 ### 行情与报价
 
-- 盘口校验有限数、价格/数量、双边流动性、cross/lock、sequence、exchange time 和 freshness。
+- 盘口校验有限数、价格/数量、双边流动性、cross/lock、exchange time、snapshot hash/可选 sequence 和 freshness；当前无 sequence 契约依靠 hash + 周期 REST 重同步。
 - 无效/陈旧/gap 行情会发布 invalid tick，撤已知订单并暂停报价。
 - 新 BUY 默认关闭；开启后还要通过 risk reservation 和 reward-independent net-edge gate。
 - 自动 SELL 只使用损失下限与最大价格冲击范围内的可见深度。

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping, Optional
 
 from app.core.accounting import AccountingInvariantError
 
 
 EXPLICIT_FEE_KEYS = ("fee_amount", "feeAmount", "fee_paid", "feePaid")
+USDC_FEE_QUANTUM = Decimal("0.00001")
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,64 @@ def extract_explicit_fee_amount(payload: Mapping[str, Any]) -> Optional[float]:
     if any(abs(value - first) > 1e-9 for value in values[1:]):
         raise AccountingInvariantError("conflicting explicit fee fields")
     return first
+
+
+def resolve_fee_amount(
+    payload: Mapping[str, Any],
+    liquidity_role: Optional[str],
+    *,
+    price: Optional[Any] = None,
+    size: Optional[Any] = None,
+    fee_rate_bps: Optional[Any] = None,
+) -> Optional[float]:
+    """Resolve a fee using the current documented CLOB contract.
+
+    An explicit absolute fee always wins. Polymarket's current CLOB fee contract
+    charges only takers.  ``fee_rate_bps`` uses basis points, and the USDC fee is
+    ``shares * (bps / 10_000) * price * (1-price)``, rounded to five decimals.
+    Missing taker inputs remain unknown rather than becoming a zero fee.
+    """
+    explicit = extract_explicit_fee_amount(payload)
+    if explicit is not None:
+        return explicit
+    role = str(liquidity_role or "").strip().upper()
+    if role == "MAKER":
+        return 0.0
+    if role == "TAKER":
+        if price in (None, "") or size in (None, "") or fee_rate_bps in (None, ""):
+            return None
+        return calculate_taker_fee_usdc(
+            price=price,
+            size=size,
+            fee_rate_bps=fee_rate_bps,
+        )
+    if role == "":
+        return None
+    raise AccountingInvariantError(f"unsupported liquidity role: {liquidity_role}")
+
+
+def calculate_taker_fee_usdc(*, price: Any, size: Any, fee_rate_bps: Any) -> float:
+    """Calculate the documented taker fee with exact decimal/USDC precision."""
+    try:
+        price_value = Decimal(str(price))
+        size_value = Decimal(str(size))
+        bps_value = Decimal(str(fee_rate_bps))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise AccountingInvariantError("taker fee inputs must be decimal numbers") from exc
+    if not all(value.is_finite() for value in (price_value, size_value, bps_value)):
+        raise AccountingInvariantError("taker fee inputs must be finite")
+    if not Decimal("0") < price_value < Decimal("1"):
+        raise AccountingInvariantError("taker fee price must be within (0, 1)")
+    if size_value <= 0:
+        raise AccountingInvariantError("taker fee size must be positive")
+    if not Decimal("0") <= bps_value <= Decimal("10000"):
+        raise AccountingInvariantError("fee_rate_bps must be within [0, 10000]")
+
+    fee = size_value * (bps_value / Decimal("10000")) * price_value * (
+        Decimal("1") - price_value
+    )
+    rounded = fee.quantize(USDC_FEE_QUANTUM, rounding=ROUND_HALF_UP)
+    return float(rounded)
 
 
 def build_fill_cash_fact(

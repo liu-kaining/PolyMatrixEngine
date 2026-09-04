@@ -1,12 +1,10 @@
 import asyncio
-import json
+import hashlib
 import logging
 import math
 import time
-import httpx
-import websockets
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from app.core.config import settings
 from app.core.redis import redis_client
@@ -19,6 +17,10 @@ from app.market_data.integrity import (
     extract_sequence,
     validate_book_levels,
     validate_event_time,
+)
+from app.oms.polymarket_v2 import (
+    PolymarketV2PublicAdapter,
+    normalize_sdk_stream_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,9 @@ class LocalOrderbook:
             "snapshot_id": payload.get("hash") or payload.get("snapshot_id"),
             "source": source,
             "resync_required": False,
+            "tick_size": payload.get("tick_size"),
+            "min_order_size": payload.get("min_order_size"),
+            "neg_risk": payload.get("neg_risk"),
         }
 
     def mark_invalid(
@@ -112,6 +117,10 @@ class LocalOrderbook:
             "exchange_timestamp": metadata.get("exchange_timestamp"),
             "sequence": metadata.get("sequence"),
             "source": metadata.get("source"),
+            "snapshot_id": metadata.get("snapshot_id"),
+            "tick_size": metadata.get("tick_size"),
+            "min_order_size": metadata.get("min_order_size"),
+            "neg_risk": metadata.get("neg_risk"),
         }
 
     def apply_event(self, data: dict) -> OrderbookEventResult:
@@ -131,6 +140,11 @@ class LocalOrderbook:
                 max_future_skew_seconds=float(settings.MARKET_DATA_MAX_FUTURE_SKEW_SEC),
             )
         except BookIntegrityError as exc:
+            # An auxiliary trade print is not an order-book mutation. A malformed
+            # or stale print may be ignored by the conservative paper simulator,
+            # but must never poison an otherwise fresh executable book.
+            if event_type == "last_trade_price":
+                return OrderbookEventResult([], {})
             asset_ids = {
                 str(item.get("asset_id"))
                 for item in data.get("price_changes", [])
@@ -147,7 +161,8 @@ class LocalOrderbook:
             asset_id = data.get("asset_id")
             if asset_id:
                 asset_id = str(asset_id)
-                previous = self.metadata.get(asset_id, {}).get("sequence")
+                previous_metadata = self.metadata.get(asset_id, {})
+                previous = previous_metadata.get("sequence")
                 if sequence is not None and previous is not None and sequence <= previous:
                     return OrderbookEventResult([], {})
                 try:
@@ -168,6 +183,15 @@ class LocalOrderbook:
                         "snapshot_id": data.get("hash") or data.get("snapshot_id"),
                         "source": "ws_book",
                         "resync_required": False,
+                        "tick_size": data.get("tick_size")
+                        or previous_metadata.get("tick_size"),
+                        "min_order_size": data.get("min_order_size")
+                        or previous_metadata.get("min_order_size"),
+                        "neg_risk": (
+                            data.get("neg_risk")
+                            if isinstance(data.get("neg_risk"), bool)
+                            else previous_metadata.get("neg_risk")
+                        ),
                     }
                     updated.add(asset_id)
 
@@ -240,9 +264,24 @@ class LocalOrderbook:
                     "received_at": received_at,
                     "exchange_timestamp": exchange_timestamp,
                     "sequence": sequence,
-                    "snapshot_id": data.get("hash") or data.get("snapshot_id"),
+                    "snapshot_id": (
+                        data.get("hash")
+                        or data.get("snapshot_id")
+                        or next(
+                            (
+                                change.get("hash")
+                                for change in changes
+                                if isinstance(change, dict) and change.get("hash")
+                            ),
+                            None,
+                        )
+                        or metadata.get("snapshot_id")
+                    ),
                     "source": "ws_delta",
                     "resync_required": False,
+                    "tick_size": metadata.get("tick_size"),
+                    "min_order_size": metadata.get("min_order_size"),
+                    "neg_risk": metadata.get("neg_risk"),
                 }
                 try:
                     validate_book_levels(
@@ -266,6 +305,85 @@ class LocalOrderbook:
                     next_metadata.update(valid=True, integrity_reason="healthy")
                     updated.add(asset_id)
                 self.metadata[asset_id] = next_metadata
+
+        elif event_type == "tick_size_change":
+            asset_id = str(data.get("asset_id") or "")
+            metadata = self.metadata.get(asset_id) or {}
+            try:
+                tick_size = float(data.get("new_tick_size"))
+            except (TypeError, ValueError):
+                tick_size = 0.0
+            if (
+                not asset_id
+                or asset_id not in self.books
+                or not math.isfinite(tick_size)
+                or tick_size <= 0
+                or tick_size >= 1
+            ):
+                if asset_id:
+                    reason = "invalid tick_size_change event"
+                    self.mark_invalid(asset_id, reason, resync_required=True)
+                    invalid[asset_id] = reason
+            else:
+                metadata.update(
+                    tick_size=tick_size,
+                    constraint_received_at=received_at,
+                    constraint_exchange_timestamp=exchange_timestamp,
+                    constraint_source="ws_tick_size_change",
+                    valid=True,
+                    integrity_reason="healthy",
+                )
+                self.metadata[asset_id] = metadata
+                updated.add(asset_id)
+
+        elif event_type == "last_trade_price":
+            asset_id = str(data.get("asset_id") or "")
+            metadata = self.metadata.get(asset_id) or {}
+            try:
+                trade_price = float(data.get("price"))
+                trade_size = float(data.get("size"))
+            except (TypeError, ValueError):
+                trade_price = trade_size = 0.0
+            exchange_trade_id = str(
+                data.get("id")
+                or data.get("trade_id")
+                or data.get("transaction_hash")
+                or ""
+            )
+            if (
+                not asset_id
+                or asset_id not in self.books
+                or not 0 < trade_price < 1
+                or trade_size <= 0
+            ):
+                # Size and transaction hash are optional in the public contract.
+                # Without a positive size the print cannot drive a simulated fill.
+                return OrderbookEventResult([], {})
+            else:
+                if exchange_trade_id:
+                    trade_id = exchange_trade_id
+                else:
+                    stable = "|".join(
+                        str(data.get(key) or "")
+                        for key in (
+                            "market",
+                            "asset_id",
+                            "price",
+                            "size",
+                            "side",
+                            "timestamp",
+                        )
+                    )
+                    trade_id = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+                metadata.update(
+                    last_trade_price=trade_price,
+                    last_trade_size=trade_size,
+                    last_trade_id=trade_id,
+                    last_trade_received_at=received_at,
+                    last_trade_exchange_timestamp=exchange_timestamp,
+                )
+                self.metadata[asset_id] = metadata
+                updated.add(asset_id)
 
         return OrderbookEventResult(sorted(updated), invalid)
 
@@ -295,20 +413,35 @@ class LocalOrderbook:
             "sequence": metadata.get("sequence"),
             "snapshot_id": metadata.get("snapshot_id"),
             "source": metadata.get("source"),
+            "tick_size": metadata.get("tick_size"),
+            "min_order_size": metadata.get("min_order_size"),
+            "neg_risk": metadata.get("neg_risk"),
+            "last_trade_price": metadata.get("last_trade_price"),
+            "last_trade_size": metadata.get("last_trade_size"),
+            "last_trade_id": metadata.get("last_trade_id"),
         }
 
 
 class MarketDataGateway:
     def __init__(self):
-        self.ws_url = settings.PM_WS_URL
         self.subscribed_markets: Set[str] = set()
-        self.ws = None
-        self.reconnect_delay = 1.0
-        self.max_reconnect_delay = 60.0
         self.orderbook = LocalOrderbook()
-        self.ping_task = None
         self.freshness_task = None
         self._last_invalid_notice: Dict[str, str] = {}
+        self._last_rest_resync_at = 0.0
+        self._sdk_adapter: Optional[PolymarketV2PublicAdapter] = None
+        self._adapter_lock = asyncio.Lock()
+        self._subscription_event = asyncio.Event()
+        self._sdk_subscribed: Set[str] = set()
+        self._stream_handles: list[Any] = []
+        self._reader_tasks: Set[asyncio.Task] = set()
+        self._last_stream_open = False
+
+    async def _ensure_adapter(self) -> PolymarketV2PublicAdapter:
+        async with self._adapter_lock:
+            if self._sdk_adapter is None:
+                self._sdk_adapter = PolymarketV2PublicAdapter.create()
+            return self._sdk_adapter
 
     def _strict_sequence_required(self) -> bool:
         return (
@@ -328,10 +461,24 @@ class MarketDataGateway:
             max_age_seconds=float(settings.MARKET_DATA_MAX_AGE_SEC),
             require_sequence=self._strict_sequence_required(),
             require_exchange_timestamp=self._strict_exchange_timestamp_required(),
+            require_snapshot_id=(
+                trading_safety.mode is TradingMode.LIVE
+                and bool(settings.MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE)
+            ),
         )
 
     async def _publish_valid_snapshot(self, asset_id: str, snapshot: dict) -> None:
         self._last_invalid_notice.pop(asset_id, None)
+        await redis_client.set_state(
+            f"market_constraints:{asset_id}",
+            {
+                "tick_size": snapshot.get("tick_size"),
+                "min_order_size": snapshot.get("min_order_size"),
+                "neg_risk": snapshot.get("neg_risk"),
+                "snapshot_id": snapshot.get("snapshot_id"),
+                "updated_at": snapshot.get("received_at"),
+            },
+        )
         await redis_client.set_state(f"ob:{asset_id}", snapshot)
         await redis_client.publish(f"tick:{asset_id}", snapshot)
 
@@ -367,6 +514,49 @@ class MarketDataGateway:
         try:
             while True:
                 await asyncio.sleep(1.0)
+                now = time.time()
+                stream_open = bool(
+                    self._sdk_adapter is not None
+                    and self._sdk_adapter.market_stream_is_open()
+                )
+                if stream_open != self._last_stream_open:
+                    self._last_stream_open = stream_open
+                    trading_safety.set_readiness(
+                        "market_stream",
+                        stream_open,
+                        "SDK market stream connected"
+                        if stream_open
+                        else "SDK market stream disconnected",
+                    )
+                    if not stream_open:
+                        for asset_id in sorted(self.subscribed_markets):
+                            reason = "SDK market stream disconnected; full snapshot required"
+                            self.orderbook.mark_invalid(
+                                asset_id, reason, resync_required=True
+                            )
+                            await self._publish_invalid_snapshot(asset_id, reason)
+                    elif self.subscribed_markets:
+                        # SDK reconnect is transparent to its iterator. Re-seed from
+                        # authoritative REST before trusting further deltas.
+                        await asyncio.gather(
+                            *(
+                                self.fetch_initial_snapshot(asset)
+                                for asset in sorted(self.subscribed_markets)
+                            ),
+                            return_exceptions=True,
+                        )
+                resync_interval = max(
+                    5.0, float(settings.MARKET_DATA_REST_RESYNC_SEC)
+                )
+                if (
+                    self.subscribed_markets
+                    and now - self._last_rest_resync_at >= resync_interval
+                ):
+                    self._last_rest_resync_at = now
+                    await asyncio.gather(
+                        *(self.fetch_initial_snapshot(asset) for asset in sorted(self.subscribed_markets)),
+                        return_exceptions=True,
+                    )
                 for asset_id in sorted(self.subscribed_markets):
                     health = self._snapshot_health(self.orderbook.snapshot(asset_id))
                     if not health.healthy:
@@ -392,12 +582,9 @@ class MarketDataGateway:
         Pull full orderbook via Polymarket CLOB REST API and seed the local book.
         Then publish the snapshot to Redis so the QuotingEngine fires immediately.
         """
-        url = f"{settings.PM_API_URL}/book"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, params={"token_id": token_id})
-                resp.raise_for_status()
-                data = resp.json()
+            adapter = await self._ensure_adapter()
+            data = await adapter.get_order_book(token_id)
 
             bids = data.get("bids", [])
             asks = data.get("asks", [])
@@ -419,15 +606,6 @@ class MarketDataGateway:
                 best_bid = snap["bids"][0]["price"] if snap["bids"] else "?"
                 best_ask = snap["asks"][0]["price"] if snap["asks"] else "?"
                 logger.info(f"Initial snapshot seeded for {token_id[:8]}: Bid={best_bid} Ask={best_ask} (bids={len(bids)} asks={len(asks)})")
-        except httpx.HTTPStatusError as e:
-            # 404 is common for illiquid / not-yet-listed books; treat as soft warning.
-            if e.response is not None and e.response.status_code == 404:
-                logger.warning(
-                    f"Initial snapshot 404 for {token_id[:8]} – "
-                    "orderbook not available via REST yet; waiting for WS ticks."
-                )
-            else:
-                logger.error(f"Failed to fetch initial snapshot for {token_id[:8]}: {e}")
         except BookIntegrityError as e:
             self.orderbook.mark_invalid(token_id, str(e), resync_required=True)
             await self._publish_invalid_snapshot(token_id, str(e))
@@ -437,180 +615,101 @@ class MarketDataGateway:
             logger.error(f"Failed to fetch initial snapshot for {token_id[:8]}: {e}")
 
     async def connect(self):
-        while True:
-            connected_at = None
-            try:
-                logger.debug(f"Connecting to Polymarket WS: {self.ws_url}")
-                async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    close_timeout=10,
-                ) as ws:
-                    self.ws = ws
-                    connected_at = time.monotonic()
-                    trading_safety.set_readiness(
-                        "market_stream", True, "market WebSocket connected"
-                    )
-                    logger.info("Market WS connected.")
-
-                    self.ping_task = asyncio.create_task(self._heartbeat())
-                    self.freshness_task = asyncio.create_task(self._freshness_monitor())
-
-                    # Always register on the market channel (even assets_ids=[]). If we skip this
-                    # while AUTO_ROUTER finds no targets, the server often drops the socket ~10s idle.
-                    await self._send_market_subscribe(mode="initial")
-
-                    await self._listen()
-                    raise RuntimeError("Market WS listen loop exited unexpectedly without exception.")
-
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(
-                    "Market WS connection closed. code=%s reason=%r clean=%s",
-                    getattr(e, "code", None),
-                    getattr(e, "reason", "") or "",
-                    isinstance(e, websockets.exceptions.ConnectionClosedOK),
-                )
-            except Exception as e:
-                logger.exception(f"Market WS connect loop crashed: {e}")
-            finally:
-                if self.ping_task:
-                    self.ping_task.cancel()
-                    self.ping_task = None
-                if self.freshness_task:
-                    self.freshness_task.cancel()
-                    await asyncio.gather(self.freshness_task, return_exceptions=True)
-                    self.freshness_task = None
-                self.ws = None
-                trading_safety.set_readiness(
-                    "market_stream", False, "market WebSocket disconnected"
-                )
-                trading_safety.set_readiness(
-                    "market_data_integrity", False, "market WebSocket disconnected"
-                )
-                for asset_id in sorted(self.subscribed_markets):
-                    reason = "market WebSocket disconnected; full snapshot required"
-                    self.orderbook.mark_invalid(
-                        asset_id, reason, resync_required=True
-                    )
-                    try:
-                        await self._publish_invalid_snapshot(asset_id, reason)
-                    except Exception:
-                        logger.exception(
-                            "Failed to publish disconnect invalidation for %s",
-                            asset_id[:8],
-                        )
-                connected_for = 0.0
-                if connected_at is not None:
-                    connected_for = max(0.0, time.monotonic() - connected_at)
-                if connected_for >= 60.0:
-                    self.reconnect_delay = 1.0
-                logger.warning(
-                    f"Market WS reconnecting in {self.reconnect_delay:.1f}s "
-                    f"(last_session={connected_for:.1f}s)."
-                )
-                await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-
-    async def _heartbeat(self):
-        """Polymarket expects text PING ~every 10s; send one immediately so we don't sit idle
-        until the first sleep (RFC ping_interval is 20s here, too late for ~10s server idle cuts)."""
+        """Own SDK stream handles; the SDK manages PING/PONG and reconnects."""
+        await self._ensure_adapter()
+        self.freshness_task = asyncio.create_task(self._freshness_monitor())
         try:
             while True:
-                if self.ws is not None and not getattr(self.ws, "closed", False):
-                    try:
-                        await self.ws.send("PING")
-                        logger.debug("Sent PING")
-                    except Exception:
-                        pass
-                await asyncio.sleep(10)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"Market WS heartbeat error: {e}")
-
-    async def _send_market_subscribe(
-        self, *, mode: Literal["initial", "update"] = "initial"
-    ) -> None:
-        if self.ws is None or getattr(self.ws, "closed", False):
-            return
-        sub_msg: Dict[str, object] = {
-            "assets_ids": list(self.subscribed_markets),
-            "type": "market",
-            "custom_feature_enabled": True,
-        }
-        if mode == "update":
-            sub_msg["operation"] = "subscribe"
-        try:
-            await self.ws.send(json.dumps(sub_msg))
-            if mode == "initial":
-                logger.debug(
-                    "Market WS initial subscription sent (asset count=%s).",
-                    len(self.subscribed_markets),
+                await self._subscription_event.wait()
+                self._subscription_event.clear()
+                new_assets = sorted(self.subscribed_markets - self._sdk_subscribed)
+                if not new_assets:
+                    continue
+                handle = await self._sdk_adapter.subscribe_market(new_assets)
+                self._stream_handles.append(handle)
+                self._sdk_subscribed.update(new_assets)
+                self._last_stream_open = self._sdk_adapter.market_stream_is_open()
+                trading_safety.set_readiness(
+                    "market_stream",
+                    self._last_stream_open,
+                    "SDK market stream connected"
+                    if self._last_stream_open
+                    else "SDK market subscription did not open",
                 )
-        except Exception as e:
-            logger.exception(f"Market WS subscribe send failed: {e}")
-            raise
+                task = asyncio.create_task(self._consume_sdk_stream(handle, new_assets))
+                self._reader_tasks.add(task)
+                task.add_done_callback(self._reader_tasks.discard)
+        finally:
+            if self.freshness_task is not None:
+                self.freshness_task.cancel()
+                await asyncio.gather(self.freshness_task, return_exceptions=True)
+                self.freshness_task = None
+            for task in list(self._reader_tasks):
+                task.cancel()
+            await asyncio.gather(*self._reader_tasks, return_exceptions=True)
+            self._reader_tasks.clear()
+            await asyncio.gather(
+                *(handle.close() for handle in self._stream_handles),
+                return_exceptions=True,
+            )
+            self._stream_handles.clear()
+            adapter, self._sdk_adapter = self._sdk_adapter, None
+            if adapter is not None:
+                try:
+                    await adapter.close()
+                except Exception as exc:
+                    logger.debug("SDK market adapter close failed: %s", exc)
+            self._sdk_subscribed.clear()
+            self._last_stream_open = False
+            trading_safety.set_readiness(
+                "market_stream", False, "SDK market stream stopped"
+            )
+            trading_safety.set_readiness(
+                "market_data_integrity", False, "SDK market stream stopped"
+            )
 
     async def subscribe(self, asset_ids: List[str]):
         self.subscribed_markets.update(asset_ids)
         trading_safety.set_readiness(
             "market_data_integrity", False, "new subscriptions await valid snapshots"
         )
-        if self.ws is not None and not getattr(self.ws, "closed", False):
-            await self._send_market_subscribe(mode="update")
-            logger.info(f"Subscribed to assets (count={len(self.subscribed_markets)})")
+        self._subscription_event.set()
+        logger.info("Requested SDK market subscriptions (count=%d)", len(asset_ids))
 
-    async def _listen(self):
-        while True:
-            try:
-                # Add strict receive timeout. If no message (tick or PONG) arrives for 30s,
-                # the connection is a zombie. Force an exception to trigger reconnection.
-                message = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", errors="replace")
-                
-                if message == "PONG":
-                    continue
-                if message == "PING":
-                    await self.ws.send("PONG")
-                    continue
-
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError as e:
-                    logger.exception(
-                        f"Market WS JSON decode failed: {e}. Raw message (first 200 chars): {str(message)[:200]}"
-                    )
-                    continue
-                items = data if isinstance(data, list) else [data]
-
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    result = self.orderbook.apply_event(item)
-                    for aid, reason in result.invalid_assets.items():
-                        await self._publish_invalid_snapshot(aid, reason)
-                    for aid in result.updated_asset_ids:
-                        snap = self.orderbook.snapshot(aid)
-                        if snap:
-                            await self._publish_valid_snapshot(aid, snap)
-                    if result.invalid_assets or result.updated_asset_ids:
-                        await self._refresh_integrity_readiness()
-
-            except asyncio.TimeoutError:
-                logger.exception("Market WS silent drop detected (30s without message). Forcing reconnect...")
-                raise
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(
-                    "Market WS recv closed. code=%s reason=%r",
-                    getattr(e, "code", None),
-                    getattr(e, "reason", "") or "",
-                )
-                raise
-            except Exception as e:
-                logger.exception(f"Error processing market WS message: {e}")
-                raise
+    async def _consume_sdk_stream(self, handle: Any, asset_ids: list[str]) -> None:
+        last_dropped = int(getattr(handle, "dropped", 0) or 0)
+        try:
+            async for event in handle:
+                dropped = int(getattr(handle, "dropped", 0) or 0)
+                if dropped > last_dropped:
+                    reason = f"SDK market stream dropped {dropped - last_dropped} event(s)"
+                    for asset_id in asset_ids:
+                        self.orderbook.mark_invalid(
+                            asset_id, reason, resync_required=True
+                        )
+                        await self._publish_invalid_snapshot(asset_id, reason)
+                    trading_safety.halt(reason)
+                    return
+                last_dropped = dropped
+                item = normalize_sdk_stream_event(event)
+                result = self.orderbook.apply_event(item)
+                for aid, reason in result.invalid_assets.items():
+                    await self._publish_invalid_snapshot(aid, reason)
+                for aid in result.updated_asset_ids:
+                    snap = self.orderbook.snapshot(aid)
+                    if snap:
+                        await self._publish_valid_snapshot(aid, snap)
+                if result.invalid_assets or result.updated_asset_ids:
+                    await self._refresh_integrity_readiness()
+            raise RuntimeError("SDK market subscription ended unexpectedly")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            trading_safety.set_readiness(
+                "market_stream", False, "SDK market stream consumer failed"
+            )
+            trading_safety.halt(f"SDK market stream consumer failed: {exc}")
+            logger.exception("SDK market stream consumer failed")
 
 
 md_gateway = MarketDataGateway()

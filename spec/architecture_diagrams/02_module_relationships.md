@@ -40,7 +40,7 @@ flowchart TB
     subgraph OMS["oms/ 订单管理"]
         OMSCore["OMS Core<br/>状态机"]
         Circuit["CircuitBreaker<br/>熔断器"]
-        ClobClient["CLOB Client<br/>py-clob-client"]
+        ClobClient["CLOB V2 Adapter<br/>polymarket-client 0.6.0"]
     end
 
     subgraph Risk["risk/ 风控"]

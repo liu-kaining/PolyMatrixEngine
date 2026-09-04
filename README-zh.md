@@ -4,17 +4,19 @@
 
 **面向 [Polymarket](https://polymarket.com) 的实验性自动化做市与流动性引擎。**
 
-> **实盘状态：NO-GO。** 项目正在按照 [实盘亏损整改计划](spec/LIVE_TRADING_REMEDIATION_PLAN.md) 重构。安全互锁、durable fill/reservation、fail-closed 订单权威对账、确定性手续费会计重放、行情完整性和有界退出已经落地；真实数据源契约验证、缺失成交回填、历史账本重建及经过统计验证的盈利策略仍是硬阻塞项。
+> **实盘状态：NO-GO。** 项目正在按照 [实盘亏损整改计划](spec/LIVE_TRADING_REMEDIATION_PLAN.md) 重构。统一 V2 SDK 边界、认证成交回填、持久化停机、单执行器租约、交易所 heartbeat、地域预检、动态市场约束和保守 paper 成交已经落地；真实行情/手续费契约验证、历史账本重建及经过统计验证的盈利 Alpha 仍是硬阻塞项。
 
 ## 安全整改状态
 
 - `TRADING_MODE=disabled` 是默认值，并且不会启动行情、用户流、Watchdog 或 Router。
-- `paper` 只产生本地模拟订单；`live` 才可能申请真实执行。
+- `paper` 使用明确标记的保守事件驱动撮合，绝不发送交易所命令；`live` 才可能申请真实执行。
 - 旧 `LIVE_TRADING_ENABLED=True` **单独无法解锁实盘**。live 还要求钱包白名单、未来 24 小时内到期的 arm、显式预算 ceiling、构建 commit、与当前源码/参数完全匹配的 alpha 证据及全部运行时 readiness。奖励排名 Auto-Router 被硬性限制为 paper-only。
 - `open_orders_reconciled` 只有在认证 `get_orders` 与逐单终态查询均和本地成交/reservation 一致后才会通过；仅仅“不在开放订单列表”绝不会释放风险。
+- CLOB 边界固定为 `polymarket-client==0.6.0`；SDK union、状态前缀、异步分页和 human/e6 数量单位在业务层之前统一归一化，认证 trade history 可幂等回填 User WS 漏单。
+- Postgres 钱包租约阻止双实例同时执行；sticky halt 跨重启保留，只能在 disabled 且本地平仓/无未决单后显式确认。交易所 heartbeat 丢失或地域判断不确定都会停止新增风险。
 - wallet-wide Periodic Hard Reset 及其 `cancel_all` helper 已从代码删除；`0.01` 全量强平实现和 Dashboard 按钮也已删除，`/liquidate` 固定返回 HTTP 410。
 - BUY 在提交前先由 Postgres 原子预占资金；下单或撤单结果不确定时保留 reservation，并阻止新增风险直至权威对账。
-- 行情快照携带接收时间、交易所时间、sequence/snapshot 元数据和有效性；陈旧、跳序、交叉、空盘或非法盘口会撤已知订单并暂停报价。
+- 行情快照携带接收时间、交易所时间、snapshot hash/可选 sequence 和有效性；当前无 sequence 的官方流使用严格 timestamp、hash 与周期 REST 重同步。每个市场的 tick/min-size 动态约束会被强制执行。
 - 自动激进退出受可见买盘深度、最大价格冲击和基于成本的已实现亏损下限约束。
 - 每个已处理 fill 都有一条不可变的带符号现金事实及对应库存版本；明确手续费进入成本/损益，缺失手续费保持 `UNKNOWN`，净 PnL 失效并阻止新增实盘风险，绝不按 0 猜测。
 - 任何 REST 仓位覆盖都会把会计版本降级为 `unverified_external`；只有最新确定性重放为 `SAFE` 且账本为验证过的 `v2` 时，API/Dashboard 才展示净已实现 PnL，否则显示 `N/A`。
@@ -59,7 +61,7 @@ PolyMatrix Engine 是一个**正在主动进行安全整改的实验性交易内
 | **性能** | 带版本的内存快照；报价 Tick 内零 Postgres 读取；durable fill 事务；`EngineSupervisor` 单例任务注册表。 |
 | **执行** | 差分报价（按 side/price/size 签名保留/撤/补）；保留时间优先，减少 CLOB 请求。Fail-Closed 的 Websocket 掉线/假死重连。 |
 | **风控** | 原子 BUY reservation + 冷仓位成本口径，共用单市场/全局限额；下单/撤单未知状态保留资本并阻止新增风险。 |
-| **Maker 纪律** | 跨盘口保护（SELL ≥ best_bid + tick，BUY ≤ best_ask - tick），杜绝意外 Taker。 |
+| **Maker 纪律** | 常规报价显式 post-only 并按动态 tick 对齐；只有有界库存退出可单独允许 Taker。 |
 | **奖励观测** | Gamma 奖励参数只用于展示/离线归因，不得改变 size、spread、订单保活或 live 准入。 |
 | **运维** | Streamlit 驾驶舱（选市场、敞口、日志、认证紧急停止）；FastAPI 控制面；fail-closed 默认配置。 |
 
@@ -159,7 +161,7 @@ PolyMatrix Engine 实现的是 **Polymarket 官方做市商（MM）流程**，�
 
 | 文档 | 内容概要 | 我们的对应实现 |
 |------|----------|----------------|
-| [概述](https://docs.polymarket.com/cn/market-makers/overview) | 做市商 = 持续挂限价单、提供流动性；用 WebSocket + Gamma + CLOB | 使用 **Gamma API** 取元数据、**CLOB REST**（py-clob-client）下单；tick 循环内无 DB；跨盘口保护保证纯 Maker。 |
+| [概述](https://docs.polymarket.com/cn/market-makers/overview) | 做市商 = 持续挂限价单、提供流动性；用 WebSocket + Gamma + CLOB | 使用 **Gamma API** 取元数据、固定版本的统一 **polymarket-client** V2 adapter 执行；常规报价强制 post-only。 |
 | [入门指南](https://docs.polymarket.com/cn/market-makers/getting-started) | 充值 USDC.e、部署钱包、代币授权、从钱包派生 API 凭证 | 使用 **ClobClient** 的 `create_or_derive_api_creds()` 与 POLY_PROXY（免 gas）。充值与授权在应用外完成。 |
 | [流动性奖励](https://docs.polymarket.com/cn/market-makers/liquidity-rewards) | 交易所奖励资格元数据 | 只读取并展示，用于离线归因；奖励不调参，也不能让亏损报价通过。 |
 | [Maker 返利](https://docs.polymarket.com/cn/market-makers/maker-rebates) | 在收费市场（如加密货币）中，taker 手续费的一部分按日以 USDC 返给被成交的 maker | 我们只挂限价单，天然是 maker；返利由 Polymarket 发放，我们不计算。 |
@@ -186,7 +188,7 @@ PolyMatrix Engine 实现的是 **Polymarket 官方做市商（MM）流程**，�
 | `app/market_data/gateway.py` | Market WS + REST 维护本地订单簿；向 Redis `tick:{token}` / `ob:{token}` 发布快照。 |
 | `app/market_data/user_stream.py` | User WS adapter：成交进入确定性 durable fill processor；只在提交后发布订单状态。 |
 | `app/quoting/engine.py` | QuotingEngine：tick/control/order status；已提交内存快照；行情、风险和净边际闸门；有界退出与差分报价。 |
-| `app/oms/core.py` | OMS：py-clob-client、熔断器、校验后的下单/撤单、稳定 local/exchange ID、保守未知状态；无全钱包 reset helper。 |
+| `app/oms/core.py` | OMS：统一 V2 adapter、新单熔断、优先撤单、heartbeat、稳定 local/exchange ID 与保守未知状态。 |
 | `app/risk/watchdog.py` | **~1s** cold/hot 成本 + reservation 检查；周期全仓位 Data API 比较；差异使会计失效；Kill → halt + 撤单 + suspend。 |
 | `app/core/alpha_evaluator.py` / `strategy_fingerprint.py` | 严格本地证据生成器与规范化参数/源码指纹；两者都不访问交易所。 |
 | `app/core/auto_router.py` | 可选 paper-only 奖励元数据研究 Router；live 启动无条件拒绝。 |
@@ -284,13 +286,15 @@ docker compose logs -f api
 | `MIN_EXPECTED_NET_EDGE` | 扣除成本与逆向选择缓冲后的最小净边际 | `0.02` |
 | `EXECUTION_COST_BUFFER` / `ADVERSE_SELECTION_BUFFER` | 每 share 的保守成本扣减 | `0.002` / `0.01` |
 | `MARKET_DATA_MAX_AGE_SEC` | 行情超过该年龄即撤单/暂停 | `5.0` |
-| `MARKET_DATA_REQUIRE_SEQUENCE_LIVE` | live 必须有交易所 sequence | `True` |
+| `MARKET_DATA_REQUIRE_SEQUENCE_LIVE` | 数据契约提供 sequence 时强制连续性 | 当前官方流默认 `False` |
 | `MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE` | live 必须有交易所 timestamp | `True` |
+| `MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE` / `MARKET_DATA_REST_RESYNC_SEC` | 强制 hash 并周期重建盘口 | `True` / `30` |
+| `EXECUTION_LEASE_TTL_SEC` / `EXCHANGE_HEARTBEAT_INTERVAL_SEC` | 单钱包执行租约 / 交易所断连撤单 heartbeat | `15` / `5` |
 | `MAX_EXPOSURE_PER_MARKET` | 单市场敞口上限（USDC）；触发 Watchdog 强停 | 如 `15` |
 | `EXPOSURE_TOLERANCE` | 账本与 API 差异超过此值才覆盖 | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | 最近一次本地成交后多少秒内不覆盖 | `8.0` |
 | `RECONCILIATION_INTERVAL_SEC` | Watchdog 周期 **Data API** 持仓比较间隔（秒） | `300` |
-| `BASE_ORDER_SIZE` | 每笔订单 **份额**（CLOB 的 `size`，非 USDC）；最小 **5** 份 | 如 `10.0` |
+| `BASE_ORDER_SIZE` | 每笔订单 outcome shares；运行时自动提高到市场当前 `min_order_size` | 如 `10.0` |
 | `GRID_LEVELS` | 每侧网格档数 | `2` |
 | `QUOTE_BASE_SPREAD` | 相对 fair value 的价差 | `0.02` |
 | `APP_CODE_COMMIT` / `ALPHA_STRATEGY_ID` | 构建身份与策略 ID，必须与证据匹配 | 空/不匹配 = 禁止 live |
@@ -341,9 +345,8 @@ docker compose logs -f api
 | `AUTO_ROUTER_SCAN_INTERVAL_SEC` | 路由器扫描 Gamma 的间隔秒数 | `3600` |
 | `AUTO_ROUTER_MIN_HOLD_HOURS` | paper 研究市场掉出 Top N 后最少保留小时数 | `2.0` |
 | `AUTO_ROUTER_MIN_REWARD_POOL` | **V7.0** — 日奖励池（USD）低于此值的 Gamma 市场直接跳过 | `50.0` |
-| `POLY_BUILDER_API_KEY` | **V7.1** — 官方 Builder API Key，用于订单归因头 | `""` |
-| `POLY_BUILDER_SECRET` | **V7.1** — 官方 Builder Secret，用于 HMAC 归因签名 | `""` |
-| `POLY_BUILDER_PASSPHRASE` | **V7.1** — 官方 Builder Passphrase，用于归因头 | `""` |
+| `POLY_BUILDER_CODE` | 统一 SDK 的订单归因 code | `""` |
+| `POLY_BUILDER_API_KEY` / `SECRET` / `PASSPHRASE` | 已删除的旧本地签名字段；非空会阻止 live | 必须为空 |
 | `EVENT_HORIZON_HOURS` | 临近结算/已过期市场的避险窗口 | `72.0` |
 | `MAX_EXPOSURE_PER_SECTOR` | 单赛道/标签最大允许敞口（USDC） | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | 单赛道/标签最大同时做市名额 | `2` |

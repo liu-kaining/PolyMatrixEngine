@@ -4,17 +4,19 @@
 
 **Experimental automated market-making and liquidity engine for [Polymarket](https://polymarket.com).**
 
-> **Live status: NO-GO.** The project is being rebuilt under the [live-loss remediation plan](spec/LIVE_TRADING_REMEDIATION_PLAN.md). Safety interlocks, durable fills/reservations, fail-closed order reconciliation, deterministic fee-aware accounting replay, market-data integrity and bounded exits are present. Real-feed contract verification, missing-trade backfill, historical ledger rebuild and a statistically validated profitable strategy remain mandatory blockers.
+> **Live status: NO-GO.** The project is being rebuilt under the [live-loss remediation plan](spec/LIVE_TRADING_REMEDIATION_PLAN.md). The unified V2 SDK boundary, authenticated trade backfill, persistent halt, single-executor lease, exchange heartbeat, geo preflight, dynamic venue constraints and conservative paper fills are implemented. Real-feed/fee contract validation, historical ledger rebuild and statistically validated profitable alpha remain mandatory blockers.
 
 ## Safety remediation status
 
 - `TRADING_MODE=disabled` is the default and does not start trading network services.
-- `paper` creates local simulated orders; only `live` can request exchange execution.
+- `paper` uses an explicitly tagged, conservative event-driven fill model and never sends exchange commands; only `live` can request exchange execution.
 - Legacy `LIVE_TRADING_ENABLED=True` **cannot unlock live orders by itself**. Live also requires a wallet allow-list, an arm expiring within 24 hours, an explicit budget ceiling, a build commit, source/config-matched alpha evidence and every runtime readiness check. The reward-ranked Auto-Router is hard-blocked in live mode.
 - `open_orders_reconciled` becomes true only after authenticated `get_orders` plus per-order terminal checks agree with local fills and reservations. Absence from the open list alone never releases risk.
+- The CLOB boundary is pinned to `polymarket-client==0.6.0`; SDK unions, enum prefixes, async pagination and human/e6 units are normalized before business code sees them. Authenticated trade history backfills missed User-WS fills idempotently.
+- A Postgres wallet lease prevents concurrent live executors. Sticky halts survive restarts and require an explicit disabled/flat acknowledgement; exchange heartbeat loss and geographic uncertainty both halt new risk.
 - The wallet-wide Periodic Hard Reset and its `cancel_all` helper were deleted. The `0.01` bulk-liquidation implementation and Dashboard action were also removed; `/liquidate` now returns HTTP 410.
 - BUY risk is reserved atomically in Postgres before submission. Ambiguous submit/cancel states retain their reservation and block new risk until authoritative reconciliation.
-- Market books now carry receive time, exchange time, sequence/snapshot metadata and validity. Stale, gapped, crossed, empty or malformed books cancel known quotes and pause the engine.
+- Market books carry receive time, exchange time, snapshot hash/optional sequence and validity. Current no-sequence feeds use strict timestamps, hashes and periodic REST resync. Dynamic tick/min-size constraints are enforced per market.
 - Automated aggressive exits are limited by visible bid depth, maximum book impact and a cost-based realized-loss floor.
 - Every processed fill has a one-to-one immutable signed cash fact and inventory state version. Explicit fees are capitalized/expensed; missing fees remain `UNKNOWN`, invalidate net PnL and halt new live risk rather than being treated as zero.
 - Any REST position overwrite downgrades accounting to `unverified_external`. The API and Dashboard show `N/A` unless the latest deterministic replay is `SAFE` and every ledger is verified `v2`.
@@ -59,7 +61,7 @@ Do not use the current version for live funds. Profitability must first be demon
 | **Performance** | Versioned memory snapshot and zero Postgres reads in the quote tick loop; durable fill transactions; `EngineSupervisor` task registry. |
 | **Execution** | Diff quoting (keep/cancel/create by signature); preserves time priority and cuts API churn. Fail-closed resilient WS with heartbeat dropping detection. |
 | **Risk** | Atomic BUY reservations plus cold-position cost basis under per-market/global limits; unknown submit/cancel outcomes retain capital and block new risk. |
-| **Maker discipline** | Crosses-the-book guard (SELL ≥ best_bid + tick, BUY ≤ best_ask - tick); no accidental taker flow. |
+| **Maker discipline** | Normal quotes are explicit post-only and tick-aligned; bounded inventory exits are separately marked taker-capable. |
 | **Rewards telemetry** | Gamma reward parameters are displayed for attribution only; they cannot change order size, spread, retention or live admission. |
 | **Ops** | Streamlit dashboard (screener, exposure, logs, authenticated emergency stop); FastAPI control plane; fail-closed defaults. |
 
@@ -69,14 +71,14 @@ Do not use the current version for live funds. Profitability must first be demon
 
 - **Paper-only Auto-Router** — Scans reward markets and applies event-horizon/sector limits for research. Reward ranking is explicitly not a live strategy and the central safety gate rejects it in live mode.
 - **Engine Supervisor** — Concurrency-safe lifecycle manager with one task per market side. Stop/shutdown paths attempt authoritative cancellation before task teardown; any unconfirmed cancel activates the sticky halt.
-- **Market Data Gateway** — Full snapshots plus atomic deltas with sequence-gap, timestamp, freshness, numeric, empty-book and crossed-book checks. Invalid data cancels known quotes instead of being priced.
+- **Market Data Gateway** — Full snapshots plus atomic deltas with timestamp/hash, optional sequence, periodic REST resync, dynamic tick-size, freshness, numeric, empty-book and crossed-book checks. Invalid data cancels known quotes instead of being priced.
 - **Versioned Inventory State** — `InventoryStateManager` serves committed exposure snapshots to the hot path. Durable user-stream fills commit to Postgres first, then publish the exact state version into memory so an older snapshot cannot overwrite a newer fill.
 - **Deterministic accounting replay** — One immutable cash row per fill, contiguous inventory versions, explicit fee facts, average-cost net realized PnL and startup/admin replay. Legacy, externally overwritten, missing-fee or non-replayable ledgers display `N/A` and block live risk.
 - **Unified Pricing (AlphaModel)** — Single anchor from YES book (mid + OBI skew); NO side derived; dynamic spread and inventory-aware state machine. This simple model is experimental, not evidence of profitability.
 - **Diff Quoting** — Compare current active orders to desired grid by (side, price, size); cancel only stale, create only missing; preserves time priority and reduces CLOB traffic.
 - **Atomic two-sided reservations** — BUY reserves USDC notional and SELL reserves inventory shares in Postgres before journaling/submission. Partial fills release only the processed portion.
 - **Net-edge gate** — New BUY risk is disabled by default. When explicitly enabled after offline validation, each quote must clear execution-cost, adverse-selection and minimum-net-edge buffers; rewards do not qualify a losing quote.
-- **Crosses-the-Book Guard** — Clamp SELL to ≥ best_bid + tick and BUY to ≤ best_ask - tick so orders stay maker-only.
+- **Post-only quote guard** — Normal BUY/SELL quotes are submitted `post_only=True` and quantized using the venue's current tick. Only the bounded depth-aware exit path may be taker-capable.
 - **Reconciliation Timestamp Guard** — Watchdog skips overwriting local ledger with REST data when a local fill happened within the last N seconds (configurable), avoiding stale overwrites.
 - **Reward-independent execution** — Reward metadata is observable in the Dashboard, but never alters size, spread, stale-order retention or quote admission.
 - **No wallet-wide reset path** — The old v6.4 `cancel_all` + local `force_evict` implementation and its configuration knobs have been removed from runtime code.
@@ -159,7 +161,7 @@ PolyMatrix Engine implements the **official Polymarket market-maker (MM) workflo
 
 | Doc | What it describes | How we align |
 |-----|--------------------|--------------|
-| [Overview](https://docs.polymarket.com/cn/market-makers/overview) | MM = post limit orders, provide liquidity, use WebSocket + Gamma + CLOB | We use **Gamma API** for metadata, **CLOB REST** (py-clob-client) for orders; no DB in tick loop; cross-book guard so we stay maker-only. |
+| [Overview](https://docs.polymarket.com/cn/market-makers/overview) | MM = post limit orders, provide liquidity, use WebSocket + Gamma + CLOB | We use **Gamma API** for metadata and the pinned unified **polymarket-client** V2 adapter for CLOB execution; normal quotes are post-only. |
 | [Getting started](https://docs.polymarket.com/cn/market-makers/getting-started) | Top up USDC.e, deploy wallet, approve tokens, derive API creds from wallet | We use **ClobClient** with `create_or_derive_api_creds()` and POLY_PROXY (gasless). Top-up and approvals are done outside the app. |
 | [Liquidity rewards](https://docs.polymarket.com/cn/market-makers/liquidity-rewards) | Venue reward eligibility metadata | We read and display the fields for offline attribution only. Rewards never tune execution or qualify a quote. |
 | [Maker rebates](https://docs.polymarket.com/cn/market-makers/maker-rebates) | In fee-enabled markets (e.g. crypto), taker fees fund daily USDC rebates to makers whose orders get filled | We are makers by design (limit orders only). Rebates are paid by Polymarket; we do not compute them. |
@@ -186,7 +188,7 @@ We do not optimize or claim reward qualification. Profitability evidence exclude
 | `app/market_data/gateway.py` | Local orderbook from Market WS + REST; publishes snapshots to Redis `tick:{token}` / `ob:{token}`. |
 | `app/market_data/user_stream.py` | User WS adapter: writes deterministic fill events through the durable processor; publishes committed order status for engine cleanup. |
 | `app/quoting/engine.py` | QuotingEngine: tick/control/order status; committed memory snapshot; market-data, risk and net-edge gates; bounded exits and diff quoting. |
-| `app/oms/core.py` | OMS: py-clob-client, CircuitBreaker, validated place/cancel, stable local/exchange IDs and conservative unknown outcomes; no wallet-wide reset helper. |
+| `app/oms/core.py` | OMS: unified V2 adapter, new-order CircuitBreaker, priority cancellation, heartbeat, stable local/exchange IDs and conservative unknown outcomes. |
 | `app/risk/watchdog.py` | **~1s** cold/hot cost + reservation checks; periodic full-position comparison vs Data API; mismatch invalidates accounting; kill switch → halt + cancel + suspend. |
 | `app/core/alpha_evaluator.py` / `strategy_fingerprint.py` | Strict local evidence generator and canonical config/source fingerprint; neither accesses the exchange. |
 | `app/core/auto_router.py` | Optional paper-only reward-metadata research router; live startup is unconditionally rejected. |
@@ -283,16 +285,17 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `MIN_EXPECTED_NET_EDGE` | Minimum edge after configured cost/adverse-selection buffers | `0.02` |
 | `EXECUTION_COST_BUFFER` / `ADVERSE_SELECTION_BUFFER` | Conservative per-share deductions from quote edge | `0.002` / `0.01` |
 | `MARKET_DATA_MAX_AGE_SEC` | Cancel/pause when a book is older than this | `5.0` |
-| `MARKET_DATA_REQUIRE_SEQUENCE_LIVE` | Require exchange sequence metadata in live | `True` |
+| `MARKET_DATA_REQUIRE_SEQUENCE_LIVE` | Require sequence if the feed contract provides one | `False` for current documented feed |
 | `MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE` | Require exchange timestamp metadata in live | `True` |
+| `MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE` / `MARKET_DATA_REST_RESYNC_SEC` | Require exchange hash and periodically reseed the book | `True` / `30` |
+| `EXECUTION_LEASE_TTL_SEC` / `EXCHANGE_HEARTBEAT_INTERVAL_SEC` | Single-wallet writer lease / exchange cancel-on-disconnect heartbeat | `15` / `5` |
 | `AUTO_ROUTER_ENABLED` | Enable Auto-Router background portfolio manager | `False` |
 | `AUTO_ROUTER_MAX_MARKETS` | Max concurrent paper-research markets managed by the router | `8` |
 | `AUTO_ROUTER_SCAN_INTERVAL_SEC` | Time between Gamma API scans for rebalancing | `3600` |
 | `AUTO_ROUTER_MIN_HOLD_HOURS` | Min-hold before evicting dropped paper-research markets | `2.0` |
 | `AUTO_ROUTER_MIN_REWARD_POOL` | **V7.0** — skip Gamma markets whose daily reward pool (USD) is below this | `50.0` |
-| `POLY_BUILDER_API_KEY` | **V7.1** — official Builder API key for order attribution headers | `""` |
-| `POLY_BUILDER_SECRET` | **V7.1** — official Builder secret for HMAC attribution signing | `""` |
-| `POLY_BUILDER_PASSPHRASE` | **V7.1** — official Builder passphrase for attribution headers | `""` |
+| `POLY_BUILDER_CODE` | Unified SDK order-attribution code | `""` |
+| `POLY_BUILDER_API_KEY` / `SECRET` / `PASSPHRASE` | Removed legacy local signing fields; non-empty values block live | Must remain empty |
 | `EVENT_HORIZON_HOURS` | Markets resolving within this window (or already expired) are avoided/evicted | `72.0` |
 | `MAX_EXPOSURE_PER_SECTOR` | Max USD exposure allowed per tag/sector across active markets | `300.0` |
 | `MAX_SLOTS_PER_SECTOR` | Max active markets allowed per tag/sector | `2` |
@@ -302,7 +305,7 @@ Loaded from project root `.env` via `app/core/config.py`. Key variables:
 | `EXPOSURE_TOLERANCE` | Ledger vs API diff above which we overwrite | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | Seconds after last local fill to skip REST overwrite | `8.0` |
 | `RECONCILIATION_INTERVAL_SEC` | Watchdog periodic **Data API** positions comparison interval | `300` |
-| `BASE_ORDER_SIZE` | Order **size in outcome shares** (CLOB `size`, not USDC); min **5** shares | e.g. `10.0` |
+| `BASE_ORDER_SIZE` | Order **size in outcome shares**; runtime raises it to the market's current `min_order_size` | e.g. `10.0` |
 | `GRID_LEVELS` | Grid levels per side | `2` |
 | `QUOTE_BASE_SPREAD` | Spread around fair value | `0.02` |
 | `EXIT_MAX_BOOK_IMPACT` | Maximum visible-book price impact for automatic aggressive exits | `0.02` |

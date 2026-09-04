@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import uuid
@@ -30,6 +31,12 @@ logger = logging.getLogger(__name__)
 OPEN_EXCHANGE_STATUSES = {"LIVE", "OPEN", "ACTIVE", "PENDING"}
 CANCELED_EXCHANGE_STATUSES = {"CANCELED", "CANCELLED", "CANCELLATION", "EXPIRED"}
 FILLED_EXCHANGE_STATUSES = {"MATCHED", "FILLED"}
+UNSETTLED_TRADE_STATUSES = {
+    "MATCHED",
+    "MATCHED_NOT_BROADCASTED",
+    "MINED",
+    "RETRYING",
+}
 TOLERANCE = 1e-6
 
 
@@ -84,6 +91,7 @@ class ReconciliationAction:
     blocker: bool
     reason: str
     exchange_remaining_size: Optional[float] = None
+    sticky: bool = True
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,21 @@ class ReconciliationReport:
     @property
     def safe(self) -> bool:
         return not self.blockers
+
+    @property
+    def sticky_blockers(self) -> tuple[ReconciliationAction, ...]:
+        return tuple(action for action in self.blockers if action.sticky)
+
+
+@dataclass(frozen=True)
+class RecoveredFill:
+    exchange_order_id: str
+    token_id: str
+    price: float
+    size: float
+    liquidity_role: str
+    fee_rate_bps: Optional[float]
+    raw: Dict[str, Any]
 
 
 def _first(payload: Dict[str, Any], *keys: str) -> Any:
@@ -114,6 +137,13 @@ def normalize_exchange_order(payload: Dict[str, Any]) -> ExchangeOrderFact:
     token_id = str(_first(payload, "asset_id", "token_id") or "").strip()
     side = str(payload.get("side") or "").strip().upper()
     status = str(payload.get("status") or "").strip().upper()
+    if status.startswith("ORDER_STATUS_"):
+        status = status[len("ORDER_STATUS_") :]
+    size_encoding = str(payload.get("_size_encoding") or "").strip().lower()
+    if size_encoding not in {"human", "e6"}:
+        raise ExchangeOrderParseError(
+            "exchange order must declare _size_encoding as human or e6"
+        )
     try:
         price = float(payload.get("price"))
         original_size = float(_first(payload, "original_size", "size"))
@@ -122,6 +152,9 @@ def normalize_exchange_order(payload: Dict[str, Any]) -> ExchangeOrderFact:
         )
     except (TypeError, ValueError) as exc:
         raise ExchangeOrderParseError("exchange price/size fields are invalid") from exc
+    if size_encoding == "e6":
+        original_size /= 1_000_000.0
+        matched_size /= 1_000_000.0
     if not exchange_order_id or not market_id or not token_id:
         raise ExchangeOrderParseError("exchange order identity is incomplete")
     if side not in {"BUY", "SELL"} or not status:
@@ -146,6 +179,134 @@ def normalize_exchange_order(payload: Dict[str, Any]) -> ExchangeOrderFact:
         status=status,
         raw=dict(payload),
     )
+
+
+def extract_fills_for_order(
+    trades: Iterable[Dict[str, Any]], exchange_order_id: str
+) -> list[RecoveredFill]:
+    """Extract role-specific human-unit fills from authenticated account trades."""
+    target = str(exchange_order_id)
+    output: list[RecoveredFill] = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            raise ExchangeOrderParseError("account trade must be an object")
+        status = str(trade.get("status") or "").upper()
+        if status.startswith("TRADE_STATUS_"):
+            status = status[len("TRADE_STATUS_") :]
+        # Settlement can permanently fail before CONFIRMED. Only the terminal
+        # success state is an authoritative cash/inventory mutation.
+        if status != "CONFIRMED":
+            continue
+        encoding = str(trade.get("_size_encoding") or "").lower()
+        if encoding not in {"human", "e6"}:
+            raise ExchangeOrderParseError("account trade has no trusted size encoding")
+        divisor = 1_000_000.0 if encoding == "e6" else 1.0
+
+        if str(trade.get("taker_order_id") or "") == target:
+            try:
+                size = float(trade.get("size")) / divisor
+                price = float(trade.get("price"))
+                fee_rate = float(trade.get("fee_rate_bps"))
+            except (TypeError, ValueError) as exc:
+                raise ExchangeOrderParseError("taker trade values are invalid") from exc
+            output.append(
+                RecoveredFill(
+                    exchange_order_id=target,
+                    token_id=str(trade.get("asset_id") or trade.get("token_id") or ""),
+                    price=price,
+                    size=size,
+                    liquidity_role="TAKER",
+                    fee_rate_bps=fee_rate,
+                    raw=dict(trade),
+                )
+            )
+
+        maker_orders = trade.get("maker_orders") or []
+        if not isinstance(maker_orders, list):
+            raise ExchangeOrderParseError("maker_orders must be a list")
+        for maker in maker_orders:
+            if not isinstance(maker, dict) or str(maker.get("order_id") or "") != target:
+                continue
+            try:
+                size = float(maker.get("matched_amount")) / divisor
+                price = float(maker.get("price"))
+                fee_rate_raw = maker.get("fee_rate_bps")
+                fee_rate = (
+                    float(fee_rate_raw) if fee_rate_raw not in (None, "") else None
+                )
+            except (TypeError, ValueError) as exc:
+                raise ExchangeOrderParseError("maker trade values are invalid") from exc
+            output.append(
+                RecoveredFill(
+                    exchange_order_id=target,
+                    token_id=str(maker.get("asset_id") or maker.get("token_id") or ""),
+                    price=price,
+                    size=size,
+                    liquidity_role="MAKER",
+                    fee_rate_bps=fee_rate,
+                    raw=dict(trade),
+                )
+            )
+
+    for fill in output:
+        if (
+            not fill.token_id
+            or not math.isfinite(fill.price)
+            or not math.isfinite(fill.size)
+            or not 0 < fill.price < 1
+            or fill.size <= 0
+        ):
+            raise ExchangeOrderParseError("recovered trade fill is outside safe bounds")
+    return output
+
+
+def extract_unsettled_size_for_order(
+    trades: Iterable[Dict[str, Any]], exchange_order_id: str
+) -> float:
+    """Return this order's matched shares that have not reached a terminal state.
+
+    The CLOB can expose matched size before settlement is CONFIRMED.  Those shares
+    must block new risk temporarily, but must not mutate cash/inventory or create a
+    sticky incident because settlement can still become CONFIRMED or FAILED.
+    """
+    target = str(exchange_order_id)
+    total = 0.0
+    for trade in trades:
+        if not isinstance(trade, dict):
+            raise ExchangeOrderParseError("account trade must be an object")
+        status = str(trade.get("status") or "").upper()
+        if status.startswith("TRADE_STATUS_"):
+            status = status[len("TRADE_STATUS_") :]
+        if status not in UNSETTLED_TRADE_STATUSES:
+            continue
+        encoding = str(trade.get("_size_encoding") or "").lower()
+        if encoding not in {"human", "e6"}:
+            raise ExchangeOrderParseError("account trade has no trusted size encoding")
+        divisor = 1_000_000.0 if encoding == "e6" else 1.0
+        matched = 0.0
+        if str(trade.get("taker_order_id") or "") == target:
+            try:
+                matched += float(trade.get("size")) / divisor
+            except (TypeError, ValueError) as exc:
+                raise ExchangeOrderParseError("unsettled taker size is invalid") from exc
+        maker_orders = trade.get("maker_orders") or []
+        if not isinstance(maker_orders, list):
+            raise ExchangeOrderParseError("maker_orders must be a list")
+        for maker in maker_orders:
+            if not isinstance(maker, dict):
+                raise ExchangeOrderParseError("maker order must be an object")
+            if str(maker.get("order_id") or "") != target:
+                continue
+            try:
+                matched += float(maker.get("matched_amount")) / divisor
+            except (TypeError, ValueError) as exc:
+                raise ExchangeOrderParseError("unsettled maker size is invalid") from exc
+        if not math.isfinite(matched) or matched < 0:
+            raise ExchangeOrderParseError("unsettled matched size is outside safe bounds")
+        total += matched
+    if not math.isfinite(total):
+        raise ExchangeOrderParseError("unsettled matched size is outside safe bounds")
+    return total
 
 
 def _identity_conflict(local: LocalOrderFact, exchange: ExchangeOrderFact) -> Optional[str]:
@@ -188,6 +349,7 @@ def reconcile_order_facts(
     local_orders: Iterable[LocalOrderFact],
     exchange_open_orders: Iterable[ExchangeOrderFact],
     exchange_details: Dict[str, ExchangeOrderFact],
+    unsettled_sizes: Optional[Dict[str, float]] = None,
 ) -> ReconciliationReport:
     locals_list = list(local_orders)
     open_by_id = {order.exchange_order_id: order for order in exchange_open_orders}
@@ -195,6 +357,7 @@ def reconcile_order_facts(
         order.exchange_order_id for order in locals_list if order.exchange_order_id
     }
     actions = []
+    pending_by_id = unsettled_sizes or {}
 
     for local in locals_list:
         if not local.exchange_order_id:
@@ -236,6 +399,23 @@ def reconcile_order_facts(
             continue
         fill_delta = exchange.matched_size - local.locally_filled_size
         if fill_delta > TOLERANCE:
+            unsettled_size = float(pending_by_id.get(exchange.exchange_order_id, 0.0))
+            if unsettled_size + TOLERANCE >= fill_delta:
+                actions.append(
+                    ReconciliationAction(
+                        local.local_order_id,
+                        exchange.exchange_order_id,
+                        "SETTLEMENT_PENDING",
+                        True,
+                        (
+                            f"{fill_delta:.8f} matched shares await terminal "
+                            "CONFIRMED/FAILED settlement"
+                        ),
+                        exchange.remaining_size,
+                        False,
+                    )
+                )
+                continue
             actions.append(
                 ReconciliationAction(
                     local.local_order_id,
@@ -356,6 +536,16 @@ def reconcile_order_facts(
     return ReconciliationReport(tuple(actions))
 
 
+async def _call_exchange_method(method, *args, **kwargs):
+    """Await async adapters while keeping synchronous offline test doubles usable."""
+    if inspect.iscoroutinefunction(method):
+        return await method(*args, **kwargs)
+    result = await asyncio.to_thread(method, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 class OrderReconciliationService:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -436,9 +626,17 @@ class OrderReconciliationService:
         return facts
 
     async def _fetch_exchange_facts(self, client, local_facts):
-        raw_open = await asyncio.to_thread(client.get_orders)
+        raw_open = await _call_exchange_method(client.get_orders)
+        if isinstance(raw_open, dict):
+            page = raw_open
+            raw_open = page.get("data")
+            cursor = page.get("next_cursor")
+            if cursor not in (None, "", "END", "LTE=", "-1"):
+                raise ExchangeOrderParseError(
+                    "raw paginated get_orders response was not fully drained"
+                )
         if not isinstance(raw_open, list):
-            raise ExchangeOrderParseError("get_orders did not return a list")
+            raise ExchangeOrderParseError("get_orders did not return a list/page")
         open_facts = [normalize_exchange_order(item) for item in raw_open]
         open_ids = {item.exchange_order_id for item in open_facts}
         details: Dict[str, ExchangeOrderFact] = {}
@@ -447,13 +645,71 @@ class OrderReconciliationService:
             exchange_id = local.exchange_order_id
             if not exchange_id or exchange_id in open_ids or exchange_id in details:
                 continue
-            raw = await asyncio.to_thread(client.get_order, exchange_id)
+            raw = await _call_exchange_method(client.get_order, exchange_id)
             fact = normalize_exchange_order(raw)
             if fact.exchange_order_id != exchange_id:
                 raise ExchangeOrderParseError("get_order returned a different order id")
             details[exchange_id] = fact
             raw_details[exchange_id] = dict(raw)
         return open_facts, details, raw_open, raw_details
+
+    async def _recover_exchange_fills(
+        self, client, local_facts
+    ) -> Dict[str, float]:
+        if not local_facts:
+            return {}
+        get_trades = getattr(client, "get_trades", None)
+        if not callable(get_trades):
+            raise ExchangeOrderParseError(
+                "authenticated adapter cannot enumerate paginated account trades"
+            )
+        from app.oms.fill_processor import derive_fill_event_id, fill_processor
+
+        unsettled_sizes: Dict[str, float] = {}
+        by_market: Dict[str, list[LocalOrderFact]] = {}
+        for local in local_facts:
+            if local.exchange_order_id:
+                by_market.setdefault(local.market_id, []).append(local)
+
+        for market_id, market_orders in by_market.items():
+            # The authenticated CLOB API filters by trade id, token or market;
+            # it has no order-id filter. Fully drain once per condition, then
+            # select role-specific order references locally.
+            raw_trades = await _call_exchange_method(get_trades, market=market_id)
+            if isinstance(raw_trades, dict):
+                page = raw_trades
+                raw_trades = page.get("data")
+                if page.get("next_cursor") not in (None, "", "END", "LTE=", "-1"):
+                    raise ExchangeOrderParseError(
+                        "raw paginated account trades were not fully drained"
+                    )
+            if not isinstance(raw_trades, list):
+                raise ExchangeOrderParseError("get_trades did not return a list/page")
+            for local in market_orders:
+                exchange_id = str(local.exchange_order_id)
+                unsettled_sizes[exchange_id] = extract_unsettled_size_for_order(
+                    raw_trades, exchange_id
+                )
+                for fill in extract_fills_for_order(raw_trades, exchange_id):
+                    event_id = derive_fill_event_id(
+                        fill.raw, fill.exchange_order_id, fill.liquidity_role.lower()
+                    )
+                    result = await fill_processor.record_and_process(
+                        event_id=event_id,
+                        exchange_order_id=fill.exchange_order_id,
+                        filled_size=fill.size,
+                        fill_price=fill.price,
+                        raw_event=fill.raw,
+                        token_id=fill.token_id,
+                        liquidity_role=fill.liquidity_role,
+                        fee_rate_bps=fill.fee_rate_bps,
+                    )
+                    if result.status not in {"PROCESSED"}:
+                        raise ExchangeOrderParseError(
+                            "authenticated trade recovery failed with "
+                            f"status={result.status}"
+                        )
+        return unsettled_sizes
 
     async def _persist_and_apply(
         self,
@@ -528,10 +784,14 @@ class OrderReconciliationService:
                         RiskReservation, order.reservation_id, with_for_update=True
                     )
 
-                if action.blocker:
+                if action.blocker and action.sticky:
                     order.status = OrderStatus.UNKNOWN
                     if reservation and reservation.status in ACTIVE_RESERVATION_STATUSES:
                         reservation.status = "UNKNOWN"
+                    continue
+                if action.blocker:
+                    # Expected in-flight settlement freezes readiness but preserves the
+                    # order/reservation facts until a terminal trade state is observed.
                     continue
                 exchange = exchange_by_id[action.exchange_order_id]
                 if action.kind == "OPEN_CONFIRMED":
@@ -578,13 +838,17 @@ class OrderReconciliationService:
         run_id = uuid.uuid4().hex
         try:
             local_facts = await self._load_local_facts()
+            unsettled_sizes = await self._recover_exchange_fills(client, local_facts)
+            local_facts = await self._load_local_facts()
             (
                 open_facts,
                 details,
                 raw_open,
                 raw_details,
             ) = await self._fetch_exchange_facts(client, local_facts)
-            report = reconcile_order_facts(local_facts, open_facts, details)
+            report = reconcile_order_facts(
+                local_facts, open_facts, details, unsettled_sizes
+            )
             await self._persist_and_apply(
                 run_id,
                 local_facts,
@@ -609,14 +873,22 @@ class OrderReconciliationService:
                 True,
                 f"authoritative pass {run_id[:12]} found no conflicts",
             )
+            # The same authenticated REST credentials back the user WebSocket.
+            # A successful REST pass plus the live SDK subscription is the strongest
+            # acknowledgement available in the documented user-stream contract.
+            from app.market_data.user_stream import user_stream
+
+            user_stream.confirm_authenticated_rest()
         else:
             detail = "; ".join(
                 f"{item.kind}:{item.reason}" for item in report.blockers[:3]
             )
             trading_safety.set_readiness("open_orders_reconciled", False, detail)
-            trading_safety.halt(
-                f"order reconciliation found {len(report.blockers)} blocker(s)"
-            )
+            if report.sticky_blockers:
+                trading_safety.halt(
+                    "order reconciliation found "
+                    f"{len(report.sticky_blockers)} persistent blocker(s)"
+                )
         return report
 
     async def reconcile(self, client) -> ReconciliationReport:

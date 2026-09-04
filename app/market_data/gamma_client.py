@@ -20,6 +20,9 @@ class GammaMarketInfo:
     tags: List[str] = field(default_factory=list)  # Sector/category tags
     category: Optional[str] = None
     liquidity: float = 0.0                   # For volatility penalty scoring
+    minimum_order_size: Optional[float] = None
+    minimum_tick_size: Optional[float] = None
+    neg_risk: Optional[bool] = None
 
 
 class GammaAPIClient:
@@ -123,6 +126,23 @@ class GammaAPIClient:
                         except (ValueError, TypeError):
                             pass
 
+                minimum_order_size = None
+                minimum_tick_size = None
+                try:
+                    raw_minimum = market_data.get("orderMinSize")
+                    if raw_minimum not in (None, ""):
+                        minimum_order_size = float(raw_minimum)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    raw_tick = market_data.get("orderPriceMinTickSize")
+                    if raw_tick not in (None, ""):
+                        minimum_tick_size = float(raw_tick)
+                except (TypeError, ValueError):
+                    pass
+                raw_neg_risk = market_data.get("negRisk")
+                neg_risk = raw_neg_risk if isinstance(raw_neg_risk, bool) else None
+
                 return GammaMarketInfo(
                     yes_token_id=tokens[0],
                     no_token_id=tokens[1],
@@ -134,6 +154,9 @@ class GammaAPIClient:
                     tags=tags_list,
                     category=category,
                     liquidity=liquidity,
+                    minimum_order_size=minimum_order_size,
+                    minimum_tick_size=minimum_tick_size,
+                    neg_risk=neg_risk,
                 )
 
             except httpx.HTTPStatusError as e:

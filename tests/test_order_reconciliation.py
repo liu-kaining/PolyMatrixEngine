@@ -4,6 +4,8 @@ import unittest
 from app.oms.order_reconciliation import (
     ExchangeOrderParseError,
     LocalOrderFact,
+    extract_fills_for_order,
+    extract_unsettled_size_for_order,
     normalize_exchange_order,
     OrderReconciliationService,
     reconcile_order_facts,
@@ -20,6 +22,7 @@ def exchange_payload(**overrides):
         "original_size": "10",
         "size_matched": "2",
         "status": "LIVE",
+        "_size_encoding": "human",
     }
     payload.update(overrides)
     return payload
@@ -73,6 +76,34 @@ class OrderReconciliationTests(unittest.TestCase):
         report = reconcile_order_facts([local_fact()], [exchange], {})
         self.assertFalse(report.safe)
         self.assertEqual(report.actions[0].kind, "MISSING_FILLS")
+
+    def test_unsettled_fill_temporarily_blocks_without_sticky_incident(self):
+        exchange = normalize_exchange_order(exchange_payload(size_matched="3"))
+        report = reconcile_order_facts(
+            [local_fact()], [exchange], {}, unsettled_sizes={"ex-1": 1.0}
+        )
+        self.assertFalse(report.safe)
+        self.assertEqual(report.actions[0].kind, "SETTLEMENT_PENDING")
+        self.assertFalse(report.actions[0].sticky)
+        self.assertEqual(report.sticky_blockers, ())
+
+    def test_only_confirmed_trade_becomes_recovered_fill(self):
+        trade = {
+            "id": "trade-1",
+            "status": "MINED",
+            "taker_order_id": "ex-1",
+            "asset_id": "token-1",
+            "size": "1.25",
+            "price": "0.4",
+            "fee_rate_bps": "700",
+            "maker_orders": [],
+            "_size_encoding": "human",
+        }
+        self.assertEqual(extract_fills_for_order([trade], "ex-1"), [])
+        self.assertEqual(extract_unsettled_size_for_order([trade], "ex-1"), 1.25)
+        trade["status"] = "CONFIRMED"
+        self.assertEqual(len(extract_fills_for_order([trade], "ex-1")), 1)
+        self.assertEqual(extract_unsettled_size_for_order([trade], "ex-1"), 0.0)
 
     def test_external_open_order_and_identity_conflict_block(self):
         external = normalize_exchange_order(exchange_payload(id="orphan"))
@@ -146,7 +177,7 @@ class FakeExchangeAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_fake_exchange_response_fails_closed(self):
         class FakeClient:
             def get_orders(self):
-                return {"data": []}
+                return {"data": [], "next_cursor": "more-pages-remain"}
 
         with self.assertRaises(ExchangeOrderParseError):
             await OrderReconciliationService()._fetch_exchange_facts(FakeClient(), [])

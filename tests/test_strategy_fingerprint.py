@@ -17,6 +17,16 @@ def settings_fixture(**overrides):
         "QUOTE_BASE_SPREAD": 0.02,
         "QUOTE_PRICE_OFFSET_THRESHOLD": 0.01,
         "QUOTE_BID_ONE_TICK_BELOW_TOUCH": True,
+        "ALPHA_BOOK_DEPTH_LEVELS": 3,
+        "ALPHA_BOOK_DEPTH_DECAY": 0.65,
+        "ALPHA_MAX_BINARY_PARITY_ERROR": 0.03,
+        "ALPHA_MAX_PAIR_SKEW_SEC": 2.0,
+        "ALPHA_MAX_INVENTORY_SKEW": 0.02,
+        "ALPHA_VOLATILITY_EWMA_ALPHA": 0.20,
+        "ALPHA_MAX_TICK_MOVE": 0.05,
+        "ALPHA_MAX_EWMA_ABS_MOVE": 0.02,
+        "ALPHA_VOLATILITY_COOLDOWN_SEC": 5.0,
+        "ALPHA_VOLATILITY_SPREAD_MULTIPLIER": 2.0,
         "MIN_EXPECTED_NET_EDGE": 0.02,
         "EXECUTION_COST_BUFFER": 0.002,
         "ADVERSE_SELECTION_BUFFER": 0.01,
@@ -28,6 +38,8 @@ def settings_fixture(**overrides):
         "MARKET_DATA_MAX_FUTURE_SKEW_SEC": 2.0,
         "MARKET_DATA_REQUIRE_SEQUENCE_LIVE": True,
         "MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE": True,
+        "MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE": True,
+        "MARKET_DATA_REST_RESYNC_SEC": 30.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

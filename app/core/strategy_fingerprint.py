@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, List, Mapping
 
 
-STRATEGY_CONFIG_SCHEMA_VERSION = "alpha-runtime-config-v1"
+STRATEGY_CONFIG_SCHEMA_VERSION = "alpha-runtime-config-v3"
 CRITICAL_SOURCE_FILES = (
     "app/main.py",
     "app/quoting/engine.py",
@@ -20,6 +20,7 @@ CRITICAL_SOURCE_FILES = (
     "app/core/config.py",
     "app/core/inventory_state.py",
     "app/core/market_lifecycle.py",
+    "app/core/pricing_model.py",
     "app/core/position_reconciliation.py",
     "app/core/quote_economics.py",
     "app/core/exit_policy.py",
@@ -27,10 +28,14 @@ CRITICAL_SOURCE_FILES = (
     "app/core/trading_safety.py",
     "app/core/alpha_evidence.py",
     "app/core/alpha_evaluator.py",
+    "app/core/execution_lease.py",
+    "app/core/geographic_eligibility.py",
+    "app/core/safety_state.py",
     "app/oms/core.py",
     "app/oms/fill_processor.py",
     "app/oms/order_reconciliation.py",
     "app/oms/validation.py",
+    "app/oms/polymarket_v2.py",
     "app/risk/reservations.py",
     "app/risk/watchdog.py",
     "app/market_data/gateway.py",
@@ -54,7 +59,7 @@ def build_runtime_strategy_config(settings_obj: Any) -> dict[str, Any]:
     config = {
         "schema_version": STRATEGY_CONFIG_SCHEMA_VERSION,
         "strategy_id": str(getattr(settings_obj, "ALPHA_STRATEGY_ID", "") or ""),
-        "model": "binary_obi_mid_v1",
+        "model": "binary_cross_book_microprice_v2",
         "parameters": {
             "base_order_size": float(settings_obj.BASE_ORDER_SIZE),
             "grid_levels": int(settings_obj.GRID_LEVELS),
@@ -64,6 +69,24 @@ def build_runtime_strategy_config(settings_obj: Any) -> dict[str, Any]:
             ),
             "quote_bid_one_tick_below_touch": bool(
                 settings_obj.QUOTE_BID_ONE_TICK_BELOW_TOUCH
+            ),
+            "alpha_book_depth_levels": int(settings_obj.ALPHA_BOOK_DEPTH_LEVELS),
+            "alpha_book_depth_decay": float(settings_obj.ALPHA_BOOK_DEPTH_DECAY),
+            "alpha_max_binary_parity_error": float(
+                settings_obj.ALPHA_MAX_BINARY_PARITY_ERROR
+            ),
+            "alpha_max_pair_skew_sec": float(settings_obj.ALPHA_MAX_PAIR_SKEW_SEC),
+            "alpha_max_inventory_skew": float(settings_obj.ALPHA_MAX_INVENTORY_SKEW),
+            "alpha_volatility_ewma_alpha": float(
+                settings_obj.ALPHA_VOLATILITY_EWMA_ALPHA
+            ),
+            "alpha_max_tick_move": float(settings_obj.ALPHA_MAX_TICK_MOVE),
+            "alpha_max_ewma_abs_move": float(settings_obj.ALPHA_MAX_EWMA_ABS_MOVE),
+            "alpha_volatility_cooldown_sec": float(
+                settings_obj.ALPHA_VOLATILITY_COOLDOWN_SEC
+            ),
+            "alpha_volatility_spread_multiplier": float(
+                settings_obj.ALPHA_VOLATILITY_SPREAD_MULTIPLIER
             ),
             "minimum_expected_net_edge": float(settings_obj.MIN_EXPECTED_NET_EDGE),
             "execution_cost_buffer": float(settings_obj.EXECUTION_COST_BUFFER),
@@ -83,6 +106,12 @@ def build_runtime_strategy_config(settings_obj: Any) -> dict[str, Any]:
             ),
             "market_data_require_exchange_timestamp_live": bool(
                 settings_obj.MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE
+            ),
+            "market_data_require_snapshot_id_live": bool(
+                settings_obj.MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE
+            ),
+            "market_data_rest_resync_sec": float(
+                settings_obj.MARKET_DATA_REST_RESYNC_SEC
             ),
         },
     }
@@ -131,6 +160,9 @@ def runtime_strategy_config_errors(settings_obj: Any) -> List[str]:
     grid_levels = int(parameters["grid_levels"])
     if grid_levels < 1 or grid_levels > 20:
         errors.append("grid_levels must be in [1, 20]")
+    alpha_depth = int(parameters["alpha_book_depth_levels"])
+    if alpha_depth < 1 or alpha_depth > 20:
+        errors.append("alpha_book_depth_levels must be in [1, 20]")
     require_range(
         "quote_base_spread",
         minimum=0.0,
@@ -143,6 +175,48 @@ def runtime_strategy_config_errors(settings_obj: Any) -> List[str]:
         minimum=0.0,
         maximum=1.0,
         include_minimum=False,
+    )
+    require_range(
+        "alpha_book_depth_decay",
+        minimum=0.0,
+        maximum=1.0,
+        include_minimum=False,
+    )
+    require_range(
+        "alpha_max_binary_parity_error",
+        minimum=0.0,
+        maximum=0.25,
+    )
+    require_range(
+        "alpha_max_pair_skew_sec",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    require_range(
+        "alpha_max_inventory_skew",
+        minimum=0.0,
+        maximum=0.25,
+    )
+    require_range(
+        "alpha_volatility_ewma_alpha",
+        minimum=0.0,
+        maximum=1.0,
+        include_minimum=False,
+    )
+    require_range(
+        "alpha_max_tick_move", minimum=0.0, maximum=0.5, include_minimum=False
+    )
+    require_range(
+        "alpha_max_ewma_abs_move",
+        minimum=0.0,
+        maximum=0.5,
+        include_minimum=False,
+    )
+    require_range(
+        "alpha_volatility_cooldown_sec", minimum=0.0, maximum=300.0
+    )
+    require_range(
+        "alpha_volatility_spread_multiplier", minimum=0.0, maximum=20.0
     )
     require_range(
         "minimum_expected_net_edge",
@@ -196,10 +270,19 @@ def runtime_strategy_config_errors(settings_obj: Any) -> List[str]:
         minimum=0.0,
         maximum=60.0,
     )
-    if not parameters["market_data_require_sequence_live"]:
-        errors.append("market_data_require_sequence_live must be true")
     if not parameters["market_data_require_exchange_timestamp_live"]:
         errors.append("market_data_require_exchange_timestamp_live must be true")
+    require_sequence = parameters["market_data_require_sequence_live"]
+    require_snapshot = parameters["market_data_require_snapshot_id_live"]
+    if not require_sequence and not require_snapshot:
+        errors.append(
+            "market data must require either an exchange sequence or snapshot hash"
+        )
+    require_range(
+        "market_data_rest_resync_sec",
+        minimum=5.0,
+        maximum=300.0,
+    )
     return errors
 
 

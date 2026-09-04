@@ -1,6 +1,7 @@
 from sqlalchemy import (
     JSON,
     CheckConstraint,
+    Boolean,
     Column,
     DateTime,
     Enum,
@@ -39,6 +40,9 @@ class MarketMeta(Base):
     rewards_min_size = Column(Numeric(20, 4), nullable=True)
     rewards_max_spread = Column(Numeric(10, 4), nullable=True)
     reward_rate_per_day = Column(Numeric(20, 4), nullable=True)
+    minimum_order_size = Column(Numeric(24, 8), nullable=True)
+    tick_size = Column(Numeric(10, 8), nullable=True)
+    neg_risk = Column(Boolean, nullable=True)
 
     # Relationships
     orders = relationship("OrderJournal", back_populates="market")
@@ -54,7 +58,7 @@ class OrderJournal(Base):
     market_id = Column(String, ForeignKey("markets_meta.condition_id"), index=True)
     side = Column(Enum(OrderSide))
     price = Column(Numeric(10, 4))
-    size = Column(Numeric(20, 4))
+    size = Column(Numeric(24, 8))
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     payload = Column(JSON)  # Store original JSON from SDK
     
@@ -69,6 +73,16 @@ class FillEvent(Base):
     """Durable, idempotent user-stream fill inbox and processing record."""
 
     __tablename__ = "fill_events"
+    __table_args__ = (
+        CheckConstraint(
+            "liquidity_role IS NULL OR liquidity_role IN ('MAKER', 'TAKER')",
+            name="ck_fill_event_liquidity_role",
+        ),
+        CheckConstraint(
+            "fee_rate_bps IS NULL OR (fee_rate_bps >= 0 AND fee_rate_bps <= 10000)",
+            name="ck_fill_event_fee_rate_bounds",
+        ),
+    )
 
     event_id = Column(String, primary_key=True)
     exchange_order_id = Column(String, index=True, nullable=False)
@@ -77,7 +91,9 @@ class FillEvent(Base):
     token_id = Column(String, nullable=True)
     side = Column(String, nullable=True)
     price = Column(Numeric(10, 4), nullable=False)
-    size = Column(Numeric(20, 4), nullable=False)
+    size = Column(Numeric(24, 8), nullable=False)
+    liquidity_role = Column(String, nullable=True)
+    fee_rate_bps = Column(Numeric(20, 8), nullable=True)
     status = Column(String, nullable=False, default="RECEIVED")
     processing_error = Column(String, nullable=True)
     # Inventory state version produced by this exact fill transaction. It makes
@@ -116,11 +132,11 @@ class InventoryLedger(Base):
     __tablename__ = "inventory_ledger"
 
     market_id = Column(String, ForeignKey("markets_meta.condition_id"), primary_key=True)
-    yes_exposure = Column(Numeric(20, 4), default=0)
-    no_exposure = Column(Numeric(20, 4), default=0)
-    yes_capital_used = Column(Numeric(20, 4), default=0)  # USDC spent on YES (cost basis)
-    no_capital_used = Column(Numeric(20, 4), default=0)   # USDC spent on NO (cost basis)
-    realized_pnl = Column(Numeric(20, 4), default=0)
+    yes_exposure = Column(Numeric(24, 8), default=0)
+    no_exposure = Column(Numeric(24, 8), default=0)
+    yes_capital_used = Column(Numeric(24, 8), default=0)  # USDC spent on YES (cost basis)
+    no_capital_used = Column(Numeric(24, 8), default=0)   # USDC spent on NO (cost basis)
+    realized_pnl = Column(Numeric(24, 8), default=0)
     # v1 stored net trade cash flow here; verified v2 uses fee-aware average-cost net PnL.
     accounting_version = Column(String, nullable=False, default="v2")
     state_version = Column(Integer, nullable=False, default=0)
@@ -184,9 +200,9 @@ class RiskReservation(Base):
     token_id = Column(String, nullable=False)
     side = Column(String, nullable=False)
     limit_price = Column(Numeric(10, 4), nullable=False)
-    original_size = Column(Numeric(20, 4), nullable=False)
-    remaining_size = Column(Numeric(20, 4), nullable=False)
-    reserved_notional = Column(Numeric(20, 4), nullable=False)
+    original_size = Column(Numeric(24, 8), nullable=False)
+    remaining_size = Column(Numeric(24, 8), nullable=False)
+    reserved_notional = Column(Numeric(24, 8), nullable=False)
     status = Column(String, nullable=False, default="RESERVED")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -242,3 +258,43 @@ class AccountingAuditRun(Base):
     summary = Column(JSON, nullable=False, default=dict)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class TradingControlState(Base):
+    """Persistent singleton for sticky halts that survive process restarts."""
+
+    __tablename__ = "trading_control_state"
+
+    control_id = Column(String, primary_key=True, default="global")
+    halted = Column(Boolean, nullable=False, default=False)
+    reason = Column(String, nullable=True)
+    incident_id = Column(String, nullable=True)
+    state_version = Column(Integer, nullable=False, default=0)
+    halted_at = Column(DateTime(timezone=True), nullable=True)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ExecutionLease(Base):
+    """Wallet-scoped database lease preventing two live order executors."""
+
+    __tablename__ = "execution_leases"
+    __table_args__ = (
+        CheckConstraint("fencing_token > 0", name="ck_execution_lease_fence_positive"),
+    )
+
+    wallet_id = Column(String, primary_key=True)
+    owner_id = Column(String, nullable=False)
+    fencing_token = Column(Integer, nullable=False, default=1)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

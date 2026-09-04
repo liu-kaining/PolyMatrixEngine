@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.future import select
 
 from app.core.accounting import AccountingInvariantError, apply_fill_accounting
-from app.core.cash_accounting import build_fill_cash_fact, extract_explicit_fee_amount
+from app.core.cash_accounting import build_fill_cash_fact, resolve_fee_amount
 from app.core.inventory_state import inventory_state
 from app.core.redis import redis_client
 from app.core.trading_safety import trading_safety
@@ -75,8 +76,25 @@ class FillProcessor:
         fill_price: float,
         raw_event: Dict[str, Any],
         token_id: Optional[str] = None,
+        liquidity_role: Optional[str] = None,
+        fee_rate_bps: Optional[Any] = None,
     ) -> FillProcessingResult:
         """Persist the inbox event first, then process it exactly once."""
+        normalized_role = str(liquidity_role or "").strip().upper() or None
+        if normalized_role not in {None, "MAKER", "TAKER"}:
+            raise AccountingInvariantError("fill liquidity role must be MAKER or TAKER")
+        normalized_fee_rate = None
+        if fee_rate_bps not in (None, ""):
+            try:
+                normalized_fee_rate = float(fee_rate_bps)
+            except (TypeError, ValueError) as exc:
+                raise AccountingInvariantError("fee_rate_bps must be numeric") from exc
+            if (
+                not math.isfinite(normalized_fee_rate)
+                or normalized_fee_rate < 0
+                or normalized_fee_rate > 10_000
+            ):
+                raise AccountingInvariantError("fee_rate_bps must be within [0, 10000]")
         async with AsyncSessionLocal() as session:
             existing = await session.get(FillEvent, event_id)
             if existing is None:
@@ -87,6 +105,8 @@ class FillProcessor:
                         token_id=str(token_id) if token_id else None,
                         price=float(fill_price),
                         size=float(filled_size),
+                        liquidity_role=normalized_role,
+                        fee_rate_bps=normalized_fee_rate,
                         status="RECEIVED",
                         payload=dict(raw_event),
                     )
@@ -177,7 +197,13 @@ class FillProcessor:
 
                 current_filled = float(payload.get("filled_size", 0.0) or 0.0)
                 fill_size = float(event.size)
-                fee_amount = extract_explicit_fee_amount(event.payload or {})
+                fee_amount = resolve_fee_amount(
+                    event.payload or {},
+                    event.liquidity_role,
+                    price=event.price,
+                    size=event.size,
+                    fee_rate_bps=event.fee_rate_bps,
+                )
                 cash_fact = build_fill_cash_fact(
                     side=order.side.value,
                     price=float(event.price),

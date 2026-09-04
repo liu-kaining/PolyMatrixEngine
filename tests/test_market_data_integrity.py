@@ -54,6 +54,7 @@ class MarketDataIntegrityTests(unittest.TestCase):
             "received_at": 100.0,
             "exchange_timestamp": 99.9,
             "sequence": 5,
+            "snapshot_id": "hash-1",
             "bids": [{"price": 0.4, "size": 1}],
             "asks": [{"price": 0.6, "size": 1}],
         }
@@ -85,6 +86,82 @@ class MarketDataIntegrityTests(unittest.TestCase):
                 require_exchange_timestamp=True,
             ).healthy
         )
+        without_hash = {**base, "snapshot_id": None}
+        self.assertFalse(
+            assess_snapshot(
+                without_hash,
+                now=101,
+                max_age_seconds=2,
+                require_sequence=False,
+                require_exchange_timestamp=True,
+                require_snapshot_id=True,
+            ).healthy
+        )
+
+    def test_tick_size_change_updates_constraints(self):
+        book = LocalOrderbook()
+        book.seed(
+            "token",
+            [{"price": 0.4, "size": 10}],
+            [{"price": 0.6, "size": 10}],
+            raw_metadata={
+                "hash": "h1",
+                "tick_size": "0.01",
+                "min_order_size": "5",
+                "neg_risk": False,
+            },
+        )
+        original_received_at = book.snapshot("token")["received_at"]
+        result = book.apply_event(
+            {
+                "event_type": "tick_size_change",
+                "asset_id": "token",
+                "new_tick_size": "0.001",
+                "hash": "h2",
+            }
+        )
+        self.assertEqual(result.updated_asset_ids, ["token"])
+        self.assertEqual(book.snapshot("token")["tick_size"], 0.001)
+        self.assertEqual(book.snapshot("token")["received_at"], original_received_at)
+
+    def test_trade_print_never_refreshes_or_invalidates_executable_book(self):
+        book = LocalOrderbook()
+        book.seed(
+            "token",
+            [{"price": 0.4, "size": 10}],
+            [{"price": 0.6, "size": 10}],
+            raw_metadata={"hash": "h1"},
+        )
+        original_received_at = book.snapshot("token")["received_at"]
+        accepted = book.apply_event(
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "token",
+                "market": "market",
+                "price": "0.41",
+                "size": "3",
+                "side": "BUY",
+                "timestamp": 1_700_000_000_000,
+            }
+        )
+        # The synthetic old timestamp is ignored as an auxiliary event and the
+        # current book remains valid/freshness-neutral.
+        self.assertEqual(accepted.invalid_assets, {})
+        self.assertEqual(book.snapshot("token")["received_at"], original_received_at)
+
+        accepted = book.apply_event(
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "token",
+                "market": "market",
+                "price": "0.41",
+                "size": "3",
+                "side": "BUY",
+            }
+        )
+        self.assertEqual(accepted.updated_asset_ids, ["token"])
+        self.assertEqual(book.snapshot("token")["received_at"], original_received_at)
+        self.assertTrue(book.snapshot("token")["last_trade_id"])
 
     def test_invalid_delta_requires_a_new_full_snapshot(self):
         book = LocalOrderbook()
