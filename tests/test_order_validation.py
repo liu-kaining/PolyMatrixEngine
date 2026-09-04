@@ -25,6 +25,15 @@ class OrderValidationTests(unittest.TestCase):
         )
         self.assertEqual(minimum.size, 5)
 
+        rounded = validate_order_intent(
+            condition_id="condition",
+            token_id="token",
+            side="BUY",
+            price=0.42,
+            size=5.129,
+        )
+        self.assertEqual(rounded.size, 5.12)
+
     def test_rejects_non_finite_numbers(self):
         for value in (math.nan, math.inf, -math.inf):
             with self.subTest(value=value):

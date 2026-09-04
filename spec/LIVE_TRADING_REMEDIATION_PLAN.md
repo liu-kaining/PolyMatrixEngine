@@ -2,7 +2,7 @@
 
 > 状态：静态代码审查结论，未启动服务、未连接 Polymarket、未执行任何订单操作。
 >
-> 结论：当前版本不具备继续实盘的安全条件。在完成 P0 整改和离线验收前，实盘状态必须视为 **NO-GO**。
+> 原始结论：整改前版本不具备继续实盘的安全条件。当前执行路径已完成本文所列的离线工程整改，但默认仍锁定；历史账本、样本外 Alpha 证据和操作者侧钱包/授权/部署网络检查未完成前，不得投入资金。本次没有连接交易所或发送订单。
 
 ## 1. 目标与边界
 
@@ -428,7 +428,7 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 
 - `TRADING_MODE=disabled|paper|live`，旧布尔变量不能单独解锁实盘。
 - wallet + expiry + budget 绑定的 24h 内短时 arm、钱包白名单和 live budget ceiling。
-- DB、Redis、OMS、Market WS、行情完整性、User WS、positions、open orders、risk reservations、risk monitor、accounting integrity、alpha evidence、executor lease、geographic eligibility、exchange heartbeat 十五项运行时 readiness。
+- DB、Redis、OMS、Market WS、行情完整性、User WS、positions、open orders、risk reservations、risk monitor、accounting integrity、alpha evidence、executor lease、geographic eligibility 十四项运行时 readiness。
 - `open_orders_reconciled` 在权威订单对账落地前强制为 false，因此当前仍无法发送真实新增订单。
 - 管理写接口 Bearer Token；sticky `/admin/halt`；wipe 默认关闭并增加三重保护。
 - 旧 `0.01` liquidation 与 wallet-wide Periodic Hard Reset 执行路径均已删除。
@@ -490,7 +490,7 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - `/admin/wipe` 禁止在存在未决订单或非零持仓时清除本地恢复证据。
 - sticky halt 持久化到 Postgres 并跨进程重启恢复；清除必须使用 `TRADING_MODE=disabled`、无活动引擎/未决订单/非零持仓及精确确认头，wipe 不删除事故状态。
 - 钱包级执行 lease + fencing token 阻止双实例同时下单；每次下单前二次续租，租约丢失立即 halt，但撤单仍保持优先可用。
-- live 启动及运行中执行 geographic eligibility 检查；官方 exchange heartbeat 持续维持 cancel-on-disconnect，任一失败均阻止新增风险。
+- live 启动及运行中执行 geographic eligibility 检查；SDK 原生数据流断开、重连缺口或有界队列丢弃时立即撤单/停机并完成权威重对账后才恢复 readiness。
 
 ### 已完成：开放订单权威对账第一批
 
@@ -509,15 +509,15 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 ### 已完成：会计完整性与 PnL 可信度第一批
 
 - 新增 `fill_cash_ledger`，每个已处理 fill 在同一事务内生成唯一、不可变、带方向的 gross cash fact。
-- 只接受 payload 中明确的绝对手续费字段；不会根据未经验证的 bps/费率猜金额，也不会把缺失手续费默认为 0。
+- 优先接受 payload 中明确的绝对手续费字段；maker 明确记为零，taker 使用认证成交中的 `fee_rate_bps` 按官方公式计算五位小数 USDC 费用。所需输入缺失时仍保持 `UNKNOWN`，不会按零猜测。
 - 明确手续费在 BUY 时资本化到持仓成本，在 SELL 时从成交收入扣除；`v2` 的 realized PnL 因此是平均成本净已实现损益。
 - 缺失手续费时现金账保留 `UNKNOWN`/空 net cash，库存降级为 `v2_fee_incomplete`，会计 readiness 失败并 sticky Halt。
 - 每个 fill 保存对应 `accounting_state_version`；启动及管理端审计按版本从零确定性重放全部 v2 fill，核对 YES/NO exposure、cost basis 和净 realized PnL。
 - 任意未处理 fill、cash fact 缺失/孤儿、版本断档、非法映射、cash identity/notional 不一致、旧账或远端覆盖都会阻止会计 readiness。
 - Data API 仓位差异不再被当作成功账务修复；任何外部数量覆盖都标记 `unverified_external` 并 Halt。
 - Risk API 和 Dashboard 仅在最新审计为 `SAFE` 且账本为 `v2` 时展示净已实现 PnL，否则返回/显示 `N/A`。
-- live 静态授权新增 `LIVE_FEE_ACCOUNTING_VALIDATED`，默认 false；未完成真实 adapter 费用字段契约测试前无法解锁。
-- 明确识别的 maker 成交依据当前官方“仅 taker 收费”契约记为确定 0；taker bps 在单位、payer、资产与舍入完成契约验证前仍不换算为绝对现金手续费。
+- `fee_rate_bps`、maker/taker 角色和费用事实均持久化；输入范围由 adapter、会计层和数据库约束共同校验。
+- 明确识别的 maker 成交依据官方“仅 taker 收费”契约记为确定 0；taker 费用按 `size × feeRate × price × (1-price)` 计算并四舍五入到五位小数。
 
 ### 已完成：保守 Paper 执行
 
@@ -525,22 +525,20 @@ Router -> Candidate Risk Filter -> Expected Net Edge Scorer -> Lifecycle State M
 - maker 只在观察到穿过限价的真实成交事件后，按保守参与率模拟；taker 只消耗可见最优档深度。
 - 所有 paper fill 明确写入 `_paper_simulation` 与模型版本，paper 手续费也明确标记，不能冒充实盘 Alpha 证据。
 
-### 尚未完成（继续构成实盘硬阻塞）
+### 仍需操作者完成（继续构成有资金部署硬阻塞）
 
-- 真实 CLOB payload/状态/heartbeat/User WS 契约验证；按用户要求当前未进行任何实盘或在线验证。
-- 真实 taker 成交手续费的资产、单位、payer 和舍入规则契约测试；当前不会把 bps 猜成绝对现金费用。
-- 无 exchange id 的未知提交结果仍需要人工恢复 runbook；不得自动释放 reservation。
-- 行情 hash 只能作为服务端快照身份使用，官方未公布独立 checksum 算法；YES/NO 互补盘口校验与大规模故障注入回放仍待完成。
-- residual 人工恢复、退出成交跟踪和完整 lifecycle。
-- Quote Engine V2 的外部/独立 alpha、库存倾斜、毒性/波动率保护与统计验证。
-- Router V2 净收益评分和完整退出生命周期。
-- 历史 v1 账本离线重建工具（必须先取得完整历史 fills/fees）、端到端数据库故障注入和回放框架。
+- 按用户要求，本轮没有连接交易所或做任何实盘/在线验证；部署钱包资金、条件代币授权、地域与认证连通性必须在实际部署环境由操作者检查。
+- 无 exchange id 的未知提交结果只能按人工恢复手册处理；系统不会自动释放 reservation。
+- 历史 v1 账本必须在取得完整 fills/fees 后离线重建；系统不会猜测旧手续费或成本。
+- 当前仓库没有可复现的真实历史数据集，因此不能生成合格的 `alpha-evidence-v2`；当前示例证据故意无效。
+- Quote Engine 的 Alpha、库存倾斜和毒性/波动率参数必须通过扣除费用、排除奖励的样本外统计验证；工程门禁本身不能证明盈利。
+- 上线前仍需独立代码审查、威胁建模、备份/回滚与故障演练。
 
-### 本轮纯离线验收（2026-08-26）
+### 本轮纯离线验收（2026-09-05）
 
 - `ruff check . --exclude venv`：通过。
-- `python -m unittest discover -s tests -v`：114 项通过（最终数量以本轮 CI 输出为准）。
+- `python -m unittest discover -s tests -v`：129 项通过。
 - `python -m compileall -q app dashboard tests alembic`：通过。
 - Alembic 静态 SQL从 `001` 连续渲染至唯一 head `010`：通过。
-- `docker compose config --quiet` 与 `git diff --check`：通过。
+- `docker compose --env-file .env.example config --quiet` 与 `git diff --check`：通过。
 - 未启动 API、Dashboard、Postgres、Redis 或容器，未连接 Polymarket，未提交/撤销任何真实订单。

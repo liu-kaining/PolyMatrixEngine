@@ -71,6 +71,13 @@ class OrderReconciliationTests(unittest.TestCase):
         self.assertTrue(report.safe)
         self.assertEqual(report.actions[0].kind, "CANCELED_CONFIRMED")
 
+        resolved = normalize_exchange_order(
+            exchange_payload(status="ORDER_STATUS_CANCELED_MARKET_RESOLVED")
+        )
+        report = reconcile_order_facts([local_fact()], [], {"ex-1": resolved})
+        self.assertTrue(report.safe)
+        self.assertEqual(report.actions[0].kind, "CANCELED_CONFIRMED")
+
     def test_missing_fill_is_never_released_or_guessed(self):
         exchange = normalize_exchange_order(exchange_payload(size_matched="3"))
         report = reconcile_order_facts([local_fact()], [exchange], {})

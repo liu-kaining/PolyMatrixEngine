@@ -1,6 +1,6 @@
 # PolyMatrix Engine：面向 Polymarket 的流动性基础设施，而非「又一个交易脚本」
 
-> 当前实盘状态：**NO-GO**。本文只描述整改后的工程边界，不构成盈利能力、资金安全或可部署实盘的证明。
+> 当前部署状态：**默认锁定**。本文只描述整改后的工程边界，不构成盈利能力、资金安全或已完成有资金部署验证的证明。
 
 **一句话**：在预测市场成交量指数级放大的背景下，我们将 **CLOB 做市**抽象为可长期运行的 **异步执行与风控系统**——**热路径零数据库、内存单一真相源、差分报价保队列优先权、四层风控与强制对账闭环**，并可选 **组合级 Auto-Router** 做赛道与事件视界约束下的自动选场。
 
@@ -35,7 +35,7 @@ Polymarket 官方将 **做市商（MM）** 定义为持续挂限价单、**赚�
 |------|----------|----------|
 | **数据面** | 订单簿实时性、用户成交/撤单事件可靠入站 | Market WS + Gateway（本地簿合并、静默断线检测）；User WS（成交写账、驱动库存） |
 | **状态面** | 报价热路径读取带版本的已提交快照 | durable fill 先原子提交 Postgres，再把同一 `state_version` 同步到 `InventoryStateManager` |
-| **执行面** | 与 CLOB 交互的韧性（熔断、超时、幂等友好） | OMS + `py-clob-client`；可选 Builder 归因 |
+| **执行面** | 与 CLOB 交互的韧性（熔断、超时、幂等友好） | OMS + 固定版本 `polymarket-client` 统一 V2 adapter；可选 Builder code 归因 |
 | **风控面** | 与报价路径**解耦**的持续监测与事实比较 | Watchdog（cold/hot cost、reservations、对账、sticky Kill Switch） |
 
 **热路径铁律**：`QuotingEngine` 的 tick 内只读带版本的已提交内存快照，不读 Postgres；成交不走 memory-first，而是把 inbox、reservation、cash、fee、inventory 和 order 原子提交后再更新内存。
@@ -66,7 +66,7 @@ Polymarket 官方将 **做市商（MM）** 定义为持续挂限价单、**赚�
 
 1. **报价前**：上述预算与预检。  
 2. **Watchdog**：高频率审视 **实际已占用资本（capital_used）** 等硬指标，触发 **Kill Switch**（库表停牌 + Redis 控制信道 + 撤单）。  
-3. **周期对账 + 时间窗**：与 Polymarket **Data API** 仓位对齐；对 **刚发生本地成交** 的时间窗内**禁止**用陈旧 REST 覆盖——避免「对账反成破坏者」。  
+3. **周期对账 + 时间窗**：live 下以认证 CLOB 条件代币余额核对已知/活跃 token，Data API 只发现未知仓位和提供可核对的成本元数据；对 **刚发生本地成交** 的时间窗内禁止覆盖——避免「对账反成破坏者」。
 4. **确定性会计与订单对账**：未知提交/撤单保留 reservation；开放订单逐单核对终态；fill 与 fee 可重放。旧 wallet-wide `cancel_all`、`force_evict` 和 Hard Reset 已删除。
 
 此外，**User WebSocket 重连**后会触发全量仓位比较，但仍遵守本地成交后的延迟保护；差异只用于触发保守风险状态，不能替代认证 trade-history 对缺失成交的回填。

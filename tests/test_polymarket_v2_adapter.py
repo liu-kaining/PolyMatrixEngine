@@ -51,8 +51,9 @@ class FakeClient:
             neg_risk=False,
         )
 
-    async def get_balance_allowance(self, *, asset_type):
+    async def get_balance_allowance(self, *, asset_type, token_id=None):
         self.balance_asset_type = asset_type
+        self.balance_token_id = token_id
         return SimpleNamespace(balance=1_234_567)
 
     def list_account_trades(self, **kwargs):
@@ -139,6 +140,9 @@ class PolymarketV2AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(constraints.min_order_size), "5.5")
         self.assertEqual(constraints.condition_id, "market-1")
         self.assertAlmostEqual(await adapter.get_balance(), 1.234567)
+        self.assertAlmostEqual(await adapter.get_token_balance("token-1"), 1.234567)
+        self.assertEqual(client.balance_asset_type, "CONDITIONAL")
+        self.assertEqual(client.balance_token_id, "token-1")
         self.assertTrue(adapter.user_stream_is_open())
 
     async def test_order_filter_is_local_and_never_sent_as_trade_id(self):

@@ -4,7 +4,7 @@
 
 **面向 [Polymarket](https://polymarket.com) 的实验性自动化做市与流动性引擎。**
 
-> **实盘状态：NO-GO。** 项目正在按照 [实盘亏损整改计划](spec/LIVE_TRADING_REMEDIATION_PLAN.md) 重构。统一 V2 SDK 边界、认证成交回填、持久化停机、单执行器租约、交易所 heartbeat、地域预检、动态市场约束和保守 paper 成交已经落地；真实行情/手续费契约验证、历史账本重建及经过统计验证的盈利 Alpha 仍是硬阻塞项。
+> **部署状态：默认锁定。** 实盘执行代码路径已经完成离线工程整改，但仓库本身不能替代有资金部署所需的外部证据。历史账本重建、哈希固定的样本外 Alpha 证据、钱包资金/授权及部署网络检查仍须由操作者完成。本次审查没有连接交易所，也没有发送任何实盘订单。
 
 ## 安全整改状态
 
@@ -13,7 +13,7 @@
 - 旧 `LIVE_TRADING_ENABLED=True` **单独无法解锁实盘**。live 还要求钱包白名单、未来 24 小时内到期的 arm、显式预算 ceiling、构建 commit、与当前源码/参数完全匹配的 alpha 证据及全部运行时 readiness。奖励排名 Auto-Router 被硬性限制为 paper-only。
 - `open_orders_reconciled` 只有在认证 `get_orders` 与逐单终态查询均和本地成交/reservation 一致后才会通过；仅仅“不在开放订单列表”绝不会释放风险。
 - CLOB 边界固定为 `polymarket-client==0.6.0`；SDK union、状态前缀、异步分页和 human/e6 数量单位在业务层之前统一归一化，认证 trade history 可幂等回填 User WS 漏单。
-- Postgres 钱包租约阻止双实例同时执行；sticky halt 跨重启保留，只能在 disabled 且本地平仓/无未决单后显式确认。交易所 heartbeat 丢失或地域判断不确定都会停止新增风险。
+- Postgres 钱包租约阻止双实例同时执行，并在每次提交前立即续约；sticky halt 跨重启保留，只能在 disabled 且本地平仓/无未决单后显式确认。数据流不确定或地域判断不确定都会停止新增风险。
 - wallet-wide Periodic Hard Reset 及其 `cancel_all` helper 已从代码删除；`0.01` 全量强平实现和 Dashboard 按钮也已删除，`/liquidate` 固定返回 HTTP 410。
 - BUY 在提交前先由 Postgres 原子预占资金；下单或撤单结果不确定时保留 reservation，并阻止新增风险直至权威对账。
 - 行情快照携带接收时间、交易所时间、snapshot hash/可选 sequence 和有效性；当前无 sequence 的官方流使用严格 timestamp、hash 与周期 REST 重同步。每个市场的 tick/min-size 动态约束会被强制执行。
@@ -22,6 +22,7 @@
 - 任何 REST 仓位覆盖都会把会计版本降级为 `unverified_external`；只有最新确定性重放为 `SAFE` 且账本为验证过的 `v2` 时，API/Dashboard 才展示净已实现 PnL，否则显示 `N/A`。
 - `OFFLINE_VALIDATED_ALPHA_ENABLED=True` 不再足以开启新增风险；还必须由内置离线评估器生成并 SHA-256 固定 `alpha-evidence-v2` 报告。策略 ID、关键参数、关键交易源码包和构建 commit 必须与运行时完全匹配。
 - 完整的本地数据契约和报告命令见[离线 Alpha 评估手册](spec/OFFLINE_ALPHA_EVALUATION.md)。
+- 分阶段部署检查、arm 顺序、放行决策与事故规则见[有资金部署手册](spec/LIVE_DEPLOYMENT_RUNBOOK.md)。
 - start/stop/halt/wipe 全部要求至少 32 字符的 `ADMIN_API_TOKEN` Bearer Token。
 - `/admin/wipe` 默认关闭，只允许在 `disabled`、无活动引擎、无未决订单、无非零仓位且带精确确认请求头时使用。
 - Docker 构建通过 `.dockerignore` 排除 `.env`、私钥、虚拟环境、Git 和日志；Dashboard 不再挂载包含钱包私钥的 `.env`。
@@ -45,11 +46,11 @@ PolyMatrix Engine 是一个**正在主动进行安全整改的实验性交易内
 
 - **差分报价，而不是「全撤再挂」。** 只撤掉与目标网格不一致的订单，只补缺失档位。既有挂单保留排队位置，API 调用量大幅下降。
 
-- **Fail-closed 对账。** 周期仓位比较通过 Polymarket **Data API** 获取事实，并保留本地成交后的延迟保护。任何仓位数量覆盖都会使精确成本、手续费和 PnL 失效并触发 sticky Halt，绝不会被描述成“账务修复成功”；遗留 Periodic Hard Reset 已删除。
+- **Fail-closed 对账。** live 模式下，已知与活跃 token 使用认证 CLOB 条件代币余额作为数量事实；公共 **Data API** 仅发现未知仓位并提供可核对的成本元数据。任何仓位数量覆盖都会使精确成本、手续费和 PnL 失效并触发 sticky Halt，绝不会被描述成“账务修复成功”；遗留 Periodic Hard Reset 已删除。
 
 - **资金保护内置。** 下单前按 **`MAX_EXPOSURE_PER_MARKET`** 与 **`GLOBAL_MAX_BUDGET`** 检查 BUY 名义，口径为 **MTM 持仓 + 挂单 BUY 名义**（严格路径），超预算自动缩档或砍档；Maker 价格限制在盘口内侧，避免意外 Taker。
 
-当前版本不得投入实盘资金。盈利能力必须先通过离线回放、费用/奖励归因和 markout 分析证明。
+在全部状态/readiness 门禁通过，并由离线回放、费用归因和 markout 分析证明盈利能力之前，不得为有资金部署解除锁定。工程检查通过不等于策略能够盈利。
 
 ---
 
@@ -59,7 +60,7 @@ PolyMatrix Engine 是一个**正在主动进行安全整改的实验性交易内
 |------|--------------|
 | **Auto-Router 研究工具** | paper-only 奖励排名实验，带事件地平线与赛道限额；不是已验证 alpha，live 模式无法启动。 |
 | **性能** | 带版本的内存快照；报价 Tick 内零 Postgres 读取；durable fill 事务；`EngineSupervisor` 单例任务注册表。 |
-| **执行** | 差分报价（按 side/price/size 签名保留/撤/补）；保留时间优先，减少 CLOB 请求。Fail-Closed 的 Websocket 掉线/假死重连。 |
+| **执行** | 差分报价（按 side/price/size 签名保留/撤/补）；保留时间优先，减少 CLOB 请求。SDK 原生流在断线、重连缺口或有界队列丢弃时 fail closed。 |
 | **风控** | 原子 BUY reservation + 冷仓位成本口径，共用单市场/全局限额；下单/撤单未知状态保留资本并阻止新增风险。 |
 | **Maker 纪律** | 常规报价显式 post-only 并按动态 tick 对齐；只有有界库存退出可单独允许 Taker。 |
 | **奖励观测** | Gamma 奖励参数只用于展示/离线归因，不得改变 size、spread、订单保活或 live 准入。 |
@@ -135,7 +136,7 @@ PolyMatrix Engine 是一个**正在主动进行安全整改的实验性交易内
 ┌─────────────────────┐           ┌─────────────────────────┐                     │
 │ quoting/engine      │◀─────────▶│ risk/watchdog           │─────────────────────┘
 │ • 统一 FV、MTM 预算 │ 对账       │ • ~1s 敞口检查          │   Kill：撤单+suspend
-│ • 报价风险闸门      │ Data API  │ • 周期比较               │
+│ • 报价风险闸门      │ 认证余额  │ • 周期比较               │
 │ • 差分报价          │           │   (RECONCILIATION_…     │
 │ • 无效行情→         │           │    INTERVAL_SEC)        │
 │   撤单/暂停         │           │ • 差异→Halt              │
@@ -151,7 +152,7 @@ PolyMatrix Engine 是一个**正在主动进行安全整改的实验性交易内
 └─────────────────────┘
 ```
 
-**数据流简述：** Gateway 与 user_stream 消费 **Market / User** WebSocket，并通过 Redis 发布 tick。QuotingEngine 每轮只读已提交的 `inventory_state` 快照，执行风险/经济性闸门后经 OMS 差分报价。成交先把 inbox、reservation 释放、手续费会计、现金事实和订单状态原子提交，再把同一 `state_version` 同步到内存。Watchdog 高频检查本地限额，并按 `RECONCILIATION_INTERVAL_SEC`（默认 **300s**）比较 Data API 仓位；远端数量差异会使账本失效并 Halt，而不是用估算 PnL 静默覆盖。
+**数据流简述：** Gateway 与 user_stream 消费 **Market / User** WebSocket，并通过 Redis 发布 tick。QuotingEngine 每轮只读已提交的 `inventory_state` 快照，执行风险/经济性闸门后经 OMS 差分报价。成交先把 inbox、reservation 释放、手续费会计、现金事实和订单状态原子提交，再把同一 `state_version` 同步到内存。Watchdog 高频检查本地限额，并按 `RECONCILIATION_INTERVAL_SEC`（默认 **300s**）比较认证条件代币余额；Data API 只用于发现未知仓位与提供数量一致时的成本元数据。远端数量差异会使账本失效并 Halt，而不是用估算 PnL 静默覆盖。
 
 ---
 
@@ -162,7 +163,7 @@ PolyMatrix Engine 实现的是 **Polymarket 官方做市商（MM）流程**，�
 | 文档 | 内容概要 | 我们的对应实现 |
 |------|----------|----------------|
 | [概述](https://docs.polymarket.com/cn/market-makers/overview) | 做市商 = 持续挂限价单、提供流动性；用 WebSocket + Gamma + CLOB | 使用 **Gamma API** 取元数据、固定版本的统一 **polymarket-client** V2 adapter 执行；常规报价强制 post-only。 |
-| [入门指南](https://docs.polymarket.com/cn/market-makers/getting-started) | 充值 USDC.e、部署钱包、代币授权、从钱包派生 API 凭证 | 使用 **ClobClient** 的 `create_or_derive_api_creds()` 与 POLY_PROXY（免 gas）。充值与授权在应用外完成。 |
+| [入门指南](https://docs.polymarket.com/trading/quickstart) | 准备抵押品、配置钱包与代币授权 | 固定版本统一 SDK 从 `PK` 创建/派生认证凭据，并核对其钱包与 `FUNDER_ADDRESS` 一致。充值与授权仍由操作者在应用外完成。 |
 | [流动性奖励](https://docs.polymarket.com/cn/market-makers/liquidity-rewards) | 交易所奖励资格元数据 | 只读取并展示，用于离线归因；奖励不调参，也不能让亏损报价通过。 |
 | [Maker 返利](https://docs.polymarket.com/cn/market-makers/maker-rebates) | 在收费市场（如加密货币）中，taker 手续费的一部分按日以 USDC 返给被成交的 maker | 我们只挂限价单，天然是 maker；返利由 Polymarket 发放，我们不计算。 |
 
@@ -188,8 +189,8 @@ PolyMatrix Engine 实现的是 **Polymarket 官方做市商（MM）流程**，�
 | `app/market_data/gateway.py` | Market WS + REST 维护本地订单簿；向 Redis `tick:{token}` / `ob:{token}` 发布快照。 |
 | `app/market_data/user_stream.py` | User WS adapter：成交进入确定性 durable fill processor；只在提交后发布订单状态。 |
 | `app/quoting/engine.py` | QuotingEngine：tick/control/order status；已提交内存快照；行情、风险和净边际闸门；有界退出与差分报价。 |
-| `app/oms/core.py` | OMS：统一 V2 adapter、新单熔断、优先撤单、heartbeat、稳定 local/exchange ID 与保守未知状态。 |
-| `app/risk/watchdog.py` | **~1s** cold/hot 成本 + reservation 检查；周期全仓位 Data API 比较；差异使会计失效；Kill → halt + 撤单 + suspend。 |
+| `app/oms/core.py` | OMS：统一 V2 adapter、新单熔断、优先撤单、提交前租约续期、稳定 local/exchange ID 与保守未知状态。 |
+| `app/risk/watchdog.py` | **~1s** cold/hot 成本 + reservation 检查；认证 token 余额对账并由 Data API 发现未知仓位；差异使会计失效；Kill → halt + 撤单 + suspend。 |
 | `app/core/alpha_evaluator.py` / `strategy_fingerprint.py` | 严格本地证据生成器与规范化参数/源码指纹；两者都不访问交易所。 |
 | `app/core/auto_router.py` | 可选 paper-only 奖励元数据研究 Router；live 启动无条件拒绝。 |
 | `app/models/` | 订单、fills、不可变现金事实、库存、reservations 与对账/审计记录。 |
@@ -214,7 +215,7 @@ Streamlit 驾驶舱（端口 **8501**）提供：
 
 - Docker 与 Docker Compose
 - PostgreSQL、Redis（由 docker-compose 提供）
-- Polymarket 账户与 USDC
+- Polymarket 账户与当前 V2 抵押资产 pUSD
 - CLOB API 私钥（`PK`）与 `FUNDER_ADDRESS`
 
 ## 安装与运行
@@ -236,7 +237,7 @@ cp .env.example .env
 
 3. **启动**
 
-保持 `TRADING_MODE=disabled`。这里只启动本地控制面与依赖；当前仓库对实盘资金仍是 **NO-GO**。
+首次部署保持 `TRADING_MODE=disabled`。这里只启动本地控制面与依赖；在历史会计与 Alpha 证据、钱包/授权、地域和部署网络检查完成前，不得解除实盘锁定。
 
 ```bash
 docker compose up --build -d
@@ -277,7 +278,6 @@ docker compose logs -f api
 | `LIVE_ARM_EXPIRES_AT` / `LIVE_ARM_TOKEN` | 24h 内短时授权 | 空 = 禁止 live |
 | `LIVE_ALLOWED_FUNDER_ADDRESSES` | live 钱包白名单 | 空 = 禁止 live |
 | `LIVE_BUDGET_CAP_USD` | 显式 live 预算 ceiling | `100.0` |
-| `LIVE_FEE_ACCOUNTING_VALIDATED` | 绝对成交手续费事实已通过 adapter 契约测试的人工确认 | `False` = 禁止 live |
 | `ADMIN_API_TOKEN` | 写接口 Bearer Token，至少 32 字符 | 空 = 写接口关闭 |
 | `OFFLINE_VALIDATED_ALPHA_ENABLED` | 申请开启新增 BUY；仍需 hash 固定且通过校验的证据报告 | `False` |
 | `ALPHA_VALIDATION_REPORT_PATH` / `ALPHA_VALIDATION_REPORT_SHA256` | 内置评估器生成的 `alpha-evidence-v2` JSON 与精确内容 hash | 空/不匹配 = alpha readiness 失败 |
@@ -289,11 +289,11 @@ docker compose logs -f api
 | `MARKET_DATA_REQUIRE_SEQUENCE_LIVE` | 数据契约提供 sequence 时强制连续性 | 当前官方流默认 `False` |
 | `MARKET_DATA_REQUIRE_EXCHANGE_TIMESTAMP_LIVE` | live 必须有交易所 timestamp | `True` |
 | `MARKET_DATA_REQUIRE_SNAPSHOT_ID_LIVE` / `MARKET_DATA_REST_RESYNC_SEC` | 强制 hash 并周期重建盘口 | `True` / `30` |
-| `EXECUTION_LEASE_TTL_SEC` / `EXCHANGE_HEARTBEAT_INTERVAL_SEC` | 单钱包执行租约 / 交易所断连撤单 heartbeat | `15` / `5` |
+| `EXECUTION_LEASE_TTL_SEC` / `ORDER_RECONCILIATION_INTERVAL_SEC` | 单钱包执行租约 / 权威订单对账周期 | `15` / `60` |
 | `MAX_EXPOSURE_PER_MARKET` | 单市场敞口上限（USDC）；触发 Watchdog 强停 | 如 `15` |
 | `EXPOSURE_TOLERANCE` | 账本与 API 差异超过此值才覆盖 | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | 最近一次本地成交后多少秒内不覆盖 | `8.0` |
-| `RECONCILIATION_INTERVAL_SEC` | Watchdog 周期 **Data API** 持仓比较间隔（秒） | `300` |
+| `RECONCILIATION_INTERVAL_SEC` | Watchdog 认证 token 余额对账间隔（秒） | `300` |
 | `BASE_ORDER_SIZE` | 每笔订单 outcome shares；运行时自动提高到市场当前 `min_order_size` | 如 `10.0` |
 | `GRID_LEVELS` | 每侧网格档数 | `2` |
 | `QUOTE_BASE_SPREAD` | 相对 fair value 的价差 | `0.02` |
@@ -312,7 +312,6 @@ docker compose logs -f api
 | `DEBUG` | 调试模式 | `False` |
 | `TRADING_MODE` | 总体运行模式 | `disabled` / `paper` / `live` |
 | `LIVE_TRADING_ENABLED` | live 第二确认，不能单独解锁 | `False` |
-| `LIVE_FEE_ACCOUNTING_VALIDATED` | 手续费字段契约验证确认 | `False`，未验证禁止 live |
 
 ### Polymarket 网络
 
@@ -355,7 +354,7 @@ docker compose logs -f api
 | `MAX_EXPOSURE_CATEGORICAL` | 遗留分类市场上限；当前 lifecycle 会拒绝非二元市场 | `30.0` |
 | `EXPOSURE_TOLERANCE` | 对账覆盖阈值 | `0.01` |
 | `RECONCILIATION_BUFFER_SECONDS` | 本地成交后跳过覆盖的秒数 | `8.0` |
-| `RECONCILIATION_INTERVAL_SEC` | Watchdog 周期 Data API 持仓比较间隔（秒） | `300` |
+| `RECONCILIATION_INTERVAL_SEC` | Watchdog 认证 token 余额对账间隔（秒） | `300` |
 
 ### 做市与报价
 

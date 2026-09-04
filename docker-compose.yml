@@ -6,9 +6,11 @@ services:
     env_file:
       - .env
     ports:
-      - "8000:8000"
+      # Bind control planes to loopback by default. Put an authenticated TLS
+      # reverse proxy in front if remote operations are required.
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres_password@postgres:5432/polymatrix
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/polymatrix
       - REDIS_URL=redis://redis:6379/0
       - PM_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
       - PM_API_URL=https://clob.polymarket.com
@@ -21,7 +23,6 @@ services:
       - LIVE_ARM_EXPIRES_AT=${LIVE_ARM_EXPIRES_AT:-}
       - LIVE_ALLOWED_FUNDER_ADDRESSES=${LIVE_ALLOWED_FUNDER_ADDRESSES:-}
       - LIVE_BUDGET_CAP_USD=${LIVE_BUDGET_CAP_USD:-100.0}
-      - LIVE_FEE_ACCOUNTING_VALIDATED=${LIVE_FEE_ACCOUNTING_VALIDATED:-False}
       - APP_CODE_COMMIT=${APP_CODE_COMMIT:-}
       - ALPHA_STRATEGY_ID=${ALPHA_STRATEGY_ID:-maker-alpha-v2}
       - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
@@ -44,10 +45,10 @@ services:
     container_name: polymatrix_dashboard
     restart: always
     ports:
-      - "8501:8501"
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
     environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:postgres_password@postgres:5432/polymatrix
+      - DATABASE_URL=postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/polymatrix
       - API_URL=http://api:8000
       - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
       - TRADING_LOG_PATH=/app/data/logs/trading.log
@@ -64,10 +65,10 @@ services:
     restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: polymatrix
     ports:
-      - "${DB_PORT:-5433}:5432"
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -81,7 +82,7 @@ services:
     container_name: polymatrix_redis
     restart: always
     ports:
-      - "6380:6379"   # host 6380 so 6379 is free for e.g. ThetaMind (override with REDIS_PORT in .env if needed)
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes

@@ -1,6 +1,6 @@
 # PolyMatrix Engine 当前架构总览
 
-> 实盘结论：**NO-GO**。当前代码已经建立 fail-closed 工程边界，但真实数据契约、历史成交/账本恢复和策略盈利统计仍未完成。
+> 部署结论：**默认锁定**。执行代码路径已完成纯离线工程整改；历史账本重建、合格的样本外 Alpha 证据、钱包资金/授权与部署网络检查仍是有资金部署的外部前置条件。本次没有连接交易所或发送订单。
 
 ## 运行平面
 
@@ -45,7 +45,7 @@ flowchart LR
 ### 安全授权
 
 - 默认 `TRADING_MODE=disabled`，不启动交易网络服务。
-- live 需要 wallet allowlist、24h 内 arm、预算 ceiling、费用 adapter 契约确认和全部 runtime readiness。
+- live 需要 wallet allowlist、24h 内 arm、预算 ceiling、与代码/参数完全匹配的 Alpha 证据和全部 runtime readiness。
 - `OFFLINE_VALIDATED_ALPHA_ENABLED` 不是充分条件；必须由内置评估器生成 hash 固定的 `alpha-evidence-v2`，并与策略 ID、运行参数、关键源码哈希及构建 commit 完全匹配。
 - 奖励排名 Auto-Router 永久限制为 paper-only；reward 元数据不能改变 size、spread、旧单保留或报价准入。
 - Dashboard 奖励/流动性榜单仅作研究观测，不再宣称收益/安全，也不能从榜单直接启动策略。
@@ -68,7 +68,7 @@ flowchart LR
 - fill、reservation、cash、fee、inventory、order 与 inbox 状态同事务提交。
 - 明确 BUY fee 资本化、SELL fee 费用化；缺失 fee 保持 `UNKNOWN`，不会当 0。
 - 每个 fill 绑定 `accounting_state_version`；启动/管理端从零重放 v2 fills 并核对 exposure/cost/net realized PnL。
-- REST 仓位数量差异会把账本降级为 `unverified_external`；Risk API/Dashboard 只在最新 audit `SAFE` 时显示 PnL。
+- live 对已知/活跃 token 使用认证 CLOB 条件代币余额；Data API 仅发现未知仓位并提供数量一致时的成本元数据。任何外部数量差异都会把账本降级为 `unverified_external`；Risk API/Dashboard 只在最新 audit `SAFE` 时显示 PnL。
 
 ### 行情与报价
 
@@ -80,7 +80,7 @@ flowchart LR
 
 ## 数据模型
 
-当前迁移 head 为 `009`。核心表：
+当前迁移 head 为 `010`。核心表：
 
 - `orders_journal`
 - `fill_events`
@@ -93,11 +93,10 @@ flowchart LR
 
 详见 [`architecture_diagrams/11_database_erd.md`](./architecture_diagrams/11_database_erd.md)。
 
-## 仍然阻塞实盘
+## 仍然阻塞有资金部署
 
-- User WS/CLOB/fee payload 的真实契约确认（当前按要求不做在线验证）。
-- `MISSING_FILLS` 的认证 trade-history 回填与无 exchange ID 的人工恢复。
+- 部署钱包资金、条件代币授权、地域与认证连通性的操作者侧检查（当前按要求不做在线/实盘验证）。
+- 无 exchange ID 的未知提交必须按人工恢复手册处理，不能自动释放 reservation。
 - 历史 v1 账本需要完整 fills/fees 后才可离线重建，不能猜测。
-- 行情 checksum、YES/NO 互补校验与故障注入回放。
 - 尚未提供可复现的真实离线数据集，因此内置评估器还无法生成一份合格证据；当前示例报告故意无效。
 - 当前 OBI-mid 策略尚未通过扣除费用/奖励后的样本外统计门槛。

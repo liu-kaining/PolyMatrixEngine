@@ -392,6 +392,17 @@ class PolymarketV2Adapter:
             raise ExchangeContractError("collateral balance is not a non-negative integer")
         return float(Decimal(raw) / Decimal(1_000_000))
 
+    async def get_token_balance(self, token_id: str) -> float:
+        balance = await self._client.get_balance_allowance(
+            asset_type="CONDITIONAL", token_id=str(token_id)
+        )
+        raw = getattr(balance, "balance", None)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ExchangeContractError(
+                "conditional token balance is not a non-negative integer"
+            )
+        return float(Decimal(raw) / Decimal(1_000_000))
+
     async def subscribe_user(self, markets: Optional[list[str]] = None) -> Any:
         from polymarket.streams import UserSpec
 

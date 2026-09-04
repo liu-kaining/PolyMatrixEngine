@@ -4,7 +4,7 @@
 
 ## Current decision
 
-The repository contains the evaluator and the live evidence gate, but it does not contain a qualifying historical dataset. Therefore the current live decision remains **NO-GO**. `spec/alpha_evidence.example.json` is deliberately invalid and must never be armed.
+The repository contains the evaluator and the live evidence gate, but it does not contain a qualifying historical dataset. A funded deployment therefore remains locked until the operator supplies a passing report. `spec/alpha_evidence.example.json` is deliberately invalid and must never be armed.
 
 ## 1. Export the exact runtime strategy configuration
 
@@ -85,4 +85,4 @@ The live gate can only tighten these built-in floors:
 
 ## 5. What this still does not prove
 
-Even a passing report does not validate live exchange contracts. Before any future GO decision, the separate blockers in `LIVE_TRADING_REMEDIATION_PLAN.md` must be resolved: User WS authentication acknowledgement, fee field/unit/payer semantics, order status and cancel response contracts, authenticated missing-fill backfill, market sequence/timestamp/checksum behavior, historical ledger recovery and failure-injection replay.
+Even a passing report does not prove future profitability or validate the operator's deployment. The pinned SDK boundary, documented fee formula, status normalization, authenticated missing-fill backfill and stream reconnect behavior are covered by offline contract tests, but wallet funding/allowances, geographic eligibility, authenticated connectivity and actual venue behavior must still be checked in the deployment environment. Historical legacy ledgers also require complete fills/fees; they are never reconstructed by guessing.

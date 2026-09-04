@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any
 
 
@@ -21,6 +22,17 @@ class ValidatedOrderIntent:
 
 class OrderValidationError(ValueError):
     """An order intent is structurally invalid or outside prediction-token bounds."""
+
+
+def normalize_order_size(size: Any) -> float:
+    """Mirror the pinned SDK's two-decimal share-size rounding before journaling."""
+    try:
+        value = Decimal(str(size))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise OrderValidationError("size must be numeric") from exc
+    if not value.is_finite():
+        raise OrderValidationError("size must be finite")
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_FLOOR))
 
 
 def validate_order_intent(
@@ -48,6 +60,7 @@ def validate_order_intent(
         raise OrderValidationError("price and size must be finite")
     if not 0.0 < normalized_price < 1.0:
         raise OrderValidationError("prediction-token limit price must be between 0 and 1")
+    normalized_size = normalize_order_size(normalized_size)
     if normalized_size < MIN_ORDER_SIZE_SHARES:
         raise OrderValidationError(
             f"order size must be at least {MIN_ORDER_SIZE_SHARES:g} shares"

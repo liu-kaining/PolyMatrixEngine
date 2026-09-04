@@ -49,6 +49,16 @@ class PositionReconciliationTests(unittest.TestCase):
         self.assertEqual(capital, 2)
         self.assertFalse(discovered)
 
+    def test_unexplained_position_increase_uses_worst_case_increment(self):
+        capital, discovered = reconcile_capital_used(
+            actual_size=7,
+            reported_cost=2,
+            previous_size=5,
+            previous_capital_used=2,
+        )
+        self.assertEqual(capital, 4)
+        self.assertTrue(discovered)
+
     def test_nonzero_position_with_zero_cost_is_treated_as_untracked(self):
         capital, discovered = reconcile_capital_used(
             actual_size=5,

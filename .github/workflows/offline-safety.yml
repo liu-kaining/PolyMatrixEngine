@@ -14,7 +14,6 @@ jobs:
     env:
       TRADING_MODE: disabled
       LIVE_TRADING_ENABLED: "False"
-      LIVE_FEE_ACCOUNTING_VALIDATED: "False"
       AUTO_ROUTER_ENABLED: "False"
       OFFLINE_VALIDATED_ALPHA_ENABLED: "False"
       DATABASE_URL: postgresql+asyncpg://postgres:postgres_password@localhost:5432/polymatrix
@@ -27,11 +26,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: requirements.lock
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt ruff
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install ruff==0.15.14
 
       - name: Static checks
         run: |

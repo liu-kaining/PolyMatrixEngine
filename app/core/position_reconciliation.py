@@ -77,5 +77,11 @@ def reconcile_capital_used(
     if actual <= 0.001:
         return 0.0, False
     if previous > 1e-9 and previous_capital > 1e-9:
-        return previous_capital * (actual / previous), False
+        if actual <= previous + 1e-9:
+            return previous_capital * (actual / previous), False
+        # A newly discovered increase has no trustworthy acquisition price.
+        # Preserve the prior basis and charge the maximum $1 payoff for every
+        # unexplained additional share; this cannot understate risk capital.
+        conservative = previous_capital + (actual - previous)
+        return max(conservative, reported), True
     return max(actual, reported), True

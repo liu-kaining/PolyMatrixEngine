@@ -165,6 +165,12 @@ class QuotingEngine:
         upper = Decimal("1") - tick
         return float(max(lower, min(upper, steps * tick)))
 
+    @staticmethod
+    def _quantize_size(size: float) -> float:
+        return float(
+            Decimal(str(size)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+        )
+
     async def run(self):
         """Main loop for the quoting engine"""
         if not await self._bootstrap_context_and_inventory():
@@ -528,7 +534,7 @@ class QuotingEngine:
                 )
             return 0.0
 
-        return round(target_size, 8)
+        return self._quantize_size(target_size)
 
     async def _get_unified_fair_value(
         self,
@@ -834,7 +840,7 @@ class QuotingEngine:
                             f"({current_exposure:.2f} < {self.min_order_size}). Skipping."
                         )
                     else:
-                        sell_size = (
+                        sell_size = self._quantize_size(
                             exit_intent.size
                             if (is_extreme_long or force_taker_exit)
                             else min(
@@ -1127,7 +1133,7 @@ class QuotingEngine:
                     # Polymarket min order size is 5
                     if max_size >= self.min_order_size:
                         shrunk = dict(o)
-                        shrunk["size"] = round(max_size, 8)
+                        shrunk["size"] = self._quantize_size(max_size)
                         kept.append(shrunk)
                         logger.warning(
                             f"[{self.token_id[:6]}] 缩减 BUY@{o['price']} size: "

@@ -3,7 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.core.trading_safety import trading_safety
-from app.risk.watchdog import RiskMonitor
+from app.risk.watchdog import (
+    RiskMonitor,
+    authenticated_balance_required,
+    risk_limit_breached,
+)
 
 
 class RiskWatchdogSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -35,6 +39,64 @@ class RiskWatchdogSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         cancel.assert_awaited_once_with("condition-1")
         session.commit.assert_not_awaited()
+
+
+class AuthenticatedBalanceSelectionTests(unittest.TestCase):
+    def test_active_market_is_queried_even_when_public_and_local_are_zero(self):
+        self.assertTrue(
+            authenticated_balance_required(
+                local_yes=0,
+                local_no=0,
+                discovered_yes=0,
+                discovered_no=0,
+                active=True,
+                tolerance=0.01,
+            )
+        )
+
+    def test_nonzero_or_negative_anomaly_is_queried(self):
+        self.assertTrue(
+            authenticated_balance_required(
+                local_yes=-0.02,
+                local_no=0,
+                discovered_yes=0,
+                discovered_no=0,
+                active=False,
+                tolerance=0.01,
+            )
+        )
+        self.assertFalse(
+            authenticated_balance_required(
+                local_yes=0,
+                local_no=0,
+                discovered_yes=0.005,
+                discovered_no=0,
+                active=False,
+                tolerance=0.01,
+            )
+        )
+
+    def test_non_finite_balance_anomaly_is_always_queried(self):
+        self.assertTrue(
+            authenticated_balance_required(
+                local_yes=float("nan"),
+                local_no=0,
+                discovered_yes=0,
+                discovered_no=0,
+                active=False,
+                tolerance=0.01,
+            )
+        )
+
+
+class RiskLimitValidationTests(unittest.TestCase):
+    def test_exact_cap_is_safe_but_invalid_state_fails_closed(self):
+        self.assertFalse(risk_limit_breached(10, 10))
+        self.assertTrue(risk_limit_breached(10.01, 10))
+        self.assertTrue(risk_limit_breached(float("nan"), 10))
+        self.assertTrue(risk_limit_breached(1, float("inf")))
+        self.assertTrue(risk_limit_breached(-1, 10))
+        self.assertTrue(risk_limit_breached(0, 0))
 
 
 if __name__ == "__main__":
